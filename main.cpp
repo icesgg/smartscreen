@@ -47,7 +47,17 @@ static constexpr int ID_BT_SETTINGS  = 209;
 static constexpr int ID_RECONNECT    = 210;
 static constexpr int ID_EDIT_IDLE    = 211;
 static constexpr int ID_BTN_BLACKNOW = 212;
+static constexpr int ID_COMBO_UNLOCK = 213;
+static constexpr int ID_EDIT_DELAY   = 214;
 static constexpr UINT WM_SCAN_RESULT = WM_USER + 100;
+
+// Overlay (user-facing widget)
+static constexpr int ID_OVL_EXIT     = 401;
+static constexpr int ID_OVL_LOCK     = 402;
+static constexpr int ID_OVL_SETTINGS = 403;
+#define OVERLAY_CLASS L"SmartScreenOverlay"
+static constexpr int OVL_W = 220;
+static constexpr int OVL_H = 70;
 
 // BlackScreen
 static constexpr int IDC_BTN_RELEASE = 301;
@@ -62,6 +72,8 @@ static DWORD  g_nearLatencyMs    = 300;
 static DWORD  g_keepAliveSec     = 5;
 static DWORD  g_scanIntervalSec  = 2;
 static int    g_idleCountdownSec = 20;    // screensaver idle seconds
+static bool   g_unlockAuto      = true;  // true=auto unlock on NEAR, false=manual only
+static int    g_unlockDelaySec  = 0;     // 0=instant, 1~10=delay seconds
 
 // ---------------------------------------------------------------------------
 // Enums & structs
@@ -114,6 +126,9 @@ static HWND   g_hEditTimeout  = nullptr;
 static HWND   g_hEditInterval = nullptr;
 static HWND   g_hEditIdle     = nullptr;
 static HWND   g_hCountdownLabel = nullptr;
+static HWND   g_hComboUnlock   = nullptr;
+static HWND   g_hEditDelay     = nullptr;
+static HWND   g_hLabelDelay    = nullptr;
 static HWND   g_hChart        = nullptr;
 static HFONT  g_hFont         = nullptr;
 static HFONT  g_hFontBold     = nullptr;
@@ -121,6 +136,11 @@ static HFONT  g_hFontBig      = nullptr;
 static HFONT  g_hFontSmall    = nullptr;
 static HBRUSH g_hBrushNear    = nullptr;
 static HBRUSH g_hBrushFar     = nullptr;
+
+// Overlay
+static HWND   g_hOverlay      = nullptr;
+static HWND   g_hOvlState     = nullptr;  // state label on overlay
+static HBRUSH g_hBrushOvl     = nullptr;  // semi-transparent brush
 
 // ---------------------------------------------------------------------------
 // Globals - BT state
@@ -147,6 +167,7 @@ static HHOOK     g_hMouseHook    = nullptr;
 static HHOOK     g_hKeyHook      = nullptr;
 static int       g_nCountdown    = 20;
 static bool      g_bBlackActive  = false;
+static int       g_unlockTimer   = 0;     // countdown for delayed auto-unlock
 
 // ---------------------------------------------------------------------------
 // Config persistence
@@ -292,7 +313,7 @@ static void DeactivateBlackScreen() {
 // ---------------------------------------------------------------------------
 static void ResetCountdown() {
     g_nCountdown = g_idleCountdownSec;
-    if (g_bBlackActive) DeactivateBlackScreen();
+    if (g_bBlackActive) DeactivateBlackScreen(); // mouse/keyboard always wakes
 }
 
 static LRESULT CALLBACK LLMouseProc(int nCode, WPARAM w, LPARAM l) {
@@ -551,6 +572,12 @@ static void StartMon() {
     g_idleCountdownSec = v; g_nCountdown = v;
     swprintf_s(buf, L"%d", v); SetWindowTextW(g_hEditIdle, buf);
 
+    g_unlockAuto = (SendMessageW(g_hComboUnlock, CB_GETCURSEL, 0, 0) == 0);
+    GetWindowTextW(g_hEditDelay, buf, _countof(buf));
+    v = _wtoi(buf); if (v < 0) v = 0; if (v > 10) v = 10;
+    g_unlockDelaySec = v;
+    swprintf_s(buf, L"%d", v); SetWindowTextW(g_hEditDelay, buf);
+
     g_selectedIdx = sel;
     g_targetAddr = g_paired[sel].address;
     g_targetName = g_paired[sel].name;
@@ -571,6 +598,7 @@ static void StartMon() {
     EnableWindow(g_hCombo, FALSE);
     EnableWindow(g_hEditLatency, FALSE); EnableWindow(g_hEditTimeout, FALSE);
     EnableWindow(g_hEditInterval, FALSE); EnableWindow(g_hEditIdle, FALSE);
+    EnableWindow(g_hComboUnlock, FALSE); EnableWindow(g_hEditDelay, FALSE);
 }
 
 static void StopMon() {
@@ -591,6 +619,7 @@ static void StopMon() {
     EnableWindow(g_hCombo, TRUE);
     EnableWindow(g_hEditLatency, TRUE); EnableWindow(g_hEditTimeout, TRUE);
     EnableWindow(g_hEditInterval, TRUE); EnableWindow(g_hEditIdle, TRUE);
+    EnableWindow(g_hComboUnlock, TRUE); EnableWindow(g_hEditDelay, TRUE);
     SetWindowTextW(g_hStateLabel, L"  STOPPED");
     SetWindowTextW(g_hStatus, L"  Stopped");
 }
@@ -676,6 +705,130 @@ static void InitListView(HWND p) {
 // ---------------------------------------------------------------------------
 // Process probe result
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Overlay (user-facing widget): semi-transparent, draggable
+// ---------------------------------------------------------------------------
+static bool g_ovlDragging = false;
+static POINT g_ovlDragStart = {};
+
+static void UpdateOverlayState() {
+    if (!g_hOvlState) return;
+    wchar_t buf[128];
+    if (!g_monitoring) wcscpy_s(buf, L"  Stopped");
+    else if (g_bBlackActive) wcscpy_s(buf, L"  LOCKED");
+    else if (g_proxState == ProxState::Near) wcscpy_s(buf, L"  WITHIN 1M");
+    else swprintf_s(buf, L"  FAR (idle: %ds)", g_nCountdown);
+    SetWindowTextW(g_hOvlState, buf);
+    InvalidateRect(g_hOvlState, nullptr, TRUE);
+}
+
+static LRESULT CALLBACK OverlayProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE: {
+        g_hOvlState = CreateWindowExW(0, L"STATIC", L"  Stopped",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
+            5, 5, OVL_W - 10, 28, hWnd, nullptr, GetModuleHandle(nullptr), nullptr);
+
+        CreateWindowExW(0, L"BUTTON", L"Exit",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            5, 38, 50, 24, hWnd, (HMENU)(UINT_PTR)ID_OVL_EXIT,
+            GetModuleHandle(nullptr), nullptr);
+        CreateWindowExW(0, L"BUTTON", L"Lock",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            60, 38, 50, 24, hWnd, (HMENU)(UINT_PTR)ID_OVL_LOCK,
+            GetModuleHandle(nullptr), nullptr);
+        CreateWindowExW(0, L"BUTTON", L"Settings",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            115, 38, 65, 24, hWnd, (HMENU)(UINT_PTR)ID_OVL_SETTINGS,
+            GetModuleHandle(nullptr), nullptr);
+        return 0;
+    }
+
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = (HDC)wParam; HWND hc = (HWND)lParam;
+        if (hc == g_hOvlState) {
+            SetBkMode(hdc, TRANSPARENT);
+            if (g_bBlackActive) {
+                SetTextColor(hdc, RGB(255, 80, 80));
+            } else if (g_proxState == ProxState::Near && g_monitoring) {
+                SetTextColor(hdc, RGB(0, 220, 0));
+            } else {
+                SetTextColor(hdc, RGB(200, 200, 200));
+            }
+            return (LRESULT)GetStockObject(NULL_BRUSH);
+        }
+        break;
+    }
+
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case ID_OVL_EXIT:
+            if (g_monitoring) StopMon();
+            PostMessage(g_hWnd, WM_CLOSE, 0, 0);
+            DestroyWindow(hWnd);
+            break;
+        case ID_OVL_LOCK:
+            if (g_monitoring && !g_bBlackActive) {
+                g_bBlackActive = true;
+                int x = GetSystemMetrics(SM_XVIRTUALSCREEN), y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                int w = GetSystemMetrics(SM_CXVIRTUALSCREEN), h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+                g_hBlackScreen = CreateWindowExW(WS_EX_TOPMOST, BLACKSCREEN_CLASS, L"",
+                    WS_POPUP, x, y, w, h, nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
+                ShowWindow(g_hBlackScreen, SW_SHOW); SetForegroundWindow(g_hBlackScreen);
+            }
+            break;
+        case ID_OVL_SETTINGS:
+            ShowWindow(g_hWnd, SW_SHOW);
+            SetForegroundWindow(g_hWnd);
+            break;
+        }
+        return 0;
+
+    // Draggable: left-click anywhere on background to drag
+    case WM_LBUTTONDOWN:
+        g_ovlDragging = true;
+        g_ovlDragStart = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
+        SetCapture(hWnd);
+        return 0;
+    case WM_MOUSEMOVE:
+        if (g_ovlDragging) {
+            POINT cur = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
+            RECT rc; GetWindowRect(hWnd, &rc);
+            int dx = cur.x - g_ovlDragStart.x;
+            int dy = cur.y - g_ovlDragStart.y;
+            SetWindowPos(hWnd, nullptr, rc.left + dx, rc.top + dy, 0, 0,
+                SWP_NOSIZE | SWP_NOZORDER);
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        g_ovlDragging = false;
+        ReleaseCapture();
+        return 0;
+
+    case WM_ERASEBKGND: {
+        HDC hdc = (HDC)wParam; RECT rc; GetClientRect(hWnd, &rc);
+        HBRUSH br = CreateSolidBrush(RGB(30, 30, 30));
+        FillRect(hdc, &rc, br); DeleteObject(br);
+        // Border
+        HPEN pen = CreatePen(PS_SOLID, 1, RGB(80, 80, 80));
+        HPEN op = (HPEN)SelectObject(hdc, pen);
+        MoveToEx(hdc, 0, 0, nullptr); LineTo(hdc, rc.right - 1, 0);
+        LineTo(hdc, rc.right - 1, rc.bottom - 1); LineTo(hdc, 0, rc.bottom - 1);
+        LineTo(hdc, 0, 0);
+        SelectObject(hdc, op); DeleteObject(pen);
+        return 1;
+    }
+
+    case WM_DESTROY:
+        g_hOverlay = nullptr;
+        break;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+// ---------------------------------------------------------------------------
+// Process probe result
+// ---------------------------------------------------------------------------
 static void OnResult(ProbeResult* r) {
     g_logCount++;
     bool transition = (r->state != r->prevState);
@@ -689,10 +842,19 @@ static void OnResult(ProbeResult* r) {
     }
     if(g_hChart)InvalidateRect(g_hChart,nullptr,FALSE);
 
-    // Auto-deactivate black screen when device returns to NEAR
-    if (transition && r->state == ProxState::Near && g_bBlackActive)
-        DeactivateBlackScreen();
-    // If NEAR, suppress countdown
+    // Auto-unlock: BT NEAR + auto mode -> start unlock delay countdown
+    if (g_unlockAuto && r->state == ProxState::Near && g_bBlackActive) {
+        if (g_unlockTimer <= 0) {
+            // Start delay timer (or instant if delay=0)
+            g_unlockTimer = g_unlockDelaySec;
+            if (g_unlockTimer <= 0) DeactivateBlackScreen();
+        }
+    }
+    // Manual mode: BT NEAR does NOT deactivate (only 해제 button or mouse/keyboard)
+    // Reset unlock timer if device goes FAR again
+    if (r->state == ProxState::Far) g_unlockTimer = 0;
+
+    // If NEAR, suppress idle countdown
     if (r->state == ProxState::Near)
         g_nCountdown = g_idleCountdownSec;
 
@@ -740,6 +902,7 @@ static void OnResult(ProbeResult* r) {
     swprintf_s(status,L"  \"%s\"  |  %s  |  Latency: %lu ms  |  Near<=%lu ms  |  Idle: %ds",
         g_targetName.c_str(),StateStr(r->state),r->latencyMs,g_nearLatencyMs,g_nCountdown);
     SetWindowTextW(g_hStatus,status);
+    UpdateOverlayState();
 }
 
 // ---------------------------------------------------------------------------
@@ -782,15 +945,29 @@ static LRESULT CALLBACK WndProc(HWND hWnd,UINT msg,WPARAM wParam,LPARAM lParam){
             308,92,25,22,hWnd,(HMENU)(UINT_PTR)ID_EDIT_INTERVAL,GetModuleHandle(nullptr),nullptr);
         CreateWindowExW(0,L"STATIC",L"s",WS_CHILD|WS_VISIBLE,338,94,15,20,hWnd,nullptr,GetModuleHandle(nullptr),nullptr);
 
-        // Settings row 2: idle + countdown
+        // Settings row 2: idle + unlock options
         CreateWindowExW(0,L"STATIC",L"Idle:",WS_CHILD|WS_VISIBLE,10,118,38,20,hWnd,nullptr,GetModuleHandle(nullptr),nullptr);
         g_hEditIdle=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"20",WS_CHILD|WS_VISIBLE|ES_NUMBER|ES_CENTER,
             48,116,35,22,hWnd,(HMENU)(UINT_PTR)ID_EDIT_IDLE,GetModuleHandle(nullptr),nullptr);
-        CreateWindowExW(0,L"STATIC",L"sec",WS_CHILD|WS_VISIBLE,88,118,28,20,hWnd,nullptr,GetModuleHandle(nullptr),nullptr);
-        CreateWindowExW(0,L"BUTTON",L"Black Now",WS_CHILD|WS_VISIBLE,125,116,80,22,hWnd,
+        CreateWindowExW(0,L"STATIC",L"s",WS_CHILD|WS_VISIBLE,88,118,12,20,hWnd,nullptr,GetModuleHandle(nullptr),nullptr);
+
+        CreateWindowExW(0,L"STATIC",L"Unlock:",WS_CHILD|WS_VISIBLE,108,118,50,20,hWnd,nullptr,GetModuleHandle(nullptr),nullptr);
+        g_hComboUnlock=CreateWindowExW(0,L"COMBOBOX",L"",
+            WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST,
+            158,115,65,120,hWnd,(HMENU)(UINT_PTR)ID_COMBO_UNLOCK,GetModuleHandle(nullptr),nullptr);
+        SendMessageW(g_hComboUnlock,CB_ADDSTRING,0,(LPARAM)L"Auto");
+        SendMessageW(g_hComboUnlock,CB_ADDSTRING,0,(LPARAM)L"Manual");
+        SendMessageW(g_hComboUnlock,CB_SETCURSEL,0,0);
+
+        g_hLabelDelay=CreateWindowExW(0,L"STATIC",L"Delay:",WS_CHILD|WS_VISIBLE,230,118,45,20,hWnd,nullptr,GetModuleHandle(nullptr),nullptr);
+        g_hEditDelay=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"0",WS_CHILD|WS_VISIBLE|ES_NUMBER|ES_CENTER,
+            275,116,25,22,hWnd,(HMENU)(UINT_PTR)ID_EDIT_DELAY,GetModuleHandle(nullptr),nullptr);
+        CreateWindowExW(0,L"STATIC",L"s",WS_CHILD|WS_VISIBLE,303,118,12,20,hWnd,nullptr,GetModuleHandle(nullptr),nullptr);
+
+        CreateWindowExW(0,L"BUTTON",L"Black Now",WS_CHILD|WS_VISIBLE,325,116,75,22,hWnd,
             (HMENU)(UINT_PTR)ID_BTN_BLACKNOW,GetModuleHandle(nullptr),nullptr);
         g_hCountdownLabel=CreateWindowExW(0,L"STATIC",L"",
-            WS_CHILD|WS_VISIBLE|SS_LEFT,215,118,250,20,hWnd,nullptr,GetModuleHandle(nullptr),nullptr);
+            WS_CHILD|WS_VISIBLE|SS_LEFT,410,118,350,20,hWnd,nullptr,GetModuleHandle(nullptr),nullptr);
 
         // ListView
         InitListView(hWnd);
@@ -846,23 +1023,35 @@ static LRESULT CALLBACK WndProc(HWND hWnd,UINT msg,WPARAM wParam,LPARAM lParam){
     }
 
     case WM_TIMER:
-        if (wParam == IDT_COUNTDOWN && g_monitoring && !g_bBlackActive) {
-            if (g_proxState == ProxState::Near) {
-                g_nCountdown = g_idleCountdownSec; // suppress
-            } else if (g_nCountdown > 0) {
-                g_nCountdown--;
+        if (wParam == IDT_COUNTDOWN && g_monitoring) {
+            // Idle countdown (when black screen not active)
+            if (!g_bBlackActive) {
+                if (g_proxState == ProxState::Near) {
+                    g_nCountdown = g_idleCountdownSec;
+                } else if (g_nCountdown > 0) {
+                    g_nCountdown--;
+                }
+                if (g_nCountdown == 0) ActivateBlackScreen();
             }
-            if (g_nCountdown == 0) ActivateBlackScreen();
+
+            // Auto-unlock delay countdown (when black screen active + NEAR)
+            if (g_bBlackActive && g_unlockAuto && g_unlockTimer > 0) {
+                g_unlockTimer--;
+                if (g_unlockTimer <= 0) DeactivateBlackScreen();
+            }
 
             // Update countdown label
-            wchar_t cdl[64];
-            if (g_proxState == ProxState::Near)
-                wcscpy_s(cdl, L"  Screen saver: suppressed (NEAR)");
+            wchar_t cdl[96];
+            if (g_bBlackActive && g_unlockAuto && g_unlockTimer > 0)
+                swprintf_s(cdl, L"  LOCKED - auto unlock in %d sec", g_unlockTimer);
             else if (g_bBlackActive)
-                wcscpy_s(cdl, L"  Screen saver: ACTIVE");
+                swprintf_s(cdl, L"  LOCKED (%s)", g_unlockAuto ? L"auto" : L"manual");
+            else if (g_proxState == ProxState::Near)
+                wcscpy_s(cdl, L"  Screen saver: suppressed (NEAR)");
             else
                 swprintf_s(cdl, L"  Screen saver in: %d sec", g_nCountdown);
             SetWindowTextW(g_hCountdownLabel, cdl);
+            UpdateOverlayState();
         }
         break;
 
@@ -893,7 +1082,14 @@ static LRESULT CALLBACK WndProc(HWND hWnd,UINT msg,WPARAM wParam,LPARAM lParam){
                 SetWindowTextW(g_hBtnReconnect,L"...");
                 CloseHandle(CreateThread(nullptr,0,ReconnectThread,nullptr,0,nullptr));}break;
         case ID_BTN_BLACKNOW:
-            if(g_monitoring){g_nCountdown=0;ActivateBlackScreen();}break;
+            if(g_monitoring){
+                g_bBlackActive = true;
+                int x=GetSystemMetrics(SM_XVIRTUALSCREEN),y=GetSystemMetrics(SM_YVIRTUALSCREEN);
+                int w=GetSystemMetrics(SM_CXVIRTUALSCREEN),h=GetSystemMetrics(SM_CYVIRTUALSCREEN);
+                g_hBlackScreen=CreateWindowExW(WS_EX_TOPMOST,BLACKSCREEN_CLASS,L"",
+                    WS_POPUP,x,y,w,h,nullptr,nullptr,GetModuleHandle(nullptr),nullptr);
+                ShowWindow(g_hBlackScreen,SW_SHOW);SetForegroundWindow(g_hBlackScreen);
+            }break;
         }break;
 
     case WM_SCAN_RESULT:{
@@ -913,7 +1109,16 @@ static LRESULT CALLBACK WndProc(HWND hWnd,UINT msg,WPARAM wParam,LPARAM lParam){
     }
 
     case WM_GETMINMAXINFO:((MINMAXINFO*)lParam)->ptMinTrackSize={700,550};break;
-    case WM_CLOSE:if(g_monitoring)StopMon();DestroyWindow(hWnd);break;
+    case WM_CLOSE:
+        // If overlay exists, just hide settings window instead of quitting
+        if (g_hOverlay && g_monitoring) {
+            ShowWindow(hWnd, SW_HIDE);
+            return 0; // don't destroy
+        }
+        if(g_monitoring)StopMon();
+        if(g_hOverlay){DestroyWindow(g_hOverlay);g_hOverlay=nullptr;}
+        DestroyWindow(hWnd);
+        break;
     case WM_DESTROY:
         if(g_hFont)DeleteObject(g_hFont);if(g_hFontBold)DeleteObject(g_hFontBold);
         if(g_hFontBig)DeleteObject(g_hFontBig);if(g_hFontSmall)DeleteObject(g_hFontSmall);
@@ -950,7 +1155,39 @@ int WINAPI wWinMain(HINSTANCE hI,HINSTANCE,LPWSTR,int nS){
         nullptr,nullptr,hI,nullptr);
 
     if(!g_hWnd){MessageBoxW(nullptr,L"Failed",L"Error",MB_ICONERROR);return 1;}
-    ShowWindow(g_hWnd,nS);UpdateWindow(g_hWnd);
+
+    // Register overlay class
+    {WNDCLASSEXW oc={};oc.cbSize=sizeof(oc);oc.lpfnWndProc=OverlayProc;
+     oc.hInstance=hI;oc.hCursor=LoadCursor(nullptr,IDC_ARROW);
+     oc.lpszClassName=OVERLAY_CLASS;RegisterClassExW(&oc);}
+
+    // Create overlay (semi-transparent, always-on-top, right-top corner)
+    g_hOverlay = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+        OVERLAY_CLASS, L"SmartScreen",
+        WS_POPUP | WS_VISIBLE,
+        sx - OVL_W - 20, 20, OVL_W, OVL_H,
+        nullptr, nullptr, hI, nullptr);
+    // Set 85% opacity (alpha=216)
+    SetLayeredWindowAttributes(g_hOverlay, 0, 216, LWA_ALPHA);
+
+    // Apply fonts to overlay children
+    if (g_hOverlay) {
+        EnumChildWindows(g_hOverlay, [](HWND h, LPARAM f) -> BOOL {
+            SendMessage(h, WM_SETFONT, (WPARAM)f, TRUE); return TRUE;
+        }, (LPARAM)g_hFont);
+        if (g_hOvlState && g_hFontBold)
+            SendMessage(g_hOvlState, WM_SETFONT, (WPARAM)g_hFontBold, TRUE);
+    }
+
+    // If config exists, settings window starts hidden (overlay is shown)
+    BTH_ADDR chk = 0;
+    if (LoadConfig(chk) && chk != 0) {
+        ShowWindow(g_hWnd, SW_HIDE); // hide settings, overlay is visible
+    } else {
+        ShowWindow(g_hWnd, nS); // no config, show settings for first setup
+    }
+    UpdateWindow(g_hWnd);
 
     MSG msg;
     while(GetMessage(&msg,nullptr,0,0)){TranslateMessage(&msg);DispatchMessage(&msg);}
