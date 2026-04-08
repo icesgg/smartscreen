@@ -208,7 +208,14 @@ static LRESULT CALLBACK OverlayProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 // ---------------------------------------------------------------------------
 static void ResetCountdown() {
     g_nCountdown = g_idleCountdownSec;
-    if (g_bBlackActive) DeactivateBlackScreen();
+    if (g_bBlackActive) {
+        // Delay applies to both Auto and Manual
+        if (g_unlockDelaySec > 0 && g_lockStartTick > 0) {
+            DWORD elapsed = (DWORD)((GetTickCount64() - g_lockStartTick) / 1000);
+            if (elapsed < (DWORD)g_unlockDelaySec) return;
+        }
+        DeactivateBlackScreen();
+    }
     if (g_ovlInfo[0]) { g_ovlInfo[0] = L'\0'; if (g_hOverlay) InvalidateRect(g_hOverlay, nullptr, TRUE); }
 }
 
@@ -315,7 +322,7 @@ static void StartMon() {
     swprintf_s(buf, L"%d", v); SetWindowTextW(g_hEditIdle, buf);
     g_unlockAuto = (SendMessageW(g_hComboUnlock, CB_GETCURSEL, 0, 0) == 0);
     GetWindowTextW(g_hEditDelay, buf, _countof(buf));
-    v = _wtoi(buf); if (v < 0) v = 0; if (v > 10) v = 10;
+    v = _wtoi(buf); if (v < 0) v = 0; if (v > 300) v = 300;
     g_unlockDelaySec = v; swprintf_s(buf, L"%d", v); SetWindowTextW(g_hEditDelay, buf);
 
     g_selectedIdx = sel;
@@ -459,11 +466,15 @@ static void OnResult(ProbeResult* r) {
         ULONGLONG cut=fe.tickMs>CHART_WINDOW_MS?fe.tickMs-CHART_WINDOW_MS:0;
         while(!g_farEvents.empty()&&g_farEvents.front().tickMs<cut)
             g_farEvents.erase(g_farEvents.begin());
+        // FAR transition -> activate black screen immediately
+        if (!g_bBlackActive) ActivateBlackScreen();
     }
     if(g_hChart)InvalidateRect(g_hChart,nullptr,FALSE);
 
-    if (g_unlockAuto && !g_bManualLock && r->state == ProxState::Near && g_bBlackActive) {
-        if (g_unlockTimer <= 0) { g_unlockTimer = g_unlockDelaySec; if (g_unlockTimer <= 0) DeactivateBlackScreen(); }
+    // BT NEAR + black screen active -> start unlock delay (both Auto and Manual)
+    if (r->state == ProxState::Near && g_bBlackActive && g_unlockTimer <= 0) {
+        g_unlockTimer = g_unlockDelaySec;
+        if (g_unlockTimer <= 0) DeactivateBlackScreen(); // delay=0 -> instant
     }
     if (r->state == ProxState::Far) g_unlockTimer = 0;
     if (r->state == ProxState::Near) g_nCountdown = g_idleCountdownSec;
@@ -546,7 +557,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         // Row 1: BT settings
         CreateWindowExW(0,L"STATIC",L"Near<=",WS_CHILD|WS_VISIBLE,10,94,48,20,hWnd,nullptr,GetModuleHandle(nullptr),nullptr);
-        g_hEditLatency=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"300",WS_CHILD|WS_VISIBLE|ES_NUMBER|ES_CENTER,
+        g_hEditLatency=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"200",WS_CHILD|WS_VISIBLE|ES_NUMBER|ES_CENTER,
             58,92,45,22,hWnd,(HMENU)(UINT_PTR)ID_EDIT_LATENCY,GetModuleHandle(nullptr),nullptr);
         CreateWindowExW(0,L"STATIC",L"ms  Timeout:",WS_CHILD|WS_VISIBLE,108,94,85,20,hWnd,nullptr,GetModuleHandle(nullptr),nullptr);
         g_hEditTimeout=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"5",WS_CHILD|WS_VISIBLE|ES_NUMBER|ES_CENTER,
@@ -590,7 +601,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             (HMENU)(UINT_PTR)ID_BTN_BANNER_IMG,GetModuleHandle(nullptr),nullptr);
 
         // Enterprise button
-        CreateWindowExW(0,L"BUTTON",L"\xAE30\xC5C5\xC6A9 \xC2E0\xCCAD\xD558\xAE30",  // 기업용 신청하기
+        CreateWindowExW(0,L"BUTTON",L"\xAE30\xC5C5\xC6A9 \xB458\xB7EC\xBCF4\xAE30",  // 기업용 둘러보기
             WS_CHILD|WS_VISIBLE,600,140,160,46,hWnd,
             (HMENU)(UINT_PTR)ID_BTN_ENTERPRISE,GetModuleHandle(nullptr),nullptr);
 
@@ -669,17 +680,31 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_TIMER:
         if (wParam == IDT_COUNTDOWN && g_monitoring) {
             if (!g_bBlackActive) {
-                if (g_proxState == ProxState::Near) g_nCountdown = g_idleCountdownSec;
-                else if (g_nCountdown > 0) g_nCountdown--;
-                if (g_nCountdown == 0) ActivateBlackScreen();
+                if (g_proxState == ProxState::Near) {
+                    g_nCountdown = g_idleCountdownSec; // suppress when nearby
+                } else {
+                    // FAR: count down to black screen
+                    if (g_nCountdown > 0) g_nCountdown--;
+                    if (g_nCountdown == 0) ActivateBlackScreen();
+                }
             }
-            if (g_bBlackActive && g_unlockAuto && !g_bManualLock && g_unlockTimer > 0) {
+            // Also: if FAR persists beyond timeout, activate immediately
+            // (even if idle countdown hasn't started yet)
+            if (!g_bBlackActive && g_proxState == ProxState::Far && g_monitoring) {
+                ULONGLONG now = GetTickCount64();
+                if (g_lastNearTick > 0 && (now - g_lastNearTick) >= (ULONGLONG)(g_keepAliveSec + g_idleCountdownSec) * 1000) {
+                    // Device has been FAR for timeout + idle period -> force activate
+                    g_nCountdown = 0;
+                    ActivateBlackScreen();
+                }
+            }
+            if (g_bBlackActive && g_unlockTimer > 0) {
                 g_unlockTimer--;
                 if (g_unlockTimer <= 0) DeactivateBlackScreen();
             }
             wchar_t cdl[96];
-            if (g_bBlackActive && g_unlockAuto && g_unlockTimer > 0)
-                swprintf_s(cdl, L"  LOCKED - auto unlock in %d sec", g_unlockTimer);
+            if (g_bBlackActive && g_unlockTimer > 0)
+                swprintf_s(cdl, L"  LOCKED - unlock in %d sec", g_unlockTimer);
             else if (g_bBlackActive)
                 swprintf_s(cdl, L"  LOCKED (%s)", g_unlockAuto ? L"auto" : L"manual");
             else if (g_proxState == ProxState::Near) wcscpy_s(cdl, L"  Screen saver: suppressed (NEAR)");
@@ -741,7 +766,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
         } break;
         case ID_BTN_ENTERPRISE:
-            ShellExecuteW(nullptr, L"open", L"https://smartscreen.example.com/apply", nullptr, nullptr, SW_SHOW);
+            ShellExecuteW(nullptr, L"open", L"https://icesgg.github.io/smartscreen/web/", nullptr, nullptr, SW_SHOW);
             break;
         }break;
 

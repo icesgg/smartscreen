@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SmartScreen Admin</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #242835;
+    --border: #2e3345;
+    --text: #e4e6ed;
+    --text-dim: #8b8fa3;
+    --accent: #4f8cff;
+    --accent-hover: #6ba0ff;
+    --danger: #f04e5e;
+    --danger-hover: #f2727f;
+    --success: #34d399;
+    --radius: 8px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+  button {
+    cursor: pointer;
+    border: none;
+    border-radius: var(--radius);
+    font-size: 14px;
+    padding: 8px 16px;
+    transition: background 0.15s;
+  }
+  input, select {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    padding: 8px 12px;
+    font-size: 14px;
+    outline: none;
+  }
+  input:focus, select:focus { border-color: var(--accent); }
+
+  /* ── 로그인 화면 ── */
+  #auth-screen {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+  }
+  .auth-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 40px;
+    width: 380px;
+  }
+  .auth-card h1 { font-size: 22px; margin-bottom: 4px; }
+  .auth-card p.sub { color: var(--text-dim); font-size: 13px; margin-bottom: 24px; }
+  .auth-card label { display: block; font-size: 13px; color: var(--text-dim); margin-bottom: 4px; }
+  .auth-card input { width: 100%; margin-bottom: 14px; }
+  .auth-card .btn-primary {
+    width: 100%;
+    background: var(--accent);
+    color: #fff;
+    padding: 10px;
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+  .auth-card .btn-primary:hover { background: var(--accent-hover); }
+  .auth-card .btn-secondary {
+    width: 100%;
+    background: transparent;
+    color: var(--accent);
+    border: 1px solid var(--border);
+    padding: 10px;
+  }
+  .auth-card .btn-secondary:hover { background: var(--surface2); }
+  .auth-error { color: var(--danger); font-size: 13px; margin-bottom: 10px; display: none; }
+
+  /* ── 대시보드 ── */
+  #dashboard { display: none; }
+  .topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 32px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+  .topbar h2 { font-size: 18px; }
+  .topbar .right { display: flex; align-items: center; gap: 12px; }
+  .topbar .btn-sm {
+    background: var(--surface2);
+    color: var(--text-dim);
+    font-size: 13px;
+    padding: 6px 12px;
+  }
+  .topbar .btn-sm:hover { color: var(--text); background: var(--border); }
+
+  .container { max-width: 960px; margin: 0 auto; padding: 32px 24px; }
+
+  /* 업로드 폼 */
+  .upload-section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    margin-bottom: 24px;
+  }
+  .upload-section h3 { font-size: 15px; margin-bottom: 16px; }
+  .upload-row {
+    display: flex;
+    gap: 12px;
+    align-items: end;
+    flex-wrap: wrap;
+  }
+  .upload-row .field { display: flex; flex-direction: column; gap: 4px; }
+  .upload-row .field label { font-size: 12px; color: var(--text-dim); }
+  .upload-row input[type="file"] { padding: 6px; }
+  .upload-row select { min-width: 120px; }
+  .btn-upload {
+    background: var(--accent);
+    color: #fff;
+    font-weight: 600;
+    padding: 9px 20px;
+  }
+  .btn-upload:hover { background: var(--accent-hover); }
+  .btn-upload:disabled { opacity: 0.5; cursor: not-allowed; }
+  .upload-status { font-size: 13px; color: var(--text-dim); margin-top: 10px; }
+
+  /* 콘텐츠 테이블 */
+  .content-section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  .content-section h3 { font-size: 15px; padding: 20px 24px 0 24px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+  th {
+    text-align: left;
+    padding: 10px 16px;
+    font-size: 12px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface2);
+  }
+  td {
+    padding: 12px 16px;
+    font-size: 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  tr:last-child td { border-bottom: none; }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .badge-image { background: #1e3a5f; color: #60a5fa; }
+  .badge-video { background: #3b1f4b; color: #c084fc; }
+  .badge-center { background: #1a3329; color: var(--success); }
+  .badge-banner { background: #3b2f1a; color: #fbbf24; }
+  .btn-delete {
+    background: transparent;
+    color: var(--danger);
+    font-size: 13px;
+    padding: 4px 10px;
+    border: 1px solid var(--danger);
+  }
+  .btn-delete:hover { background: var(--danger); color: #fff; }
+  .empty-msg { padding: 40px; text-align: center; color: var(--text-dim); }
+
+  /* Org ID 표시 */
+  .org-id-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 24px;
+    font-size: 13px;
+    color: var(--text-dim);
+  }
+  .org-id-bar code {
+    background: var(--surface2);
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-family: monospace;
+    color: var(--text);
+    font-size: 13px;
+  }
+  .btn-copy {
+    background: var(--surface2);
+    color: var(--text-dim);
+    font-size: 12px;
+    padding: 4px 10px;
+  }
+  .btn-copy:hover { color: var(--text); }
+
+  .toast {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    background: var(--success);
+    color: #000;
+    padding: 10px 20px;
+    border-radius: var(--radius);
+    font-size: 14px;
+    opacity: 0;
+    transition: opacity 0.3s;
+    pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+
+<!-- ── 로그인 / 회원가입 ── -->
+<div id="auth-screen">
+  <div class="auth-card">
+    <h1>SmartScreen Admin</h1>
+    <p class="sub">Enterprise 콘텐츠 관리 대시보드</p>
+    <div id="auth-error" class="auth-error"></div>
+    <label>이메일</label>
+    <input type="email" id="email" placeholder="admin@company.com">
+    <label>비밀번호</label>
+    <input type="password" id="password" placeholder="••••••••">
+    <div id="org-name-field" style="display:none">
+      <label>조직 이름 (신규 가입 시)</label>
+      <input type="text" id="org-name" placeholder="회사명" style="width:100%;margin-bottom:14px">
+    </div>
+    <button class="btn-primary" id="btn-login" onclick="handleLogin()">로그인</button>
+    <button class="btn-secondary" id="btn-register" onclick="handleRegister()">새 계정 만들기</button>
+  </div>
+</div>
+
+<!-- ── 대시보드 ── -->
+<div id="dashboard">
+  <div class="topbar">
+    <h2 id="org-title">SmartScreen</h2>
+    <div class="right">
+      <span id="user-email" style="font-size:13px;color:var(--text-dim)"></span>
+      <button class="btn-sm" onclick="handleLogout()">로그아웃</button>
+    </div>
+  </div>
+  <div class="container">
+    <!-- 조직 ID -->
+    <div class="org-id-bar">
+      <span>조직 ID:</span>
+      <code id="org-id-display">-</code>
+      <button class="btn-copy" onclick="copyOrgId()">복사</button>
+    </div>
+
+    <!-- 업로드 -->
+    <div class="upload-section">
+      <h3>콘텐츠 업로드</h3>
+      <div class="upload-row">
+        <div class="field">
+          <label>파일 선택</label>
+          <input type="file" id="file-input" accept="image/*,video/*">
+        </div>
+        <div class="field">
+          <label>표시 위치</label>
+          <select id="position-select">
+            <option value="center">중앙 (Center)</option>
+            <option value="banner">배너 (Banner)</option>
+          </select>
+        </div>
+        <button class="btn-upload" id="btn-upload" onclick="handleUpload()">업로드</button>
+      </div>
+      <div class="upload-status" id="upload-status"></div>
+    </div>
+
+    <!-- 콘텐츠 목록 -->
+    <div class="content-section">
+      <h3>콘텐츠 목록</h3>
+      <div id="content-list"></div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script type="module">
+// ── Supabase 설정 ──
+// 아래 값을 본인의 Supabase 프로젝트 값으로 교체하세요
+const SUPABASE_URL = 'SUPABASE_URL';
+const SUPABASE_ANON_KEY = 'SUPABASE_ANON_KEY';
+
+import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+let currentOrg = null;
+
+// ── 유틸리티 ──
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), 2500);
+}
+
+function showError(msg) {
+  const el = document.getElementById('auth-error');
+  el.textContent = msg;
+  el.style.display = 'block';
+}
+
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1048576).toFixed(1) + ' MB';
+}
+
+function formatDate(iso) {
+  return new Date(iso).toLocaleDateString('ko-KR', {
+    year: 'numeric', month: '2-digit', day: '2-digit'
+  });
+}
+
+// SHA-256 해시 계산
+async function computeSHA256(file) {
+  const buffer = await file.arrayBuffer();
+  const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// ── 인증 ──
+window.handleLogin = async function () {
+  const email = document.getElementById('email').value.trim();
+  const password = document.getElementById('password').value;
+  if (!email || !password) return showError('이메일과 비밀번호를 입력하세요.');
+  const { error } = await supabase.auth.signInWithPassword({ email, password });
+  if (error) return showError(error.message);
+  await initDashboard();
+};
+
+window.handleRegister = async function () {
+  const field = document.getElementById('org-name-field');
+  if (field.style.display === 'none') {
+    field.style.display = 'block';
+    return;
+  }
+  const email = document.getElementById('email').value.trim();
+  const password = document.getElementById('password').value;
+  const orgName = document.getElementById('org-name').value.trim();
+  if (!email || !password) return showError('이메일과 비밀번호를 입력하세요.');
+  if (!orgName) return showError('조직 이름을 입력하세요.');
+
+  const { data, error } = await supabase.auth.signUp({ email, password });
+  if (error) return showError(error.message);
+
+  // 조직 생성 (트리거가 admin 멤버 자동 등록)
+  const { error: orgErr } = await supabase.from('orgs').insert({
+    name: orgName,
+    created_by: data.user.id
+  });
+  if (orgErr) return showError('조직 생성 실패: ' + orgErr.message);
+
+  await initDashboard();
+};
+
+window.handleLogout = async function () {
+  await supabase.auth.signOut();
+  currentOrg = null;
+  document.getElementById('auth-screen').style.display = 'flex';
+  document.getElementById('dashboard').style.display = 'none';
+  document.getElementById('auth-error').style.display = 'none';
+};
+
+// ── 대시보드 초기화 ──
+async function initDashboard() {
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return;
+
+  // 소속 조직 조회
+  const { data: membership } = await supabase
+    .from('org_members')
+    .select('org_id, role, orgs(id, name)')
+    .eq('user_id', user.id)
+    .limit(1)
+    .single();
+
+  if (!membership) {
+    showError('소속된 조직이 없습니다.');
+    return;
+  }
+
+  currentOrg = membership.orgs;
+
+  document.getElementById('auth-screen').style.display = 'none';
+  document.getElementById('dashboard').style.display = 'block';
+  document.getElementById('org-title').textContent = currentOrg.name;
+  document.getElementById('org-id-display').textContent = currentOrg.id;
+  document.getElementById('user-email').textContent = user.email;
+
+  await loadContents();
+}
+
+// ── 콘텐츠 목록 로드 ──
+async function loadContents() {
+  if (!currentOrg) return;
+  const { data, error } = await supabase
+    .from('contents')
+    .select('*')
+    .eq('org_id', currentOrg.id)
+    .order('created_at', { ascending: false });
+
+  const container = document.getElementById('content-list');
+  if (error || !data || data.length === 0) {
+    container.innerHTML = '<div class="empty-msg">등록된 콘텐츠가 없습니다.</div>';
+    return;
+  }
+
+  let html = `<table><thead><tr>
+    <th>파일명</th><th>유형</th><th>위치</th><th>크기</th><th>업로드일</th><th></th>
+  </tr></thead><tbody>`;
+
+  for (const c of data) {
+    const typeBadge = c.content_type === 'image'
+      ? '<span class="badge badge-image">이미지</span>'
+      : '<span class="badge badge-video">동영상</span>';
+    const posBadge = c.display_position === 'center'
+      ? '<span class="badge badge-center">중앙</span>'
+      : '<span class="badge badge-banner">배너</span>';
+
+    html += `<tr>
+      <td>${escapeHtml(c.filename)}</td>
+      <td>${typeBadge}</td>
+      <td>${posBadge}</td>
+      <td>${formatSize(c.file_size)}</td>
+      <td>${formatDate(c.created_at)}</td>
+      <td><button class="btn-delete" data-id="${c.id}" data-path="${escapeHtml(c.storage_path)}">삭제</button></td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  container.innerHTML = html;
+
+  // 삭제 버튼 이벤트
+  container.querySelectorAll('.btn-delete').forEach(btn => {
+    btn.addEventListener('click', () => handleDelete(btn.dataset.id, btn.dataset.path));
+  });
+}
+
+function escapeHtml(str) {
+  const d = document.createElement('div');
+  d.textContent = str;
+  return d.innerHTML;
+}
+
+// ── 업로드 ──
+window.handleUpload = async function () {
+  const fileInput = document.getElementById('file-input');
+  const position = document.getElementById('position-select').value;
+  const status = document.getElementById('upload-status');
+  const btn = document.getElementById('btn-upload');
+
+  const file = fileInput.files[0];
+  if (!file) { status.textContent = '파일을 선택하세요.'; return; }
+  if (!currentOrg) return;
+
+  btn.disabled = true;
+  status.textContent = '해시 계산 중...';
+
+  try {
+    const hash = await computeSHA256(file);
+    const contentType = file.type.startsWith('video/') ? 'video' : 'image';
+    const ext = file.name.split('.').pop();
+    const storagePath = `${currentOrg.id}/${hash}.${ext}`;
+
+    status.textContent = '업로드 중...';
+
+    // Storage 업로드
+    const { error: uploadErr } = await supabase.storage
+      .from('content')
+      .upload(storagePath, file, { upsert: true });
+
+    if (uploadErr) throw uploadErr;
+
+    // DB 레코드 생성
+    const { error: dbErr } = await supabase.from('contents').insert({
+      org_id: currentOrg.id,
+      filename: file.name,
+      storage_path: storagePath,
+      file_hash: hash,
+      file_size: file.size,
+      content_type: contentType,
+      display_position: position
+    });
+
+    if (dbErr) throw dbErr;
+
+    status.textContent = '업로드 완료!';
+    fileInput.value = '';
+    toast('콘텐츠가 업로드되었습니다.');
+    await loadContents();
+  } catch (e) {
+    status.textContent = '오류: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+// ── 삭제 ──
+async function handleDelete(id, storagePath) {
+  if (!confirm('이 콘텐츠를 삭제하시겠습니까?')) return;
+
+  const { error: storageErr } = await supabase.storage
+    .from('content')
+    .remove([storagePath]);
+
+  const { error: dbErr } = await supabase.from('contents')
+    .delete()
+    .eq('id', id);
+
+  if (dbErr) { toast('삭제 실패: ' + dbErr.message); return; }
+
+  toast('삭제되었습니다.');
+  await loadContents();
+}
+
+// ── 조직 ID 복사 ──
+window.copyOrgId = function () {
+  if (!currentOrg) return;
+  navigator.clipboard.writeText(currentOrg.id).then(() => toast('조직 ID가 복사되었습니다.'));
+};
+
+// ── 페이지 로드 시 세션 확인 ──
+const { data: { session } } = await supabase.auth.getSession();
+if (session) await initDashboard();
+</script>
+</body>
+</html>

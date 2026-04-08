@@ -4,7 +4,7 @@
 
 struct AppConfig {
     BTH_ADDR btAddress = 0;
-    DWORD nearLatencyMs = 300;
+    DWORD nearLatencyMs = 200;
     DWORD keepAliveSec = 5;
     DWORD scanIntervalSec = 2;
     int idleCountdownSec = 20;

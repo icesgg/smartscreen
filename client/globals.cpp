@@ -2,7 +2,7 @@
 #include "common.h"
 
 // User-configurable settings
-DWORD  g_nearLatencyMs    = 300;
+DWORD  g_nearLatencyMs    = 200;
 DWORD  g_keepAliveSec     = 5;
 DWORD  g_scanIntervalSec  = 2;
 int    g_idleCountdownSec = 20;
