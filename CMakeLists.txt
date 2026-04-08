@@ -10,9 +10,12 @@ add_executable(SmartScreen WIN32
     client/config.cpp
     client/bluetooth.cpp
     client/blackscreen.cpp
+    client/enterprise/supabase.cpp
+    client/p2p/discovery.cpp
+    client/p2p/transfer.cpp
 )
 
-target_include_directories(SmartScreen PRIVATE client)
+target_include_directories(SmartScreen PRIVATE client client/enterprise client/p2p)
 
 target_link_libraries(SmartScreen PRIVATE
     ws2_32
@@ -23,6 +26,7 @@ target_link_libraries(SmartScreen PRIVATE
     shell32
     gdiplus
     comdlg32
+    winhttp
 )
 
 target_compile_definitions(SmartScreen PRIVATE UNICODE _UNICODE)
