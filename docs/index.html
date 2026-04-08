@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SmartScreen - 스마트 화면보호기</title>
+<style>
+  :root {
+    --bg: #0a0b10;
+    --surface: #13151d;
+    --surface2: #1c1f2b;
+    --border: #2a2e3e;
+    --text: #e8eaf0;
+    --text-dim: #7d829a;
+    --accent: #4f8cff;
+    --accent-hover: #6ba0ff;
+    --green: #34d399;
+    --orange: #f59e0b;
+    --radius: 12px;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg); color: var(--text);
+    line-height: 1.7;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { color: var(--accent-hover); }
+
+  /* Nav */
+  nav {
+    position: fixed; top:0; width:100%; z-index:100;
+    background: rgba(10,11,16,0.85); backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+    padding: 0 40px; height: 64px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  nav .logo { font-size: 20px; font-weight: 700; }
+  nav .logo span { color: var(--accent); }
+  nav .nav-links { display: flex; gap: 32px; align-items: center; }
+  nav .nav-links a { color: var(--text-dim); font-size: 14px; }
+  nav .nav-links a:hover { color: var(--text); }
+  .btn {
+    display: inline-block; padding: 10px 24px; border-radius: var(--radius);
+    font-weight: 600; font-size: 14px; border: none; cursor: pointer;
+    transition: all 0.2s;
+  }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { background: var(--accent-hover); transform: translateY(-1px); }
+  .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  .btn-outline:hover { border-color: var(--accent); color: var(--accent); }
+  .btn-large { padding: 14px 36px; font-size: 16px; }
+
+  /* Hero */
+  .hero {
+    min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    text-align: center; padding: 120px 40px 80px;
+    background: radial-gradient(ellipse at 50% 0%, rgba(79,140,255,0.08) 0%, transparent 60%);
+  }
+  .hero h1 { font-size: 56px; font-weight: 800; line-height: 1.2; margin-bottom: 24px; }
+  .hero h1 .highlight { color: var(--accent); }
+  .hero p { font-size: 20px; color: var(--text-dim); max-width: 640px; margin: 0 auto 40px; }
+  .hero-buttons { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+  .hero-badge {
+    display: inline-block; padding: 6px 16px; border-radius: 20px;
+    background: rgba(52,211,153,0.1); color: var(--green);
+    font-size: 13px; font-weight: 600; margin-bottom: 20px;
+  }
+
+  /* Section */
+  section { padding: 100px 40px; max-width: 1100px; margin: 0 auto; }
+  .section-title {
+    font-size: 36px; font-weight: 700; text-align: center; margin-bottom: 16px;
+  }
+  .section-sub {
+    font-size: 18px; color: var(--text-dim); text-align: center;
+    max-width: 600px; margin: 0 auto 60px;
+  }
+
+  /* Features */
+  .features-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 24px;
+  }
+  .feature-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 32px;
+    transition: border-color 0.3s;
+  }
+  .feature-card:hover { border-color: var(--accent); }
+  .feature-icon { font-size: 36px; margin-bottom: 16px; }
+  .feature-card h3 { font-size: 20px; margin-bottom: 8px; }
+  .feature-card p { color: var(--text-dim); font-size: 15px; }
+
+  /* How it works */
+  .steps {
+    display: flex; gap: 32px; flex-wrap: wrap; justify-content: center;
+  }
+  .step {
+    flex: 1; min-width: 220px; max-width: 280px; text-align: center;
+    padding: 32px 20px;
+  }
+  .step-num {
+    width: 48px; height: 48px; border-radius: 50%;
+    background: var(--accent); color: #fff; font-size: 20px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+    margin: 0 auto 16px;
+  }
+  .step h3 { margin-bottom: 8px; }
+  .step p { color: var(--text-dim); font-size: 14px; }
+
+  /* Pricing */
+  .pricing-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 24px; max-width: 800px; margin: 0 auto;
+  }
+  .price-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 40px 32px; text-align: center;
+    position: relative;
+  }
+  .price-card.featured { border-color: var(--accent); }
+  .price-card.featured::before {
+    content: 'POPULAR'; position: absolute; top: -12px; left: 50%;
+    transform: translateX(-50%); background: var(--accent); color: #fff;
+    padding: 4px 16px; border-radius: 12px; font-size: 12px; font-weight: 700;
+  }
+  .price-card h3 { font-size: 24px; margin-bottom: 8px; }
+  .price-card .price { font-size: 40px; font-weight: 800; margin: 16px 0; }
+  .price-card .price span { font-size: 16px; color: var(--text-dim); font-weight: 400; }
+  .price-card ul { list-style: none; text-align: left; margin: 24px 0; }
+  .price-card ul li {
+    padding: 8px 0; border-bottom: 1px solid var(--border);
+    font-size: 14px; color: var(--text-dim);
+  }
+  .price-card ul li::before { content: '✓ '; color: var(--green); font-weight: 700; }
+
+  /* Enterprise features */
+  .ent-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 40px; align-items: center;
+  }
+  .ent-visual {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 40px; text-align: center;
+  }
+  .ent-visual .diagram {
+    font-family: monospace; color: var(--accent); font-size: 13px;
+    white-space: pre; line-height: 1.5; text-align: left;
+  }
+
+  /* CTA */
+  .cta {
+    text-align: center; padding: 80px 40px;
+    background: linear-gradient(180deg, var(--bg) 0%, var(--surface) 100%);
+    border-top: 1px solid var(--border);
+  }
+  .cta h2 { font-size: 32px; margin-bottom: 16px; }
+  .cta p { color: var(--text-dim); margin-bottom: 32px; }
+
+  /* Footer */
+  footer {
+    text-align: center; padding: 40px;
+    border-top: 1px solid var(--border);
+    color: var(--text-dim); font-size: 13px;
+  }
+
+  @media (max-width: 768px) {
+    .hero h1 { font-size: 36px; }
+    .ent-grid { grid-template-columns: 1fr; }
+    nav { padding: 0 20px; }
+    section { padding: 60px 20px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Nav -->
+<nav>
+  <div class="logo">Smart<span>Screen</span></div>
+  <div class="nav-links">
+    <a href="#features">기능</a>
+    <a href="#how">사용방법</a>
+    <a href="#enterprise">기업용</a>
+    <a href="#pricing">요금</a>
+    <a href="dashboard.html" class="btn btn-primary">관리자 로그인</a>
+  </div>
+</nav>
+
+<!-- Hero -->
+<section class="hero">
+  <div>
+    <div class="hero-badge">개인용 무료</div>
+    <h1>스마트폰이 멀어지면<br><span class="highlight">자동으로 화면 보호</span></h1>
+    <p>블루투스로 스마트폰 거리를 감지하여, 자리를 비우면 자동 화면 잠금,
+       돌아오면 자동 해제. 개인정보와 업무 화면을 안전하게 보호합니다.</p>
+    <div class="hero-buttons">
+      <a href="https://github.com/icesgg/smartscreen/releases" class="btn btn-primary btn-large">다운로드 (무료)</a>
+      <a href="#enterprise" class="btn btn-outline btn-large">기업용 둘러보기</a>
+    </div>
+  </div>
+</section>
+
+<!-- Features -->
+<section id="features">
+  <h2 class="section-title">주요 기능</h2>
+  <p class="section-sub">설치 후 블루투스 페어링만 하면 바로 사용할 수 있습니다</p>
+  <div class="features-grid">
+    <div class="feature-card">
+      <div class="feature-icon">📡</div>
+      <h3>블루투스 근접 감지</h3>
+      <p>페어링된 스마트폰의 블루투스 신호를 실시간 측정하여 거리를 판단합니다.
+         듀얼 소켓 방식으로 정확도를 높였습니다.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">🔒</div>
+      <h3>자동 화면 잠금</h3>
+      <p>스마트폰이 멀어지면 자동으로 화면을 잠급니다.
+         잠금 지연시간, 해제 방식 등을 세밀하게 설정할 수 있습니다.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">🔓</div>
+      <h3>스마트 해제</h3>
+      <p>스마트폰을 들고 자리에 돌아오면 자동으로 화면이 해제됩니다.
+         마우스/키보드로도 해제 가능합니다.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">🖼️</div>
+      <h3>커스텀 잠금 화면</h3>
+      <p>잠금 화면에 원하는 이미지나 동영상을 표시할 수 있습니다.
+         기업용에서는 홍보 콘텐츠를 전사에 송출합니다.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">📊</div>
+      <h3>30분 타임라인</h3>
+      <p>근접/이탈 이벤트를 30분 차트로 시각화합니다.
+         자리 비움 패턴을 한눈에 파악할 수 있습니다.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">📱</div>
+      <h3>자동 재연결</h3>
+      <p>스마트폰이 범위를 벗어났다가 돌아오면 자동으로 블루투스가 재연결됩니다.
+         별도 조작이 필요 없습니다.</p>
+    </div>
+  </div>
+</section>
+
+<!-- How it works -->
+<section id="how">
+  <h2 class="section-title">사용 방법</h2>
+  <p class="section-sub">3단계로 간단하게 시작하세요</p>
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <h3>설치 & 페어링</h3>
+      <p>SmartScreen을 설치하고 Windows 블루투스 설정에서 스마트폰을 페어링합니다.</p>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <h3>기기 선택</h3>
+      <p>SmartScreen에서 페어링된 기기를 선택하고 Start를 누릅니다.</p>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <h3>자동 보호</h3>
+      <p>이제 자리를 비우면 자동 잠금, 돌아오면 자동 해제됩니다.</p>
+    </div>
+  </div>
+</section>
+
+<!-- Enterprise -->
+<section id="enterprise">
+  <h2 class="section-title">기업용</h2>
+  <p class="section-sub">전사 화면 보호 + 사내 홍보 콘텐츠 송출</p>
+  <div class="ent-grid">
+    <div>
+      <h3 style="font-size:24px; margin-bottom:16px;">중앙 관리 대시보드</h3>
+      <ul style="list-style:none; font-size:15px; color:var(--text-dim);">
+        <li style="padding:10px 0; border-bottom:1px solid var(--border);">
+          ✅ 웹 대시보드에서 이미지/동영상 업로드
+        </li>
+        <li style="padding:10px 0; border-bottom:1px solid var(--border);">
+          ✅ 업로드한 콘텐츠가 직원 PC 잠금 화면에 자동 표시
+        </li>
+        <li style="padding:10px 0; border-bottom:1px solid var(--border);">
+          ✅ P2P 배포: 서버 부하 없이 사내망에서 자동 전파
+        </li>
+        <li style="padding:10px 0; border-bottom:1px solid var(--border);">
+          ✅ 조직별 콘텐츠 관리 (조직 ID로 구분)
+        </li>
+        <li style="padding:10px 0;">
+          ✅ 보안: 직원이 자리 비우면 즉시 화면 보호
+        </li>
+      </ul>
+    </div>
+    <div class="ent-visual">
+      <div class="diagram">
+  ┌──────────────┐
+  │  관리자 웹    │  이미지/동영상 업로드
+  │  대시보드     │
+  └──────┬───────┘
+         │ Supabase Cloud
+  ┌──────┴───────┐
+  │   첫 번째     │  서버에서 다운로드
+  │   직원 PC     │
+  └──────┬───────┘
+    P2P  │  사내망
+  ┌──────┴───────┐
+  │  직원 PC #2   │  P2P로 전파
+  │  직원 PC #3   │  (서버 접속 불필요)
+  │  직원 PC #N   │
+  └──────────────┘</div>
+    </div>
+  </div>
+</section>
+
+<!-- Pricing -->
+<section id="pricing">
+  <h2 class="section-title">요금</h2>
+  <p class="section-sub">개인은 무료, 기업은 합리적인 가격으로</p>
+  <div class="pricing-grid">
+    <div class="price-card">
+      <h3>개인용</h3>
+      <div class="price">무료</div>
+      <ul>
+        <li>블루투스 근접 감지</li>
+        <li>자동 화면 잠금/해제</li>
+        <li>커스텀 잠금 화면 (로컬 이미지)</li>
+        <li>30분 타임라인 차트</li>
+        <li>자동 재연결</li>
+        <li>설정 저장/복원</li>
+      </ul>
+      <a href="https://github.com/icesgg/smartscreen/releases" class="btn btn-outline" style="width:100%;">다운로드</a>
+    </div>
+    <div class="price-card featured">
+      <h3>기업용</h3>
+      <div class="price">문의<span> / 조직</span></div>
+      <ul>
+        <li>개인용 기능 전체 포함</li>
+        <li>웹 관리 대시보드</li>
+        <li>이미지/동영상 중앙 송출</li>
+        <li>P2P 사내망 자동 배포</li>
+        <li>조직별 콘텐츠 관리</li>
+        <li>전담 기술 지원</li>
+      </ul>
+      <a href="dashboard.html" class="btn btn-primary" style="width:100%;">무료 체험 시작</a>
+    </div>
+  </div>
+</section>
+
+<!-- CTA -->
+<div class="cta">
+  <h2>지금 시작하세요</h2>
+  <p>개인용은 영구 무료입니다. 기업용은 무료 체험 후 결정하세요.</p>
+  <div style="display:flex; gap:16px; justify-content:center; flex-wrap:wrap;">
+    <a href="https://github.com/icesgg/smartscreen/releases" class="btn btn-primary btn-large">무료 다운로드</a>
+    <a href="mailto:icesgg@gmail.com" class="btn btn-outline btn-large">기업 문의</a>
+  </div>
+</div>
+
+<!-- Footer -->
+<footer>
+  <p>&copy; 2026 SmartScreen. All rights reserved.</p>
+  <p style="margin-top:8px;">
+    <a href="https://github.com/icesgg/smartscreen">GitHub</a> &nbsp;|&nbsp;
+    <a href="mailto:icesgg@gmail.com">Contact</a> &nbsp;|&nbsp;
+    <a href="dashboard.html">관리자</a>
+  </p>
+</footer>
+
+</body>
+</html>
