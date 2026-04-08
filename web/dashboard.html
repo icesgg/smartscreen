@@ -80,6 +80,28 @@
     padding: 10px;
   }
   .auth-card .btn-secondary:hover { background: var(--surface2); }
+  .auth-card .btn-google {
+    width: 100%;
+    background: #fff;
+    color: #333;
+    padding: 10px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    border: 1px solid #ddd;
+  }
+  .auth-card .btn-google:hover { background: #f5f5f5; }
+  .auth-card .btn-google svg { width: 20px; height: 20px; }
+  .auth-divider {
+    display: flex; align-items: center; gap: 12px;
+    margin: 16px 0; color: var(--text-dim); font-size: 13px;
+  }
+  .auth-divider::before, .auth-divider::after {
+    content: ''; flex: 1; height: 1px; background: var(--border);
+  }
   .auth-error { color: var(--danger); font-size: 13px; margin-bottom: 10px; display: none; }
 
   /* ── 대시보드 ── */
@@ -228,6 +250,16 @@
     <h1>SmartScreen Admin</h1>
     <p class="sub">Enterprise 콘텐츠 관리 대시보드</p>
     <div id="auth-error" class="auth-error"></div>
+
+    <!-- Google 로그인 -->
+    <button class="btn-google" onclick="handleGoogleLogin()">
+      <svg viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18A11.96 11.96 0 0 0 0 12c0 1.94.46 3.77 1.28 5.39l3.56-2.83.01-.47z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
+      Google 계정으로 로그인
+    </button>
+
+    <div class="auth-divider">또는</div>
+
+    <!-- 이메일 로그인 -->
     <label>이메일</label>
     <input type="email" id="email" placeholder="admin@company.com">
     <label>비밀번호</label>
@@ -236,7 +268,7 @@
       <label>조직 이름 (신규 가입 시)</label>
       <input type="text" id="org-name" placeholder="회사명" style="width:100%;margin-bottom:14px">
     </div>
-    <button class="btn-primary" id="btn-login" onclick="handleLogin()">로그인</button>
+    <button class="btn-primary" id="btn-login" onclick="handleLogin()">이메일로 로그인</button>
     <button class="btn-secondary" id="btn-register" onclick="handleRegister()">새 계정 만들기</button>
   </div>
 </div>
@@ -335,6 +367,16 @@ async function computeSHA256(file) {
 }
 
 // ── 인증 ──
+window.handleGoogleLogin = async function () {
+  const { error } = await supabase.auth.signInWithOAuth({
+    provider: 'google',
+    options: {
+      redirectTo: window.location.href
+    }
+  });
+  if (error) showError(error.message);
+};
+
 window.handleLogin = async function () {
   const email = document.getElementById('email').value.trim();
   const password = document.getElementById('password').value;
@@ -391,11 +433,26 @@ async function initDashboard() {
     .single();
 
   if (!membership) {
-    showError('소속된 조직이 없습니다.');
-    return;
+    // Google 로그인 등으로 조직 없이 들어온 경우: 조직 생성 유도
+    const orgName = prompt('조직 이름을 입력하세요 (첫 로그인):');
+    if (!orgName) { await supabase.auth.signOut(); return; }
+    const { data: newOrg, error: orgErr } = await supabase.from('orgs').insert({
+      name: orgName, created_by: user.id
+    }).select().single();
+    if (orgErr || !newOrg) {
+      showError('조직 생성 실패: ' + (orgErr?.message || ''));
+      return;
+    }
+    // Retry membership lookup (trigger should have added member)
+    const { data: retryMembership } = await supabase
+      .from('org_members')
+      .select('org_id, role, orgs(id, name)')
+      .eq('user_id', user.id).limit(1).single();
+    if (!retryMembership) { showError('조직 설정 실패. 다시 시도하세요.'); return; }
+    currentOrg = retryMembership.orgs;
+  } else {
+    currentOrg = membership.orgs;
   }
-
-  currentOrg = membership.orgs;
 
   document.getElementById('auth-screen').style.display = 'none';
   document.getElementById('dashboard').style.display = 'block';
