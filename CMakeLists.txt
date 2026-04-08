@@ -13,9 +13,10 @@ add_executable(SmartScreen WIN32
     client/enterprise/supabase.cpp
     client/p2p/discovery.cpp
     client/p2p/transfer.cpp
+    client/video/player.cpp
 )
 
-target_include_directories(SmartScreen PRIVATE client client/enterprise client/p2p)
+target_include_directories(SmartScreen PRIVATE client client/enterprise client/p2p client/video)
 
 target_link_libraries(SmartScreen PRIVATE
     ws2_32
@@ -27,6 +28,12 @@ target_link_libraries(SmartScreen PRIVATE
     gdiplus
     comdlg32
     winhttp
+    mfplat
+    mf
+    mfplay
+    mfuuid
+    ole32
+    propsys
 )
 
 target_compile_definitions(SmartScreen PRIVATE UNICODE _UNICODE)

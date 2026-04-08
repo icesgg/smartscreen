@@ -1,8 +1,11 @@
-// blackscreen.cpp - Black screen window, image loading, activation
+// blackscreen.cpp - Black screen window, image/video rendering, activation
 #include "blackscreen.h"
 #include "config.h"
+#include "video/player.h"
 
 static constexpr int IDC_BTN_RELEASE = 301;
+static constexpr int IDT_VIDEO_TICK  = 20;
+static bool s_videoMode = false;
 
 static Gdiplus::Image* s_imgCenter = nullptr;
 static Gdiplus::Image* s_imgBanner = nullptr;
@@ -91,6 +94,15 @@ static LRESULT CALLBACK BlackScreenProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
             hWnd, (HMENU)(UINT_PTR)IDC_BTN_RELEASE, GetModuleHandle(nullptr), nullptr);
         if (g_hFont) SendMessage(hBtn, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
+        // Check if center content is video
+        s_videoMode = false;
+        if (!g_centerImagePath.empty() && IsVideoFile(g_centerImagePath)) {
+            if (VideoInit() && VideoPlay(hWnd, g_centerImagePath)) {
+                s_videoMode = true;
+                SetTimer(hWnd, IDT_VIDEO_TICK, 500, nullptr); // loop check
+            }
+        }
+
         // Banner popup
         int bannerW = 300, bannerH = 400;
         int bannerX = sw - bannerW - 40, bannerY = 80;
@@ -113,11 +125,20 @@ static LRESULT CALLBACK BlackScreenProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
         FillRect(hdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
         return 1;
     }
+    case WM_TIMER:
+        if (wParam == IDT_VIDEO_TICK) VideoTick();
+        return 0;
+
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC hdc = BeginPaint(hWnd, &ps);
         RECT rc; GetClientRect(hWnd, &rc);
         int cw = rc.right, ch = rc.bottom;
         FillRect(hdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+
+        if (s_videoMode) {
+            VideoOnPaint(hWnd);
+            EndPaint(hWnd, &ps); return 0;
+        }
 
         int imgW = 1024, imgH = 768;
         if (s_imgCenter) {
@@ -140,6 +161,8 @@ static LRESULT CALLBACK BlackScreenProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
     }
     case WM_CLOSE: return 0;
     case WM_DESTROY:
+        KillTimer(hWnd, IDT_VIDEO_TICK);
+        if (s_videoMode) { VideoStop(); s_videoMode = false; }
         if (s_hBannerPopup) { DestroyWindow(s_hBannerPopup); s_hBannerPopup = nullptr; }
         return 0;
     }
