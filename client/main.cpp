@@ -766,7 +766,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
         } break;
         case ID_BTN_ENTERPRISE:
-            ShellExecuteW(nullptr, L"open", L"https://icesgg.github.io/smartscreen/web/", nullptr, nullptr, SW_SHOW);
+            ShellExecuteW(nullptr, L"open", L"https://icesgg.github.io/smartscreen/", nullptr, nullptr, SW_SHOW);
             break;
         }break;
 
