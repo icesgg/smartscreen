@@ -4,7 +4,15 @@ project(SmartScreen LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_executable(SmartScreen WIN32 main.cpp)
+add_executable(SmartScreen WIN32
+    client/main.cpp
+    client/globals.cpp
+    client/config.cpp
+    client/bluetooth.cpp
+    client/blackscreen.cpp
+)
+
+target_include_directories(SmartScreen PRIVATE client)
 
 target_link_libraries(SmartScreen PRIVATE
     ws2_32
@@ -13,6 +21,8 @@ target_link_libraries(SmartScreen PRIVATE
     gdi32
     comctl32
     shell32
+    gdiplus
+    comdlg32
 )
 
 target_compile_definitions(SmartScreen PRIVATE UNICODE _UNICODE)

@@ -15,6 +15,7 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "gdiplus.lib")
 
 #include <winsock2.h>
 #include <ws2bth.h>
@@ -23,6 +24,7 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <gdiplus.h>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -56,8 +58,8 @@ static constexpr int ID_OVL_EXIT     = 401;
 static constexpr int ID_OVL_LOCK     = 402;
 static constexpr int ID_OVL_SETTINGS = 403;
 #define OVERLAY_CLASS L"SmartScreenOverlay"
-static constexpr int OVL_W = 220;
-static constexpr int OVL_H = 70;
+static constexpr int OVL_W = 260;
+static constexpr int OVL_H = 90;
 
 // BlackScreen
 static constexpr int IDC_BTN_RELEASE = 301;
@@ -139,8 +141,9 @@ static HBRUSH g_hBrushFar     = nullptr;
 
 // Overlay
 static HWND   g_hOverlay      = nullptr;
-static HWND   g_hOvlState     = nullptr;  // state label on overlay
-static HBRUSH g_hBrushOvl     = nullptr;  // semi-transparent brush
+static HWND   g_hOvlState     = nullptr;
+static HFONT  g_hFontOvl      = nullptr;  // overlay state font
+static HFONT  g_hFontOvlBtn   = nullptr;  // overlay button font
 
 // ---------------------------------------------------------------------------
 // Globals - BT state
@@ -167,7 +170,10 @@ static HHOOK     g_hMouseHook    = nullptr;
 static HHOOK     g_hKeyHook      = nullptr;
 static int       g_nCountdown    = 20;
 static bool      g_bBlackActive  = false;
-static int       g_unlockTimer   = 0;     // countdown for delayed auto-unlock
+static bool      g_bManualLock   = false;
+static int       g_unlockTimer   = 0;
+static wchar_t   g_ovlInfo[128]  = L"";
+static ULONGLONG g_lockStartTick = 0;
 
 // ---------------------------------------------------------------------------
 // Config persistence
@@ -242,21 +248,116 @@ static const wchar_t* LatencyToDist(DWORD ms) {
 // ---------------------------------------------------------------------------
 // BlackScreen: activation / deactivation
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// BlackScreen images (GDI+)
+// ---------------------------------------------------------------------------
+static Gdiplus::Image* g_imgCenter = nullptr;  // 홍보이미지 (center, 1024x768)
+static Gdiplus::Image* g_imgBanner = nullptr;  // 배너 (right-top, 300x400)
+static HWND g_hBannerPopup = nullptr;
+static ULONG_PTR g_gdipToken = 0;
+
+static std::wstring GetExeDir() {
+    wchar_t path[MAX_PATH];
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    std::wstring s(path);
+    return s.substr(0, s.find_last_of(L"\\/") + 1);
+}
+
+static void LoadBlackScreenImages() {
+    std::wstring dir = GetExeDir() + L"images\\";
+    // Try common formats: png, jpg, bmp
+    const wchar_t* exts[] = { L"png", L"jpg", L"bmp", L"jpeg" };
+
+    if (!g_imgCenter) {
+        for (auto ext : exts) {
+            std::wstring p = dir + L"center." + ext;
+            auto* img = new Gdiplus::Image(p.c_str());
+            if (img->GetLastStatus() == Gdiplus::Ok) { g_imgCenter = img; break; }
+            delete img;
+        }
+    }
+    if (!g_imgBanner) {
+        for (auto ext : exts) {
+            std::wstring p = dir + L"banner." + ext;
+            auto* img = new Gdiplus::Image(p.c_str());
+            if (img->GetLastStatus() == Gdiplus::Ok) { g_imgBanner = img; break; }
+            delete img;
+        }
+    }
+}
+
+static void FreeBlackScreenImages() {
+    if (g_imgCenter) { delete g_imgCenter; g_imgCenter = nullptr; }
+    if (g_imgBanner) { delete g_imgBanner; g_imgBanner = nullptr; }
+}
+
+// Banner popup (layered, right-top area)
+#define BANNER_CLASS L"BSBannerWnd"
+
+static LRESULT CALLBACK BannerProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    switch (uMsg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC hdc = BeginPaint(hWnd, &ps);
+        RECT rc; GetClientRect(hWnd, &rc);
+        if (g_imgBanner) {
+            Gdiplus::Graphics gfx(hdc);
+            gfx.DrawImage(g_imgBanner, 0, 0, rc.right, rc.bottom);
+        } else {
+            // Placeholder
+            HBRUSH br = CreateSolidBrush(RGB(40, 40, 60));
+            FillRect(hdc, &rc, br); DeleteObject(br);
+            SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, RGB(120, 120, 150));
+            DrawTextW(hdc, L"banner.png\n(300x400)\nimages\\", -1, &rc, DT_CENTER | DT_VCENTER | DT_WORDBREAK);
+        }
+        EndPaint(hWnd, &ps); return 0;
+    }
+    case WM_ERASEBKGND: return 1;
+    }
+    return DefWindowProc(hWnd, uMsg, wParam, lParam);
+}
+
 static LRESULT CALLBACK BlackScreenProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
     case WM_CREATE: {
-        int sw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        LoadBlackScreenImages();
+
+        RECT rc; GetClientRect(hWnd, &rc);
+        int sw = rc.right, sh = rc.bottom;
+
+        // 해제 button (right-top)
         HWND hBtn = CreateWindowW(L"BUTTON", L"해제",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             sw - 125, 15, 110, 42,
             hWnd, (HMENU)(UINT_PTR)IDC_BTN_RELEASE, GetModuleHandle(nullptr), nullptr);
         if (g_hFont) SendMessage(hBtn, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+
+        // Banner popup (right-top, offset from corner)
+        {WNDCLASSW wc = {}; wc.hInstance = GetModuleHandle(nullptr);
+         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+         wc.lpfnWndProc = BannerProc; wc.lpszClassName = BANNER_CLASS;
+         RegisterClassW(&wc);}
+
+        int bannerW = 300, bannerH = 400;
+        int bannerX = sw - bannerW - 40;
+        int bannerY = 80;
+        // Convert to screen coords
+        POINT pt = { bannerX, bannerY };
+        ClientToScreen(hWnd, &pt);
+
+        g_hBannerPopup = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            BANNER_CLASS, L"",
+            WS_POPUP | WS_VISIBLE | WS_BORDER,
+            pt.x, pt.y, bannerW, bannerH,
+            hWnd, nullptr, GetModuleHandle(nullptr), nullptr);
+
         return 0;
     }
     case WM_COMMAND:
         if (LOWORD(wParam) == IDC_BTN_RELEASE) {
             g_bBlackActive = false;
             g_nCountdown = g_idleCountdownSec;
+            if (g_hBannerPopup) { DestroyWindow(g_hBannerPopup); g_hBannerPopup = nullptr; }
             DestroyWindow(hWnd);
             g_hBlackScreen = nullptr;
             if (g_hCountdownLabel) InvalidateRect(g_hCountdownLabel, nullptr, TRUE);
@@ -270,10 +371,40 @@ static LRESULT CALLBACK BlackScreenProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC hdc = BeginPaint(hWnd, &ps);
         RECT rc; GetClientRect(hWnd, &rc);
+        int cw = rc.right, ch = rc.bottom;
+
+        // Black background
         FillRect(hdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+
+        // Center image (1024x768)
+        int imgW = 1024, imgH = 768;
+        if (g_imgCenter) {
+            Gdiplus::Graphics gfx(hdc);
+            int x = (cw - imgW) / 2;
+            int y = (ch - imgH) / 2;
+            gfx.DrawImage(g_imgCenter, x, y, imgW, imgH);
+        } else {
+            // Placeholder frame
+            int x = (cw - imgW) / 2, y = (ch - imgH) / 2;
+            RECT imgRc = { x, y, x + imgW, y + imgH };
+            HBRUSH br = CreateSolidBrush(RGB(20, 20, 30));
+            FillRect(hdc, &imgRc, br); DeleteObject(br);
+            HPEN pen = CreatePen(PS_DOT, 1, RGB(60, 60, 80));
+            HPEN op = (HPEN)SelectObject(hdc, pen);
+            MoveToEx(hdc, x, y, nullptr); LineTo(hdc, x + imgW, y);
+            LineTo(hdc, x + imgW, y + imgH); LineTo(hdc, x, y + imgH); LineTo(hdc, x, y);
+            SelectObject(hdc, op); DeleteObject(pen);
+            SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, RGB(80, 80, 100));
+            DrawTextW(hdc, L"center.png (1024x768)\nimages\\", -1, &imgRc,
+                DT_CENTER | DT_VCENTER | DT_WORDBREAK);
+        }
+
         EndPaint(hWnd, &ps); return 0;
     }
     case WM_CLOSE: return 0;
+    case WM_DESTROY:
+        if (g_hBannerPopup) { DestroyWindow(g_hBannerPopup); g_hBannerPopup = nullptr; }
+        return 0;
     }
     return DefWindowProc(hWnd, uMsg, wParam, lParam);
 }
@@ -285,6 +416,8 @@ static void ActivateBlackScreen() {
         return;
     }
     g_bBlackActive = true;
+    g_bManualLock = false;
+    g_lockStartTick = GetTickCount64();
 
     int x = GetSystemMetrics(SM_XVIRTUALSCREEN);
     int y = GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -299,8 +432,31 @@ static void ActivateBlackScreen() {
 
 static void DeactivateBlackScreen() {
     if (!g_bBlackActive) return;
+
+    // Record lock/unlock times
+    SYSTEMTIME stNow; GetLocalTime(&stNow);
+    DWORD durationSec = (g_lockStartTick > 0) ? (DWORD)((GetTickCount64() - g_lockStartTick) / 1000) : 0;
+    DWORD durMin = durationSec / 60, durSec = durationSec % 60;
+
+    // Calculate lock start time
+    FILETIME ftNow; SystemTimeToFileTime(&stNow, &ftNow);
+    ULARGE_INTEGER u; u.LowPart = ftNow.dwLowDateTime; u.HighPart = ftNow.dwHighDateTime;
+    u.QuadPart -= (ULONGLONG)durationSec * 10000000ULL;
+    ftNow.dwLowDateTime = u.LowPart; ftNow.dwHighDateTime = u.HighPart;
+    SYSTEMTIME stLock; FileTimeToSystemTime(&ftNow, &stLock);
+    // Convert to local
+    SystemTimeToTzSpecificLocalTime(nullptr, &stLock, &stLock);
+
+    swprintf_s(g_ovlInfo, L"Lock %02d:%02d -> Unlock %02d:%02d (%dm%02ds)",
+        stLock.wHour, stLock.wMinute,
+        stNow.wHour, stNow.wMinute,
+        durMin, durSec);
+
     g_bBlackActive = false;
+    g_bManualLock = false;
+    g_lockStartTick = 0;
     g_nCountdown = g_idleCountdownSec;
+    if (g_hBannerPopup) { DestroyWindow(g_hBannerPopup); g_hBannerPopup = nullptr; }
     if (g_hBlackScreen) {
         DestroyWindow(g_hBlackScreen);
         g_hBlackScreen = nullptr;
@@ -313,7 +469,12 @@ static void DeactivateBlackScreen() {
 // ---------------------------------------------------------------------------
 static void ResetCountdown() {
     g_nCountdown = g_idleCountdownSec;
-    if (g_bBlackActive) DeactivateBlackScreen(); // mouse/keyboard always wakes
+    if (g_bBlackActive) DeactivateBlackScreen();
+    // User is active -> clear lock/unlock info
+    if (g_ovlInfo[0] != L'\0') {
+        g_ovlInfo[0] = L'\0';
+        if (g_hOverlay) InvalidateRect(g_hOverlay, nullptr, TRUE);
+    }
 }
 
 static LRESULT CALLBACK LLMouseProc(int nCode, WPARAM w, LPARAM l) {
@@ -711,65 +872,53 @@ static void InitListView(HWND p) {
 static bool g_ovlDragging = false;
 static POINT g_ovlDragStart = {};
 
+static wchar_t g_ovlText[64] = L"Stopped";
+static COLORREF g_ovlColor = RGB(200, 200, 200);
+
 static void UpdateOverlayState() {
-    if (!g_hOvlState) return;
-    wchar_t buf[128];
-    if (!g_monitoring) wcscpy_s(buf, L"  Stopped");
-    else if (g_bBlackActive) wcscpy_s(buf, L"  LOCKED");
-    else if (g_proxState == ProxState::Near) wcscpy_s(buf, L"  WITHIN 1M");
-    else swprintf_s(buf, L"  FAR (idle: %ds)", g_nCountdown);
-    SetWindowTextW(g_hOvlState, buf);
-    InvalidateRect(g_hOvlState, nullptr, TRUE);
+    if (!g_hOverlay) return;
+    if (!g_monitoring) { wcscpy_s(g_ovlText, L"Stopped"); g_ovlColor = RGB(160, 160, 160); }
+    else if (g_bBlackActive) { wcscpy_s(g_ovlText, L"LOCKED"); g_ovlColor = RGB(255, 80, 80); }
+    else if (g_proxState == ProxState::Near) { wcscpy_s(g_ovlText, L"NEAR"); g_ovlColor = RGB(0, 230, 0); }
+    else { swprintf_s(g_ovlText, L"FAR  %ds", g_nCountdown); g_ovlColor = RGB(255, 180, 50); }
+    InvalidateRect(g_hOverlay, nullptr, TRUE);
 }
 
 static LRESULT CALLBACK OverlayProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
-        g_hOvlState = CreateWindowExW(0, L"STATIC", L"  Stopped",
-            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
-            5, 5, OVL_W - 10, 28, hWnd, nullptr, GetModuleHandle(nullptr), nullptr);
+        // No STATIC label - text drawn directly in WM_ERASEBKGND
 
         CreateWindowExW(0, L"BUTTON", L"Exit",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            5, 38, 50, 24, hWnd, (HMENU)(UINT_PTR)ID_OVL_EXIT,
+            8, 56, 55, 25, hWnd, (HMENU)(UINT_PTR)ID_OVL_EXIT,
             GetModuleHandle(nullptr), nullptr);
         CreateWindowExW(0, L"BUTTON", L"Lock",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            60, 38, 50, 24, hWnd, (HMENU)(UINT_PTR)ID_OVL_LOCK,
+            70, 56, 55, 25, hWnd, (HMENU)(UINT_PTR)ID_OVL_LOCK,
             GetModuleHandle(nullptr), nullptr);
         CreateWindowExW(0, L"BUTTON", L"Settings",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            115, 38, 65, 24, hWnd, (HMENU)(UINT_PTR)ID_OVL_SETTINGS,
+            132, 56, 70, 25, hWnd, (HMENU)(UINT_PTR)ID_OVL_SETTINGS,
             GetModuleHandle(nullptr), nullptr);
         return 0;
     }
 
-    case WM_CTLCOLORSTATIC: {
-        HDC hdc = (HDC)wParam; HWND hc = (HWND)lParam;
-        if (hc == g_hOvlState) {
-            SetBkMode(hdc, TRANSPARENT);
-            if (g_bBlackActive) {
-                SetTextColor(hdc, RGB(255, 80, 80));
-            } else if (g_proxState == ProxState::Near && g_monitoring) {
-                SetTextColor(hdc, RGB(0, 220, 0));
-            } else {
-                SetTextColor(hdc, RGB(200, 200, 200));
-            }
-            return (LRESULT)GetStockObject(NULL_BRUSH);
-        }
-        break;
-    }
+    // (overlay text drawn directly in WM_ERASEBKGND, no CTLCOLORSTATIC needed)
 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case ID_OVL_EXIT:
             if (g_monitoring) StopMon();
-            PostMessage(g_hWnd, WM_CLOSE, 0, 0);
+            g_hOverlay = nullptr;
             DestroyWindow(hWnd);
+            DestroyWindow(g_hWnd);
             break;
         case ID_OVL_LOCK:
             if (g_monitoring && !g_bBlackActive) {
                 g_bBlackActive = true;
+                g_bManualLock = true;
+                g_lockStartTick = GetTickCount64();
                 int x = GetSystemMetrics(SM_XVIRTUALSCREEN), y = GetSystemMetrics(SM_YVIRTUALSCREEN);
                 int w = GetSystemMetrics(SM_CXVIRTUALSCREEN), h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
                 g_hBlackScreen = CreateWindowExW(WS_EX_TOPMOST, BLACKSCREEN_CLASS, L"",
@@ -807,6 +956,7 @@ static LRESULT CALLBACK OverlayProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
     case WM_ERASEBKGND: {
         HDC hdc = (HDC)wParam; RECT rc; GetClientRect(hWnd, &rc);
+        // Background
         HBRUSH br = CreateSolidBrush(RGB(30, 30, 30));
         FillRect(hdc, &rc, br); DeleteObject(br);
         // Border
@@ -816,6 +966,20 @@ static LRESULT CALLBACK OverlayProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         LineTo(hdc, rc.right - 1, rc.bottom - 1); LineTo(hdc, 0, rc.bottom - 1);
         LineTo(hdc, 0, 0);
         SelectObject(hdc, op); DeleteObject(pen);
+        // Draw state text (line 1)
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, g_ovlColor);
+        HFONT oldF = (HFONT)SelectObject(hdc, g_hFontOvl ? g_hFontOvl : (HFONT)GetStockObject(DEFAULT_GUI_FONT));
+        RECT textRc = { 10, 3, rc.right - 10, 28 };
+        DrawTextW(hdc, g_ovlText, -1, &textRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        // Draw info text (line 2) - lock/unlock times
+        if (g_ovlInfo[0] != L'\0') {
+            SelectObject(hdc, g_hFontOvlBtn ? g_hFontOvlBtn : (HFONT)GetStockObject(DEFAULT_GUI_FONT));
+            SetTextColor(hdc, RGB(180, 180, 120));
+            RECT infoRc = { 10, 30, rc.right - 10, 50 };
+            DrawTextW(hdc, g_ovlInfo, -1, &infoRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        }
+        SelectObject(hdc, oldF);
         return 1;
     }
 
@@ -842,8 +1006,8 @@ static void OnResult(ProbeResult* r) {
     }
     if(g_hChart)InvalidateRect(g_hChart,nullptr,FALSE);
 
-    // Auto-unlock: BT NEAR + auto mode -> start unlock delay countdown
-    if (g_unlockAuto && r->state == ProxState::Near && g_bBlackActive) {
+    // Auto-unlock: BT NEAR + auto mode + NOT manual lock
+    if (g_unlockAuto && !g_bManualLock && r->state == ProxState::Near && g_bBlackActive) {
         if (g_unlockTimer <= 0) {
             // Start delay timer (or instant if delay=0)
             g_unlockTimer = g_unlockDelaySec;
@@ -1084,6 +1248,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd,UINT msg,WPARAM wParam,LPARAM lParam){
         case ID_BTN_BLACKNOW:
             if(g_monitoring){
                 g_bBlackActive = true;
+                g_bManualLock = true;
+                g_lockStartTick = GetTickCount64();
                 int x=GetSystemMetrics(SM_XVIRTUALSCREEN),y=GetSystemMetrics(SM_YVIRTUALSCREEN);
                 int w=GetSystemMetrics(SM_CXVIRTUALSCREEN),h=GetSystemMetrics(SM_CYVIRTUALSCREEN);
                 g_hBlackScreen=CreateWindowExW(WS_EX_TOPMOST,BLACKSCREEN_CLASS,L"",
@@ -1123,6 +1289,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd,UINT msg,WPARAM wParam,LPARAM lParam){
         if(g_hFont)DeleteObject(g_hFont);if(g_hFontBold)DeleteObject(g_hFontBold);
         if(g_hFontBig)DeleteObject(g_hFontBig);if(g_hFontSmall)DeleteObject(g_hFontSmall);
         if(g_hBrushNear)DeleteObject(g_hBrushNear);if(g_hBrushFar)DeleteObject(g_hBrushFar);
+        if(g_hFontOvl)DeleteObject(g_hFontOvl);if(g_hFontOvlBtn)DeleteObject(g_hFontOvlBtn);
         PostQuitMessage(0);break;
     default:return DefWindowProcW(hWnd,msg,wParam,lParam);
     }
@@ -1141,6 +1308,10 @@ int WINAPI wWinMain(HINSTANCE hI,HINSTANCE,LPWSTR,int nS){
     }
 
     WSADATA wd;WSAStartup(MAKEWORD(2,2),&wd);
+
+    // GDI+ init
+    Gdiplus::GdiplusStartupInput gdipIn;
+    Gdiplus::GdiplusStartup(&g_gdipToken, &gdipIn, nullptr);
 
     WNDCLASSEXW wc={};wc.cbSize=sizeof(wc);wc.style=CS_HREDRAW|CS_VREDRAW;
     wc.lpfnWndProc=WndProc;wc.hInstance=hI;wc.hCursor=LoadCursor(nullptr,IDC_ARROW);
@@ -1168,16 +1339,19 @@ int WINAPI wWinMain(HINSTANCE hI,HINSTANCE,LPWSTR,int nS){
         WS_POPUP | WS_VISIBLE,
         sx - OVL_W - 20, 20, OVL_W, OVL_H,
         nullptr, nullptr, hI, nullptr);
-    // Set 85% opacity (alpha=216)
-    SetLayeredWindowAttributes(g_hOverlay, 0, 216, LWA_ALPHA);
+    // Set 50% opacity (alpha=128)
+    SetLayeredWindowAttributes(g_hOverlay, 0, 128, LWA_ALPHA);
 
-    // Apply fonts to overlay children
+    // Overlay-specific fonts
+    g_hFontOvl = CreateFontW(18, 0, 0, 0, FW_BOLD, 0, 0, 0,
+        DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    g_hFontOvlBtn = CreateFontW(13, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+        DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+
     if (g_hOverlay) {
         EnumChildWindows(g_hOverlay, [](HWND h, LPARAM f) -> BOOL {
             SendMessage(h, WM_SETFONT, (WPARAM)f, TRUE); return TRUE;
-        }, (LPARAM)g_hFont);
-        if (g_hOvlState && g_hFontBold)
-            SendMessage(g_hOvlState, WM_SETFONT, (WPARAM)g_hFontBold, TRUE);
+        }, (LPARAM)g_hFontOvlBtn);
     }
 
     // If config exists, settings window starts hidden (overlay is shown)
@@ -1192,6 +1366,8 @@ int WINAPI wWinMain(HINSTANCE hI,HINSTANCE,LPWSTR,int nS){
     MSG msg;
     while(GetMessage(&msg,nullptr,0,0)){TranslateMessage(&msg);DispatchMessage(&msg);}
 
+    FreeBlackScreenImages();
+    if (g_gdipToken) Gdiplus::GdiplusShutdown(g_gdipToken);
     WSACleanup();
     if(hMutex)CloseHandle(hMutex);
     return(int)msg.wParam;
