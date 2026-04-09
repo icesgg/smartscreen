@@ -461,11 +461,16 @@
       </div>
     </div>
     <div class="container">
-      <!-- 조직 ID -->
+      <!-- 조직 ID + API 정보 -->
       <div class="org-id-bar">
         <span>조직 ID:</span>
         <code id="org-id-display">-</code>
         <button class="btn-copy" onclick="copyOrgId()">복사</button>
+      </div>
+      <div class="org-id-bar">
+        <span>API:</span>
+        <code id="api-url-display" style="font-size:11px">-</code>
+        <button class="btn-copy" onclick="copyApiUrl()">복사</button>
       </div>
 
       <!-- 업로드 -->
@@ -660,6 +665,8 @@
       document.getElementById('dashboard').style.display = 'block';
       document.getElementById('org-title').textContent = currentOrg.name;
       document.getElementById('org-id-display').textContent = currentOrg.id;
+      document.getElementById('api-url-display').textContent =
+        `${SUPABASE_URL}/rest/v1/contents?org_id=eq.${currentOrg.id}&select=*`;
       document.getElementById('user-email').textContent = user.email;
 
       await loadContents();
@@ -681,10 +688,15 @@
       }
 
       let html = `<table><thead><tr>
-    <th>파일명</th><th>유형</th><th>위치</th><th>크기</th><th>업로드일</th><th></th>
+    <th>미리보기</th><th>파일명</th><th>유형</th><th>위치</th><th>크기</th><th>업로드일</th><th></th>
   </tr></thead><tbody>`;
 
       for (const c of data) {
+        const { data: urlData } = await supabase.storage
+          .from('content')
+          .createSignedUrl(c.storage_path, 3600);
+        const signedUrl = urlData?.signedUrl || '';
+
         const typeBadge = c.content_type === 'image'
           ? '<span class="badge badge-image">이미지</span>'
           : '<span class="badge badge-video">동영상</span>';
@@ -692,8 +704,15 @@
           ? '<span class="badge badge-center">중앙</span>'
           : '<span class="badge badge-banner">배너</span>';
 
+        const preview = c.content_type === 'image' && signedUrl
+          ? `<img src="${signedUrl}" style="max-width:80px;max-height:60px;border-radius:4px;object-fit:cover">`
+          : c.content_type === 'video' && signedUrl
+            ? `<video src="${signedUrl}" style="max-width:80px;max-height:60px;border-radius:4px" muted></video>`
+            : '-';
+
         html += `<tr>
-      <td>${escapeHtml(c.filename)}</td>
+      <td>${preview}</td>
+      <td>${signedUrl ? `<a href="${signedUrl}" target="_blank" style="color:var(--accent);text-decoration:none">${escapeHtml(c.filename)}</a>` : escapeHtml(c.filename)}</td>
       <td>${typeBadge}</td>
       <td>${posBadge}</td>
       <td>${formatSize(c.file_size)}</td>
@@ -791,6 +810,13 @@
     window.copyOrgId = function () {
       if (!currentOrg) return;
       navigator.clipboard.writeText(currentOrg.id).then(() => toast('조직 ID가 복사되었습니다.'));
+    };
+
+    // ── API URL 복사 ──
+    window.copyApiUrl = function () {
+      const url = document.getElementById('api-url-display').textContent;
+      if (url === '-') return;
+      navigator.clipboard.writeText(url).then(() => toast('API URL이 복사되었습니다.'));
     };
 
     // ── 페이지 로드 시 세션 확인 ──
