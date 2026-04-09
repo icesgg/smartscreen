@@ -421,7 +421,7 @@
       <div id="auth-error" class="auth-error"></div>
 
       <!-- Google 로그인 -->
-      <button class="btn-google" onclick="handleGoogleLogin()">
+      <button class="btn-google" id="btn-google-login" onclick="handleGoogleLogin()">
         <svg viewBox="0 0 24 24">
           <path fill="#4285F4"
             d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" />
@@ -611,7 +611,34 @@
         .single();
 
       if (!membership) {
-        showError('소속된 조직이 없습니다.');
+        // 조직이 없으면 조직 생성 화면 표시
+        document.getElementById('auth-error').style.display = 'none';
+        document.querySelector('.auth-card p.sub').textContent = user.email + ' 으로 로그인됨';
+        document.getElementById('org-name-field').style.display = 'block';
+        document.getElementById('btn-login').style.display = 'none';
+        document.getElementById('btn-register').style.display = 'none';
+        document.getElementById('btn-google-login').style.display = 'none';
+        document.querySelector('.auth-divider').style.display = 'none';
+        document.getElementById('email').style.display = 'none';
+        document.getElementById('password').style.display = 'none';
+        document.querySelectorAll('.auth-card > label').forEach(el => el.style.display = 'none');
+
+        const createBtn = document.createElement('button');
+        createBtn.className = 'btn-primary';
+        createBtn.textContent = '조직 생성';
+        createBtn.style.width = '100%';
+        createBtn.onclick = async () => {
+          const orgName = document.getElementById('org-name').value.trim();
+          if (!orgName) { showError('조직 이름을 입력하세요.'); return; }
+          const { error: orgErr } = await supabase.from('orgs').insert({
+            name: orgName,
+            created_by: user.id
+          });
+          if (orgErr) { showError('조직 생성 실패: ' + orgErr.message); return; }
+          // 재시도
+          await initDashboard();
+        };
+        document.getElementById('org-name-field').after(createBtn);
         return;
       }
 
