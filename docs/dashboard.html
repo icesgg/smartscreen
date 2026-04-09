@@ -623,22 +623,24 @@
         document.getElementById('password').style.display = 'none';
         document.querySelectorAll('.auth-card > label').forEach(el => el.style.display = 'none');
 
-        const createBtn = document.createElement('button');
-        createBtn.className = 'btn-primary';
-        createBtn.textContent = '조직 생성';
-        createBtn.style.width = '100%';
-        createBtn.onclick = async () => {
-          const orgName = document.getElementById('org-name').value.trim();
-          if (!orgName) { showError('조직 이름을 입력하세요.'); return; }
-          const { error: orgErr } = await supabase.from('orgs').insert({
-            name: orgName,
-            created_by: user.id
-          });
-          if (orgErr) { showError('조직 생성 실패: ' + orgErr.message); return; }
-          // 재시도
-          await initDashboard();
-        };
-        document.getElementById('org-name-field').after(createBtn);
+        if (!document.getElementById('btn-create-org')) {
+          const createBtn = document.createElement('button');
+          createBtn.id = 'btn-create-org';
+          createBtn.className = 'btn-primary';
+          createBtn.textContent = '조직 생성';
+          createBtn.style.width = '100%';
+          createBtn.onclick = async () => {
+            const orgName = document.getElementById('org-name').value.trim();
+            if (!orgName) { showError('조직 이름을 입력하세요.'); return; }
+            const { error: orgErr } = await supabase.from('orgs').insert({
+              name: orgName,
+              created_by: user.id
+            });
+            if (orgErr) { showError('조직 생성 실패: ' + orgErr.message); return; }
+            await initDashboard();
+          };
+          document.getElementById('org-name-field').after(createBtn);
+        }
         return;
       }
 
