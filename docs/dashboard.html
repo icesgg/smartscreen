@@ -632,12 +632,22 @@
           createBtn.onclick = async () => {
             const orgName = document.getElementById('org-name').value.trim();
             if (!orgName) { showError('조직 이름을 입력하세요.'); return; }
-            const { error: orgErr } = await supabase.from('orgs').insert({
-              name: orgName,
-              created_by: user.id
-            });
-            if (orgErr) { showError('조직 생성 실패: ' + orgErr.message); return; }
-            await initDashboard();
+            createBtn.disabled = true;
+            createBtn.textContent = '생성 중...';
+            try {
+              const { data: orgData, error: orgErr } = await supabase.from('orgs').insert({
+                name: orgName,
+                created_by: user.id
+              }).select();
+              if (orgErr) { showError('조직 생성 실패: ' + orgErr.message); return; }
+              // 트리거로 org_members가 자동 생성되므로 바로 대시보드 진입
+              window.location.reload();
+            } catch (e) {
+              showError('오류: ' + e.message);
+            } finally {
+              createBtn.disabled = false;
+              createBtn.textContent = '조직 생성';
+            }
           };
           document.getElementById('org-name-field').after(createBtn);
         }
