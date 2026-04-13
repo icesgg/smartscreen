@@ -342,6 +342,28 @@
       color: #fbbf24;
     }
 
+    .badge-active {
+      background: #1a3329;
+      color: var(--success);
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .badge-active:hover {
+      background: #22443a;
+    }
+
+    .badge-inactive {
+      background: var(--border);
+      color: var(--text-dim);
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .badge-inactive:hover {
+      background: #3a3f54;
+    }
+
     .btn-delete {
       background: transparent;
       color: var(--danger);
@@ -504,6 +526,10 @@
   <div class="toast" id="toast"></div>
 
   <script type="module">
+    // ── DB 스키마 변경 필요 ──
+    // contents 테이블에 active 컬럼을 추가하려면 아래 SQL을 실행하세요:
+    // ALTER TABLE contents ADD COLUMN IF NOT EXISTS active boolean NOT NULL DEFAULT false;
+
     // ── Supabase 설정 ──
     // 아래 값을 본인의 Supabase 프로젝트 값으로 교체하세요
     const SUPABASE_URL = 'https://vnonoschrzbgvyeduosm.supabase.co';
@@ -688,7 +714,7 @@
       }
 
       let html = `<table><thead><tr>
-    <th>미리보기</th><th>파일명</th><th>유형</th><th>위치</th><th>크기</th><th>업로드일</th><th></th>
+    <th>미리보기</th><th>파일명</th><th>유형</th><th>위치</th><th>크기</th><th>업로드일</th><th>상태</th><th></th>
   </tr></thead><tbody>`;
 
       for (const c of data) {
@@ -710,6 +736,11 @@
             ? `<video src="${signedUrl}" style="max-width:80px;max-height:60px;border-radius:4px" muted></video>`
             : '-';
 
+        const isActive = c.active === true;
+        const activeBadge = isActive
+          ? `<span class="badge badge-active" data-toggle-id="${c.id}" data-position="${c.display_position}" data-active="true">송출 중</span>`
+          : `<span class="badge badge-inactive" data-toggle-id="${c.id}" data-position="${c.display_position}" data-active="false">대기</span>`;
+
         html += `<tr>
       <td>${preview}</td>
       <td>${signedUrl ? `<a href="${signedUrl}" target="_blank" style="color:var(--accent);text-decoration:none">${escapeHtml(c.filename)}</a>` : escapeHtml(c.filename)}</td>
@@ -717,11 +748,21 @@
       <td>${posBadge}</td>
       <td>${formatSize(c.file_size)}</td>
       <td>${formatDate(c.created_at)}</td>
+      <td>${activeBadge}</td>
       <td><button class="btn-delete" data-id="${c.id}" data-path="${escapeHtml(c.storage_path)}">삭제</button></td>
     </tr>`;
       }
       html += '</tbody></table>';
       container.innerHTML = html;
+
+      // 상태 토글 이벤트
+      container.querySelectorAll('[data-toggle-id]').forEach(badge => {
+        badge.addEventListener('click', () => handleToggleActive(
+          badge.dataset.toggleId,
+          badge.dataset.position,
+          badge.dataset.active === 'true'
+        ));
+      });
 
       // 삭제 버튼 이벤트
       container.querySelectorAll('.btn-delete').forEach(btn => {
@@ -733,6 +774,40 @@
       const d = document.createElement('div');
       d.textContent = str;
       return d.innerHTML;
+    }
+
+    // ── 상태 토글 ──
+    async function handleToggleActive(id, displayPosition, currentlyActive) {
+      if (!currentOrg) return;
+
+      const newActive = !currentlyActive;
+
+      try {
+        if (newActive) {
+          // 같은 org, 같은 display_position의 다른 아이템을 비활성화
+          const { error: deactivateErr } = await supabase
+            .from('contents')
+            .update({ active: false })
+            .eq('org_id', currentOrg.id)
+            .eq('display_position', displayPosition)
+            .eq('active', true);
+
+          if (deactivateErr) throw deactivateErr;
+        }
+
+        // 해당 아이템의 active 상태 변경
+        const { error: updateErr } = await supabase
+          .from('contents')
+          .update({ active: newActive })
+          .eq('id', id);
+
+        if (updateErr) throw updateErr;
+
+        toast(newActive ? '송출이 시작되었습니다.' : '송출이 중지되었습니다.');
+        await loadContents();
+      } catch (e) {
+        toast('상태 변경 실패: ' + e.message);
+      }
     }
 
     // ── 업로드 ──
@@ -772,7 +847,8 @@
           file_hash: hash,
           file_size: file.size,
           content_type: contentType,
-          display_position: position
+          display_position: position,
+          active: false
         });
 
         if (dbErr) throw dbErr;

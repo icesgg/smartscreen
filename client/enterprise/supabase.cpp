@@ -158,8 +158,8 @@ bool FetchManifest(const std::wstring& supabaseUrl, const std::wstring& anonKey,
     out.orgId = orgId;
     out.maxVersion = 0;
 
-    // GET /rest/v1/contents?org_id=eq.{orgId}&select=*
-    std::wstring url = supabaseUrl + L"/rest/v1/contents?org_id=eq." + orgId + L"&select=*";
+    // GET /rest/v1/contents?org_id=eq.{orgId}&active=eq.true&select=*
+    std::wstring url = supabaseUrl + L"/rest/v1/contents?org_id=eq." + orgId + L"&active=eq.true&select=*";
     std::wstring auth = L"apikey: " + anonKey + L"\r\nAuthorization: Bearer " + anonKey;
 
     std::string body;
@@ -199,14 +199,18 @@ bool FetchManifest(const std::wstring& supabaseUrl, const std::wstring& anonKey,
 // ---------------------------------------------------------------------------
 bool DownloadContent(const std::wstring& supabaseUrl, const std::wstring& anonKey,
                      const std::wstring& storagePath, const std::wstring& localPath) {
-    std::wstring url = supabaseUrl + L"/storage/v1/object/public/content/" + storagePath;
-    std::wstring auth = L"apikey: " + anonKey;
+    std::wstring url = supabaseUrl + L"/storage/v1/object/authenticated/content/" + storagePath;
+    std::wstring auth = L"apikey: " + anonKey + L"\r\nAuthorization: Bearer " + anonKey;
     return HttpDownloadFile(url, auth, localPath);
 }
 
 // ---------------------------------------------------------------------------
 // Sync enterprise content
 // ---------------------------------------------------------------------------
+// Last synced paths
+static std::wstring s_centerPath;
+static std::wstring s_bannerPath;
+
 bool SyncEnterpriseContent(const std::wstring& supabaseUrl, const std::wstring& anonKey,
                            const std::wstring& orgId) {
     ContentManifest manifest;
@@ -214,22 +218,34 @@ bool SyncEnterpriseContent(const std::wstring& supabaseUrl, const std::wstring& 
     if (manifest.items.empty()) return false;
 
     std::wstring dir = GetEnterpriseContentDir();
+    s_centerPath.clear();
+    s_bannerPath.clear();
 
     for (auto& item : manifest.items) {
         std::wstring localPath = dir + L"\\" + item.filename;
 
-        // Check if already downloaded (by hash)
-        // Simple: if file exists and size matches, skip
+        // Check if already downloaded (by size)
         WIN32_FILE_ATTRIBUTE_DATA fad;
         if (GetFileAttributesExW(localPath.c_str(), GetFileExInfoStandard, &fad)) {
             LARGE_INTEGER li;
             li.LowPart = fad.nFileSizeLow;
             li.HighPart = fad.nFileSizeHigh;
-            if (li.QuadPart == item.fileSize) continue; // already have it
+            if (li.QuadPart == item.fileSize) {
+                // Already have it, just record path
+                if (item.displayPos == L"center") s_centerPath = localPath;
+                else if (item.displayPos == L"banner") s_bannerPath = localPath;
+                continue;
+            }
         }
 
-        // Download from server (P2P fallback will be added in phase 5-6)
-        DownloadContent(supabaseUrl, anonKey, item.storagePath, localPath);
+        // Download from server
+        if (DownloadContent(supabaseUrl, anonKey, item.storagePath, localPath)) {
+            if (item.displayPos == L"center") s_centerPath = localPath;
+            else if (item.displayPos == L"banner") s_bannerPath = localPath;
+        }
     }
     return true;
 }
+
+std::wstring GetEnterpriseCenterPath() { return s_centerPath; }
+std::wstring GetEnterpriseBannerPath() { return s_bannerPath; }

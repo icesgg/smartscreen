@@ -153,14 +153,18 @@ void VideoOnPaint(HWND hWnd) {
 void VideoTick() {
     if (s_callback && s_callback->HasEnded() && !s_currentFile.empty() && s_videoWnd) {
         s_callback->ResetEnded();
-        // Restart playback from beginning
+        // Seamless loop: destroy and recreate player to avoid black flash
         if (s_player) {
-            PROPVARIANT var;
-            PropVariantInit(&var);
-            var.vt = VT_I8;
-            var.hVal.QuadPart = 0; // seek to beginning
-            s_player->SetPosition(MFP_POSITIONTYPE_100NS, &var);
-            PropVariantClear(&var);
+            s_player->Stop();
+            s_player->Shutdown();
+            s_player->Release();
+            s_player = nullptr;
+        }
+        // Recreate player and start immediately
+        HRESULT hr = MFPCreateMediaPlayer(
+            s_currentFile.c_str(),
+            FALSE, 0, s_callback, s_videoWnd, &s_player);
+        if (SUCCEEDED(hr) && s_player) {
             s_player->Play();
         }
     }
