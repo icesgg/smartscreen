@@ -839,6 +839,16 @@
 
         if (uploadErr) throw uploadErr;
 
+        // 같은 위치에 활성 콘텐츠가 없으면 자동 활성화
+        const { data: existing } = await supabase
+          .from('contents')
+          .select('id')
+          .eq('org_id', currentOrg.id)
+          .eq('display_position', position)
+          .eq('active', true)
+          .limit(1);
+        const autoActive = !existing || existing.length === 0;
+
         // DB 레코드 생성
         const { error: dbErr } = await supabase.from('contents').insert({
           org_id: currentOrg.id,
@@ -848,7 +858,7 @@
           file_size: file.size,
           content_type: contentType,
           display_position: position,
-          active: false
+          active: autoActive
         });
 
         if (dbErr) throw dbErr;

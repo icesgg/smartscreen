@@ -158,12 +158,19 @@ bool FetchManifest(const std::wstring& supabaseUrl, const std::wstring& anonKey,
     out.orgId = orgId;
     out.maxVersion = 0;
 
-    // GET /rest/v1/contents?org_id=eq.{orgId}&active=eq.true&select=*
-    std::wstring url = supabaseUrl + L"/rest/v1/contents?org_id=eq." + orgId + L"&active=eq.true&select=*";
+    // Try active=true first, fallback to all if none active
     std::wstring auth = L"apikey: " + anonKey + L"\r\nAuthorization: Bearer " + anonKey;
+    std::wstring url = supabaseUrl + L"/rest/v1/contents?org_id=eq." + orgId + L"&active=eq.true&select=*";
 
     std::string body;
     if (!HttpGet(url, auth, body)) return false;
+
+    // If no active content found, fetch all content as fallback
+    if (body == "[]" || body.find("{") == std::string::npos) {
+        url = supabaseUrl + L"/rest/v1/contents?org_id=eq." + orgId + L"&select=*&order=created_at.desc&limit=2";
+        body.clear();
+        if (!HttpGet(url, auth, body)) return false;
+    }
 
     // Parse JSON array (simple approach: split by },{)
     // Each item: {"id":"...","filename":"...","storage_path":"...","file_hash":"...","file_size":...,"content_type":"...","display_position":"...","version":...}
