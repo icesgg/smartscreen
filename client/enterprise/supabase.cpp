@@ -229,7 +229,11 @@ bool SyncEnterpriseContent(const std::wstring& supabaseUrl, const std::wstring& 
     s_bannerPath.clear();
 
     for (auto& item : manifest.items) {
-        std::wstring localPath = dir + L"\\" + item.filename;
+        // Use storage path filename (hash-based) to avoid encoding issues
+        std::wstring storageFile = item.storagePath;
+        auto slash = storageFile.rfind(L'/');
+        if (slash != std::wstring::npos) storageFile = storageFile.substr(slash + 1);
+        std::wstring localPath = dir + L"\\" + storageFile;
 
         // Check if already downloaded (by size)
         WIN32_FILE_ATTRIBUTE_DATA fad;

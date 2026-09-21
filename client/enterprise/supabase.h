@@ -35,3 +35,7 @@ std::wstring GetEnterpriseContentDir();
 // Check and download new content if available
 bool SyncEnterpriseContent(const std::wstring& supabaseUrl, const std::wstring& anonKey,
                            const std::wstring& orgId);
+
+// After sync, get paths for center/banner content
+std::wstring GetEnterpriseCenterPath();
+std::wstring GetEnterpriseBannerPath();
