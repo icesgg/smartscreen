@@ -47,6 +47,7 @@ void LoadBlackScreenImages() {
             delete img;
         }
     }
+
 }
 
 void FreeBlackScreenImages() {
@@ -121,6 +122,7 @@ static LRESULT CALLBACK BlackScreenProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
         }
         return 0;
     case WM_ERASEBKGND: {
+        if (s_videoMode) return 1; // Let MFPlay handle rendering
         HDC hdc = (HDC)wParam; RECT rc; GetClientRect(hWnd, &rc);
         FillRect(hdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
         return 1;
@@ -133,12 +135,13 @@ static LRESULT CALLBACK BlackScreenProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
         PAINTSTRUCT ps; HDC hdc = BeginPaint(hWnd, &ps);
         RECT rc; GetClientRect(hWnd, &rc);
         int cw = rc.right, ch = rc.bottom;
-        FillRect(hdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
 
         if (s_videoMode) {
             VideoOnPaint(hWnd);
             EndPaint(hWnd, &ps); return 0;
         }
+
+        FillRect(hdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
 
         int imgW = 1024, imgH = 768;
         if (s_imgCenter) {
@@ -191,6 +194,8 @@ void RegisterBlackScreenClasses(HINSTANCE hInst) {
 // ---------------------------------------------------------------------------
 void ActivateBlackScreen() {
     if (g_bBlackActive) return;
+    // 방금 마우스/키보드를 썼다 = 사람이 앞에 있다 → RSSI와 무관하게 잠그지 않음
+    if (g_lastInputTick != 0 && (GetTickCount64() - g_lastInputTick) < 5000) return;
     if (g_proxState == ProxState::Near) {
         g_nCountdown = g_idleCountdownSec;
         return;
@@ -198,8 +203,9 @@ void ActivateBlackScreen() {
     g_bBlackActive = true;
     g_bManualLock = false;
     g_lockStartTick = GetTickCount64();
+    DbgEvent(L"BLACK ON  (idleCountdown=%d)", g_nCountdown);
 
-    int x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int x =GetSystemMetrics(SM_XVIRTUALSCREEN);
     int y = GetSystemMetrics(SM_YVIRTUALSCREEN);
     int w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
     int h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
@@ -225,6 +231,7 @@ void DeactivateBlackScreen() {
     swprintf_s(g_ovlInfo, L"Lock %02d:%02d -> Unlock %02d:%02d (%dm%02ds)",
         stLock.wHour, stLock.wMinute, stNow.wHour, stNow.wMinute, durMin, durSec);
 
+    DbgEvent(L"BLACK OFF (locked %lus, unlockTimer=%d)", durationSec, g_unlockTimer);
     g_bBlackActive = false;
     g_bManualLock = false;
     g_lockStartTick = 0;

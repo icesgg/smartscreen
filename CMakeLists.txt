@@ -10,6 +10,8 @@ add_executable(SmartScreen WIN32
     client/config.cpp
     client/bluetooth.cpp
     client/blackscreen.cpp
+    client/ble_rssi.cpp
+    client/ble_gatt.cpp
     client/enterprise/supabase.cpp
     client/p2p/discovery.cpp
     client/p2p/transfer.cpp
@@ -34,6 +36,8 @@ target_link_libraries(SmartScreen PRIVATE
     mfuuid
     ole32
     propsys
+    windowsapp
+    bcrypt
 )
 
 target_compile_definitions(SmartScreen PRIVATE UNICODE _UNICODE)

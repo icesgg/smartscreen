@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cmath>
+#include <atomic>
 
 // ---------------------------------------------------------------------------
 // Enums & structs
@@ -33,6 +34,9 @@ struct PairedDevice {
 struct ProbeResult {
     bool      reachable;
     DWORD     latencyMs;
+    int       rssiDbm;       // BLE RSSI (dBm, 음수값. 예: -65)
+    bool      gatt;          // true: v2(GATT 연결) RSSI, false: v1(광고) RSSI
+    bool      bleAvailable;  // BLE RSSI 사용 가능 여부
     int       wsaError;
     wchar_t   timeStr[32];
     ProxState state;
@@ -57,6 +61,12 @@ static constexpr DWORD WARMUP_MS       = 120000;
 // User-configurable settings (global)
 // ---------------------------------------------------------------------------
 extern DWORD  g_nearLatencyMs;
+extern int    g_nearRssiThreshold;  // RSSI 임계값 (dBm, 예: -70)
+extern int    g_gattRssiThreshold;  // v2(GATT) RSSI 임계값 - 폰이 측정한 값이라 v1과 별도
+extern bool   g_gattSeen;           // 이 PC에서 컴패니언 앱이 연결된 적이 있는지 (config에 저장)
+extern DWORD  g_gattGraceSec;       // 모니터링 시작 후 앱 연결을 기다려 주는 시간(초)
+extern ULONGLONG g_monStartTick;    // StartMon 시각
+extern bool   g_bleLostMeansFar;    // BLE 수신 끊김을 범위 이탈로 볼지 (상시 광고 기기 전용)
 extern DWORD  g_keepAliveSec;
 extern DWORD  g_scanIntervalSec;
 extern int    g_idleCountdownSec;
@@ -73,6 +83,7 @@ extern bool      g_monitoring;
 extern ProxState g_proxState;
 extern ULONGLONG g_lastNearTick;
 extern ULONGLONG g_reconnectTick;
+extern std::atomic<ULONGLONG> g_lastInputTick;  // 마지막 마우스/키보드 입력 시각
 extern int       g_consecutiveFails;
 extern std::vector<PairedDevice> g_paired;
 extern std::vector<FarEvent>     g_farEvents;
@@ -122,6 +133,16 @@ inline int LatencyToLevel(DWORD ms, bool reachable) {
     return 3;
 }
 
+// RSSI 기반 신호 레벨 (5단계, dBm)
+inline int RssiToLevel(int rssi, bool receiving) {
+    if (!receiving || rssi <= -100) return 0;  // 신호 없음
+    if (rssi >= -50) return 5;  // 매우 강함 (~1m 이내)
+    if (rssi >= -60) return 4;  // 강함 (~3m)
+    if (rssi >= -70) return 3;  // 보통 (~5-7m)
+    if (rssi >= -80) return 2;  // 약함 (~10m)
+    return 1;                   // 매우 약함 (>10m)
+}
+
 inline const wchar_t* LevelBar(int lv) {
     switch (lv) {
     case 5: return L"\u2588\u2588\u2588\u2588\u2588";
@@ -140,6 +161,17 @@ inline const wchar_t* LatencyToDist(DWORD ms) {
     if (ms < 1000) return L"~3-5m";
     if (ms < 2000) return L"~5-10m";
     return L"> 10m";
+}
+
+// RSSI 기반 거리 추정 (dBm → 거리 문자열)
+// Log-distance path loss model 기반
+inline const wchar_t* RssiToDist(int rssi) {
+    if (rssi >= -45) return L"< 1m";
+    if (rssi >= -55) return L"~1-2m";
+    if (rssi >= -65) return L"~2-5m";
+    if (rssi >= -75) return L"~5-10m";
+    if (rssi >= -85) return L"~10-15m";
+    return L"> 15m";
 }
 
 inline std::wstring GetExeDir() {
