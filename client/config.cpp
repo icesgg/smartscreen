@@ -77,7 +77,7 @@ bool LoadAppConfig(AppConfig& cfg) {
     if (m.count(L"bleIrk")) cfg.bleIrk = m[L"bleIrk"];
     if (m.count(L"bleTimeoutSec")) cfg.bleTimeoutSec = _wtoi(m[L"bleTimeoutSec"].c_str());
     if (m.count(L"bleGattServer")) cfg.bleGattServer = (_wtoi(m[L"bleGattServer"].c_str()) != 0);
-    if (m.count(L"bleGattPlain")) cfg.bleGattPlain = (_wtoi(m[L"bleGattPlain"].c_str()) != 0);
+    if (m.count(L"bleGattEncrypt")) cfg.bleGattEncrypt = (_wtoi(m[L"bleGattEncrypt"].c_str()) != 0);
     if (m.count(L"gattSeen")) cfg.gattSeen = (_wtoi(m[L"gattSeen"].c_str()) != 0);
     if (m.count(L"gattGraceSec")) cfg.gattGraceSec = _wtoi(m[L"gattGraceSec"].c_str());
     if (m.count(L"gattRssiThreshold")) cfg.gattRssiThreshold = _wtoi(m[L"gattRssiThreshold"].c_str());
@@ -132,7 +132,7 @@ void SaveAppConfig(const AppConfig& cfg) {
     m[L"bleIrk"] = cfg.bleIrk;
     swprintf_s(buf, L"%lu", cfg.bleTimeoutSec); m[L"bleTimeoutSec"] = buf;
     m[L"bleGattServer"] = cfg.bleGattServer ? L"1" : L"0";
-    m[L"bleGattPlain"] = cfg.bleGattPlain ? L"1" : L"0";
+    m[L"bleGattEncrypt"] = cfg.bleGattEncrypt ? L"1" : L"0";
     m[L"gattSeen"] = cfg.gattSeen ? L"1" : L"0";
     swprintf_s(buf, L"%lu", cfg.gattGraceSec); m[L"gattGraceSec"] = buf;
     swprintf_s(buf, L"%d", cfg.gattRssiThreshold); m[L"gattRssiThreshold"] = buf;

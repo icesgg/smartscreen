@@ -9,7 +9,9 @@ struct AppConfig {
     bool bleDebugLog = false;     // BLE 광고 진단 로그 (ble_scan_log.csv)
     DWORD bleTimeoutSec = 90;     // BLE 수신 끊김 판정 시간(초). 주머니 속 iPhone은 광고 간격이 70초까지 벌어짐
     bool bleGattServer = true;    // v2: PC가 GATT 서버가 되어 폰 앱의 1Hz RSSI 보고를 받음
-    bool bleGattPlain = false;    // v2 디버깅용: 암호화 요구 끄기
+    // 링크 암호화(=LE 본딩) 요구. 기본 끔: 본딩은 PC마다 따로 맺어야 해서 PC를 옮길 때마다 막힌다.
+    // 기기 확인은 IRK로 연결 상대 주소를 푸는 방식을 쓴다 (본딩과 무관하게 동작)
+    bool bleGattEncrypt = false;
     bool gattSeen = false;        // 컴패니언 앱이 연결된 적 있음 → 이후 미연결은 "부재"로 간주
     DWORD gattGraceSec = 90;      // 시작 후 앱 연결을 기다리는 시간(초)
     int gattRssiThreshold = -55;  // v2 임계값 (dBm, 폰이 측정한 연결 RSSI)
