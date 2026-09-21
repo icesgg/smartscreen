@@ -51,11 +51,14 @@ final class LinkManager: NSObject, ObservableObject, CBCentralManagerDelegate, C
             pc = p; p.delegate = self
             central.connect(p, options: nil)
             stateText = "PC에 연결 중"
-            return
         }
+        // 이전 PC로의 재연결 대기와 별개로 스캔도 계속 돌린다.
+        // 스캔을 멈추면 다른 PC(노트북 등)로 옮겼을 때 영영 찾지 못한다.
         // 백그라운드 스캔은 서비스 UUID를 명시해야 동작한다
-        central.scanForPeripherals(withServices: [kServiceUUID], options: nil)
-        stateText = "PC 찾는 중"
+        if !central.isScanning {
+            central.scanForPeripherals(withServices: [kServiceUUID], options: nil)
+            if pc == nil { stateText = "PC 찾는 중" }
+        }
     }
 
     // MARK: CBCentralManagerDelegate
@@ -82,6 +85,10 @@ final class LinkManager: NSObject, ObservableObject, CBCentralManagerDelegate, C
 
     func centralManager(_ c: CBCentralManager, didDiscover p: CBPeripheral,
                         advertisementData: [String: Any], rssi RSSI: NSNumber) {
+        // 다른 PC를 찾았으면 이전 PC로의 대기 중인 연결은 취소하고 갈아탄다
+        if let old = pc, old.identifier != p.identifier {
+            c.cancelPeripheralConnection(old)
+        }
         c.stopScan()
         pc = p
         p.delegate = self
@@ -101,12 +108,14 @@ final class LinkManager: NSObject, ObservableObject, CBCentralManagerDelegate, C
         stateText = "연결 끊김 - 재연결 대기"
         // 타임아웃 없는 connect(): 범위 안으로 돌아오면 iOS가 백그라운드에서도 자동 재연결
         c.connect(p, options: nil)
+        startScanOrConnect()   // 동시에 스캔도 재개 (다른 PC로 옮겼을 수 있음)
     }
 
     func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
         isConnected = false
         stateText = "연결 실패 - 재시도"
         c.connect(p, options: nil)
+        startScanOrConnect()
     }
 
     // MARK: CBPeripheralDelegate
