@@ -381,6 +381,11 @@ static DWORD WINAPI ReconnectThread(LPVOID) {
 static DWORD WINAPI ScanThread(LPVOID) {
     g_proxState = ProxState::Far;
     g_lastNearTick = 0;
+    // RFCOMM 프로브 결과 캐시 (폰 연결 대기 중에는 프로브를 띄엄띄엄 돌린다)
+    ULONGLONG lastProbeTick = 0;
+    bool  cachedReachable = false;
+    DWORD cachedLatency = 0;
+    int   cachedErr = 0;
     while (true) {
         bool reachable = false; DWORD latency = 0; int wsaErr = 0;
         bool isNear = false, bleAvail = false, useGatt = false;
@@ -424,8 +429,19 @@ static DWORD WINAPI ScanThread(LPVOID) {
                 reachable = true;
                 isNear = (rssi >= g_nearRssiThreshold);
             } else {
-                // BLE 불가 → 기존 latency fallback
-                DoProbe(g_targetAddr, reachable, latency, wsaErr);
+                // BLE 불가 → 기존 latency fallback.
+                // 단, GATT 서버가 폰을 기다리는 중이면 프로브 간격을 늘린다:
+                // 같은 라디오에서 2초마다 Classic 연결을 시도하면 BLE 광고/연결이 밀려
+                // 폰이 PC를 찾지 못한다. (iPhone은 PAN이 붙어 있지 않으면 RFCOMM도 실패)
+                bool gattWaiting = g_bleGatt.IsRunning() && !g_bleGatt.EverSubscribed();
+                ULONGLONG tick = GetTickCount64();
+                if (!gattWaiting || lastProbeTick == 0 || (tick - lastProbeTick) >= 20000) {
+                    lastProbeTick = tick;
+                    DoProbe(g_targetAddr, reachable, latency, wsaErr);
+                    cachedReachable = reachable; cachedLatency = latency; cachedErr = wsaErr;
+                } else {
+                    reachable = cachedReachable; latency = cachedLatency; wsaErr = cachedErr;
+                }
             }
         }
 
