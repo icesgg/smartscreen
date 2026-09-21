@@ -6,6 +6,7 @@
 #include <map>
 #include <cctype>
 #include <cstdarg>
+#include <mutex>
 
 std::wstring GetConfigDir() {
     wchar_t appdata[MAX_PATH];
@@ -19,7 +20,11 @@ bool g_debugEvents = true;
 
 void DbgEvent(const wchar_t* fmt, ...) {
     if (!g_debugEvents) return;
-    FILE* f = _wfsopen((GetConfigDir() + L"\\events.log").c_str(), L"a,ccs=UTF-8", _SH_DENYWR);
+    // 광고 콜백/틱 스레드/UI가 동시에 호출한다. 공유 모드로 열지 않으면
+    // 동시 호출 시 한쪽의 _wfsopen이 실패해 메시지가 조용히 사라진다.
+    static std::mutex mx;
+    std::lock_guard<std::mutex> lock(mx);
+    FILE* f = _wfsopen((GetConfigDir() + L"\\events.log").c_str(), L"a,ccs=UTF-8", _SH_DENYNO);
     if (!f) return;
     SYSTEMTIME st; GetLocalTime(&st);
     fwprintf(f, L"%02d:%02d:%02d ", st.wHour, st.wMinute, st.wSecond);

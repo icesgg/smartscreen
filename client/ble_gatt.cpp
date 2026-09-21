@@ -90,18 +90,31 @@ struct BleGattServer::Impl {
     }
 
     // 광고가 멈춰 있으면 다시 켠다. Stop() 직후 재시작하면 Windows가 Aborted로 떨어지는 경우가 있음
+    std::atomic<int> advRetries{ 0 };
+
     void EnsureAdvertising() {
         if (!provider || !running) return;
         try {
             auto st = provider.AdvertisementStatus();
             if (st == GattServiceProviderAdvertisementStatus::Started ||
-                st == GattServiceProviderAdvertisementStatus::StartedWithoutAllAdvertisementData) return;
+                st == GattServiceProviderAdvertisementStatus::StartedWithoutAllAdvertisementData) {
+                advRetries = 0;
+                return;
+            }
+            // Aborted 상태에서는 StartAdvertising만 다시 불러도 살아나지 않는다. 먼저 멈춘다.
+            try { provider.StopAdvertising(); } catch (...) {}
+            Sleep(200);
             GattServiceProviderAdvertisingParameters adv;
             adv.IsConnectable(true);
             adv.IsDiscoverable(true);
             provider.StartAdvertising(adv);
-            DbgEvent(L"GATT advertisement restarted");
-        } catch (...) {}
+            int n = ++advRetries;
+            DbgEvent(L"GATT advertisement restart #%d -> status=%d", n, (int)provider.AdvertisementStatus());
+        } catch (winrt::hresult_error const& e) {
+            DbgEvent(L"GATT advertisement restart failed: 0x%08X", (unsigned)e.code());
+        } catch (...) {
+            DbgEvent(L"GATT advertisement restart failed");
+        }
     }
 
     static DWORD WINAPI TickThread(LPVOID p) {
@@ -272,6 +285,8 @@ bool BleGattServer::Start(bool plain, const std::wstring& logPath) {
         adv.IsConnectable(true);
         adv.IsDiscoverable(true);
         m_impl->provider.StartAdvertising(adv);
+        DbgEvent(L"GATT advertising: status=%d (2=Started, 3=Aborted)",
+                 (int)m_impl->provider.AdvertisementStatus());
 
         m_impl->stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         m_impl->thread = CreateThread(nullptr, 0, Impl::TickThread, m_impl, 0, nullptr);

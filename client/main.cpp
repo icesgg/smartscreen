@@ -553,11 +553,7 @@ static void StartMon() {
     DbgEvent(L"START thr=%d dBm keepAlive=%lus idle=%ds unlockDelay=%ds bleTimeout=%lus lostMeansFar=%d irk=%d",
         g_nearRssiThreshold, g_keepAliveSec, g_idleCountdownSec, g_unlockDelaySec,
         cfg.bleTimeoutSec, cfg.bleLostMeansFar ? 1 : 0, cfg.bleIrk.empty() ? 0 : 1);
-    g_bleScanner.SetTimeoutSec(cfg.bleTimeoutSec);
-    g_bleScanner.SetDebugLog(cfg.bleDebugLog ? GetConfigDir() + L"\\ble_scan_log.csv" : L"");
-    g_bleScanner.Start(g_targetName, g_targetAddr);
-
-    // v2: GATT 서버 시작 (폰 앱이 연결해 오면 1Hz RSSI 보고를 받음. 실패해도 v1/latency로 동작)
+    // v2: GATT 서버를 먼저 시작 (폰 앱이 연결해 오면 1Hz RSSI 보고를 받음. 실패해도 v1/latency로 동작)
     g_gattRssiThreshold = cfg.gattRssiThreshold;
     g_gattSeen = cfg.gattSeen;
     g_gattGraceSec = cfg.gattGraceSec;
@@ -570,6 +566,17 @@ static void StartMon() {
     } else {
         DbgEvent(L"GATT server disabled by config");
     }
+
+    // v1 광고 스캔은 컴패니언 앱을 안 쓰는 PC에서만 돌린다.
+    // 같은 어댑터에서 Active 스캔과 주변장치 광고가 겹치면 광고가 Aborted 되는 일이 있다.
+    bool useAdvScan = !(g_bleGatt.IsRunning() && cfg.gattSeen);
+    DbgEvent(L"v1 advertisement scan: %s", useAdvScan ? L"on" : L"off (companion expected)");
+    if (useAdvScan) {
+        g_bleScanner.SetTimeoutSec(cfg.bleTimeoutSec);
+        g_bleScanner.SetDebugLog(cfg.bleDebugLog ? GetConfigDir() + L"\\ble_scan_log.csv" : L"");
+        g_bleScanner.Start(g_targetName, g_targetAddr);
+    }
+
     cfg.btAddress = g_targetAddr;
     cfg.nearLatencyMs = g_nearLatencyMs;
     cfg.nearRssiThreshold = g_nearRssiThreshold;
