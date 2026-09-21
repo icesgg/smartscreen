@@ -33,6 +33,7 @@ final class LinkManager: NSObject, ObservableObject, CBCentralManagerDelegate, C
     private var pc: CBPeripheral?
     private var rssiChar: CBCharacteristic?
     private var seq: UInt8 = 0
+    private var discoverTries = 0
 
     override init() {
         super.init()
@@ -99,7 +100,9 @@ final class LinkManager: NSObject, ObservableObject, CBCentralManagerDelegate, C
     func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
         isConnected = true
         stateText = "연결됨"
-        p.discoverServices([kServiceUUID])
+        discoverTries = 0
+        // nil = 전체 탐색. UUID 필터를 주면 iOS 캐시 때문에 실제로 있는 서비스를 놓치기도 한다
+        p.discoverServices(nil)
     }
 
     func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
@@ -120,10 +123,25 @@ final class LinkManager: NSObject, ObservableObject, CBCentralManagerDelegate, C
 
     // MARK: CBPeripheralDelegate
     func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
-        guard let svc = p.services?.first(where: { $0.uuid == kServiceUUID }) else {
-            stateText = "서비스를 찾지 못함"; return
+        if let svc = p.services?.first(where: { $0.uuid == kServiceUUID }) {
+            discoverTries = 0
+            p.discoverCharacteristics([kTickUUID, kRssiUUID], for: svc)
+            return
         }
-        p.discoverCharacteristics([kTickUUID, kRssiUUID], for: svc)
+        let n = p.services?.count ?? 0
+        discoverTries += 1
+        if discoverTries <= 3 {
+            stateText = "서비스 찾는 중 (\(n)개 발견, 재시도 \(discoverTries))"
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                guard self != nil, p.state == .connected else { return }
+                p.discoverServices(nil)
+            }
+        } else {
+            // 끊었다 다시 붙으면 iOS가 GATT 목록을 다시 읽는다
+            stateText = "서비스 없음 (\(n)개) - 재연결"
+            discoverTries = 0
+            central.cancelPeripheralConnection(p)
+        }
     }
 
     func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
