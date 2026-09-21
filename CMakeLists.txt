@@ -4,6 +4,9 @@ project(SmartScreen LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# CRT를 정적 링크 → 다른 PC에서 VC++ 재배포 패키지 없이 exe 하나로 실행
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 add_executable(SmartScreen WIN32
     client/main.cpp
     client/globals.cpp

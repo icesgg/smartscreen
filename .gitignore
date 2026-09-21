@@ -5,3 +5,5 @@ build/
 *.pdb
 *.ilk
 main.cpp.bak
+dist/
+*.zip
