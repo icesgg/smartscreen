@@ -15,11 +15,21 @@
 #include <windows.h>
 #include <string>
 
-// 한 주소에 붙어 신원 토큰을 읽는다. 블로킹, 보통 1~3초, 최악 20초.
-// 성공하면 tokenHex에 32자리 hex(16바이트)를 넣고 true.
-// why에는 실패 사유가 들어간다 (이벤트 로그용).
-bool ReadPhoneToken(uint64_t addr, bool randomAddr,
-                    std::wstring& tokenHex, std::wstring& why);
+// 탐색 결과. 실패를 둘로 가르는 것이 핵심이다 -
+// "붙었는데 우리 서비스가 없다"는 확정이고, "못 붙었다"는 다시 해볼 일이다.
+// 둘을 같이 취급하면 아닌 게 확실한 기기를 계속 다시 찌르면서
+// 정작 맞는 기기에 쓸 시도를 낭비한다.
+enum class ProbeOutcome {
+    Token,        // 토큰을 읽었다 (우리 것인지는 호출자가 대조한다)
+    NotOurs,      // 붙었지만 신원 서비스가 없다 - 남의 기기
+    Unreachable,  // 붙지 못했다 - 일시적일 수 있다
+};
+
+// 한 주소에 붙어 신원 토큰을 읽는다. 블로킹, 보통 1~3초, 최악 10초.
+// why에는 사유가 들어간다 (이벤트 로그용). elapsedMs는 실제 걸린 시간.
+ProbeOutcome ReadPhoneToken(uint64_t addr, bool randomAddr,
+                            std::wstring& tokenHex, std::wstring& why,
+                            DWORD* elapsedMs = nullptr);
 
 // 등록: 앱을 화면에 띄운 폰을 찾아 토큰을 읽는다.
 // 포그라운드에서는 iOS가 이름과 서비스 UUID를 광고에 그대로 실으므로 후보가

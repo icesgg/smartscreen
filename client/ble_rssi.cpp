@@ -95,10 +95,19 @@ struct BleRssiScanner::Impl {
     std::atomic<uint64_t> boundAddr{ 0 };       // 토큰으로 확인된 현재 주소
     std::atomic<ULONGLONG> boundSeenTick{ 0 };  // 그 주소를 마지막으로 본 시각
 
+    // 못 붙은 것은 금방 다시 해 본다. 실측에서 맞는 주소인데도 Unreachable 이
+    // 다섯 번 연달아 났고, 60초 간격이라 4분에 다섯 번밖에 시도하지 못했다.
+    static constexpr ULONGLONG kRetryUnreachableMs = 15000;
+    // 붙었는데 우리 서비스가 없던 기기는 다시 볼 이유가 없다. 주소가 바뀌면
+    // 어차피 새 후보로 들어온다.
+    static constexpr ULONGLONG kRetryNotOursMs = 600000;
+
     struct Cand { bool rnd; int rssi; int bit; ULONGLONG seen; };
     std::mutex candMutex;
     std::map<uint64_t, Cand> cands;             // overflow 비트 하나짜리 광고들
-    std::map<uint64_t, ULONGLONG> probedTick;   // 주소별 마지막 탐색 (재시도 억제)
+    // 주소별 재시도 금지 시각. 실패 종류에 따라 길이가 다르다 -
+    // 남의 기기로 확인된 주소를 계속 다시 찌르면 맞는 기기에 쓸 시도를 낭비한다.
+    std::map<uint64_t, ULONGLONG> probedUntil;
     HANDLE proberThread{ nullptr };
     HANDLE proberStop{ nullptr };
 
@@ -263,18 +272,21 @@ struct BleRssiScanner::Impl {
     }
 
     // 후보 하나를 골라 붙어 보고, 토큰이 맞으면 그 주소를 묶는다.
-    // 스캔 콜백 스레드에서 하면 안 된다 - 연결은 최악 20초까지 걸린다.
+    // 스캔 콜백 스레드에서 하면 안 된다 - 연결은 최악 10초까지 걸린다.
     static DWORD WINAPI ProberThunk(LPVOID p) { ((Impl*)p)->ProberLoop(); return 0; }
 
     void ProberLoop() {
         while (WaitForSingleObject(proberStop, 2000) == WAIT_TIMEOUT) {
             // 스캔이 꺼져 있으면 논다. 스레드를 Impl 수명 내내 살려 두는 이유는
-            // 연결 한 번이 최악 20초라 Stop 에서 조인하면 UI 가 그만큼 멈추기 때문이다.
+            // 연결 한 번이 최악 10초라 Stop 에서 조인하면 UI 가 그만큼 멈추기 때문이다.
             if (!running || identToken.empty()) continue;
             ULONGLONG now = GetTickCount64();
 
-            // 묶인 주소가 아직 광고 중이면 할 일이 없다
-            if (boundAddr && (now - boundSeenTick) < 20000) continue;
+            // 묶인 주소가 아직 광고 중이면 할 일이 없다.
+            // 30초로 잡은 이유: 실측 광고 간격의 최대가 19.9초였다. 20초로 두면
+            // 정상적인 공백에도 결합이 풀려 헛된 탐색이 돈다. 늦게 풀어도 손해가
+            // 적은 쪽인데, 결합이 풀려도 RSSI 는 bleTimeoutSec(90초)까지 살아 있다.
+            if (boundAddr && (now - boundSeenTick) < 30000) continue;
             if (boundAddr) {
                 DbgEvent(L"ident: %012llX went quiet, looking again",
                          (unsigned long long)boundAddr.load());
@@ -289,8 +301,8 @@ struct BleRssiScanner::Impl {
                     else ++it;
                 }
                 // 주소는 주기적으로 바뀌므로 그냥 두면 계속 쌓인다
-                for (auto it = probedTick.begin(); it != probedTick.end(); ) {
-                    if (now - it->second > 300000) it = probedTick.erase(it);
+                for (auto it = probedUntil.begin(); it != probedUntil.end(); ) {
+                    if (now > it->second + 300000) it = probedUntil.erase(it);
                     else ++it;
                 }
                 int want = identBit.load();
@@ -301,32 +313,42 @@ struct BleRssiScanner::Impl {
                     for (auto const& [a, c] : cands) {
                         if (pass == 0 && c.bit != want) continue;
                         if (c.rssi < probeFloor) continue;   // 자리 판정에 쓸 수 없는 거리는 건드리지 않는다
-                        auto pit = probedTick.find(a);
-                        if (pit != probedTick.end() && (now - pit->second) < 60000) continue;
+                        auto pit = probedUntil.find(a);
+                        if (pit != probedUntil.end() && now < pit->second) continue;
                         if (c.rssi > pickRssi) {
                             pick = a; pickRnd = c.rnd; pickBit = c.bit; pickRssi = c.rssi;
                         }
                     }
                 }
-                if (pick) probedTick[pick] = now;
+                if (pick) probedUntil[pick] = now + kRetryUnreachableMs;
             }
             if (!pick) continue;
 
             std::wstring tok, why;
-            if (!ReadPhoneToken(pick, pickRnd, tok, why)) {
-                DbgEvent(L"ident: %012llX probe failed (%s)",
-                         (unsigned long long)pick, why.c_str());
-                continue;
-            }
-            if (_wcsicmp(tok.c_str(), identToken.c_str()) != 0) {
-                DbgEvent(L"ident: %012llX is someone else's phone",
-                         (unsigned long long)pick);
+            DWORD took = 0;
+            ProbeOutcome r = ReadPhoneToken(pick, pickRnd, tok, why, &took);
+            bool ours = (r == ProbeOutcome::Token) &&
+                        (_wcsicmp(tok.c_str(), identToken.c_str()) == 0);
+            if (!ours) {
+                // 붙었는데 아닌 것으로 확인된 기기는 한동안 접어 둔다.
+                // 못 붙은 것은 일시적일 수 있으니 금방 다시 해 본다 -
+                // 실측에서 맞는 주소인데도 연달아 다섯 번 Unreachable 이 났다.
+                bool settled = (r != ProbeOutcome::Unreachable);
+                {
+                    std::lock_guard<std::mutex> lock(candMutex);
+                    probedUntil[pick] = GetTickCount64() +
+                        (settled ? kRetryNotOursMs : kRetryUnreachableMs);
+                }
+                DbgEvent(L"ident: %012llX %s (%s, %lums)",
+                         (unsigned long long)pick,
+                         settled ? L"is not our phone" : L"probe failed",
+                         why.empty() ? L"token mismatch" : why.c_str(), took);
                 continue;
             }
             boundAddr = pick;
             boundSeenTick = GetTickCount64();
-            DbgEvent(L"ident: bound to %012llX (%d dBm)",
-                     (unsigned long long)pick, pickRssi);
+            DbgEvent(L"ident: bound to %012llX (%d dBm, %lums)",
+                     (unsigned long long)pick, pickRssi, took);
             if (pickBit >= 0 && pickBit != identBit.load()) {
                 identBit = pickBit;
                 identBitLearned = pickBit;   // 설정에 저장하도록 알린다
@@ -554,7 +576,7 @@ void BleRssiScanner::Stop() {
     {
         std::lock_guard<std::mutex> lock(m_impl->candMutex);
         m_impl->cands.clear();
-        m_impl->probedTick.clear();
+        m_impl->probedUntil.clear();
     }
 }
 

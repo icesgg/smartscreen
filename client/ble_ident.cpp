@@ -37,10 +37,16 @@ static const wchar_t* StatusText(GattCommunicationStatus s) {
     }
 }
 
-bool ReadPhoneToken(uint64_t addr, bool randomAddr,
-                    std::wstring& tokenHex, std::wstring& why) {
+ProbeOutcome ReadPhoneToken(uint64_t addr, bool randomAddr,
+                            std::wstring& tokenHex, std::wstring& why,
+                            DWORD* elapsedMs) {
     tokenHex.clear();
     why.clear();
+    ULONGLONG t0 = GetTickCount64();
+    struct Timer {
+        ULONGLONG t0; DWORD* out;
+        ~Timer() { if (out) *out = (DWORD)(GetTickCount64() - t0); }
+    } timer{ t0, elapsedMs };
     static const winrt::guid identGuid = ToGuid(SS_IDENT_SERVICE_UUID);
     static const winrt::guid tokenGuid = ToGuid(SS_IDENT_TOKEN_UUID);
 
@@ -50,22 +56,22 @@ bool ReadPhoneToken(uint64_t addr, bool randomAddr,
     try {
         auto op = BluetoothLEDevice::FromBluetoothAddressAsync(
             addr, randomAddr ? BluetoothAddressType::Random : BluetoothAddressType::Public);
-        if (op.wait_for(std::chrono::seconds(10)) != winrt::Windows::Foundation::AsyncStatus::Completed) {
-            why = L"device object timeout"; return false;
+        if (op.wait_for(std::chrono::seconds(5)) != winrt::Windows::Foundation::AsyncStatus::Completed) {
+            why = L"device object timeout"; return ProbeOutcome::Unreachable;
         }
         dev = op.GetResults();
     } catch (hresult_error const& e) {
         wchar_t b[64]; swprintf_s(b, L"device object 0x%08X", (unsigned)e.code());
-        why = b; return false;
+        why = b; return ProbeOutcome::Unreachable;
     }
-    if (!dev) { why = L"device object null"; return false; }
+    if (!dev) { why = L"device object null"; return ProbeOutcome::Unreachable; }
 
-    bool ok = false;
+    ProbeOutcome outcome = ProbeOutcome::Unreachable;
     GattDeviceServicesResult res{ nullptr };
     try {
         // Uncached 라야 실제로 붙는다. 캐시를 주면 예전 서비스 목록이 돌아온다.
         auto sop = dev.GetGattServicesAsync(BluetoothCacheMode::Uncached);
-        if (sop.wait_for(std::chrono::seconds(20)) != winrt::Windows::Foundation::AsyncStatus::Completed) {
+        if (sop.wait_for(std::chrono::seconds(10)) != winrt::Windows::Foundation::AsyncStatus::Completed) {
             why = L"service discovery timeout";
         } else {
             res = sop.GetResults();
@@ -78,7 +84,7 @@ bool ReadPhoneToken(uint64_t addr, bool randomAddr,
                     if (s.Uuid() != identGuid) continue;
                     found = true;
                     auto cop = s.GetCharacteristicsAsync(BluetoothCacheMode::Uncached);
-                    if (cop.wait_for(std::chrono::seconds(10)) != winrt::Windows::Foundation::AsyncStatus::Completed) {
+                    if (cop.wait_for(std::chrono::seconds(5)) != winrt::Windows::Foundation::AsyncStatus::Completed) {
                         why = L"characteristic discovery timeout"; break;
                     }
                     auto cres = cop.GetResults();
@@ -88,7 +94,7 @@ bool ReadPhoneToken(uint64_t addr, bool randomAddr,
                     for (auto const& ch : cres.Characteristics()) {
                         if (ch.Uuid() != tokenGuid) continue;
                         auto rop = ch.ReadValueAsync(BluetoothCacheMode::Uncached);
-                        if (rop.wait_for(std::chrono::seconds(10)) != winrt::Windows::Foundation::AsyncStatus::Completed) {
+                        if (rop.wait_for(std::chrono::seconds(5)) != winrt::Windows::Foundation::AsyncStatus::Completed) {
                             why = L"token read timeout"; break;
                         }
                         auto rres = rop.GetResults();
@@ -102,13 +108,13 @@ bool ReadPhoneToken(uint64_t addr, bool randomAddr,
                             swprintf_s(hx, L"%02X", rd.ReadByte());
                             tokenHex += hx;
                         }
-                        ok = !tokenHex.empty();
-                        if (!ok) why = L"token empty";
+                        if (tokenHex.empty()) why = L"token empty";
+                        else outcome = ProbeOutcome::Token;
                         break;
                     }
                     break;
                 }
-                if (!found) why = L"ident service absent";
+                if (!found) { why = L"ident service absent"; outcome = ProbeOutcome::NotOurs; }
             }
         }
     } catch (hresult_error const& e) {
@@ -123,7 +129,7 @@ bool ReadPhoneToken(uint64_t addr, bool randomAddr,
     if (res) { try { for (auto const& s : res.Services()) s.Close(); } catch (...) {} }
     // 연결을 붙잡고 있으면 폰이 광고를 멈출 수 있으니 반드시 놓아준다
     try { dev.Close(); } catch (...) {}
-    return ok;
+    return outcome;
 }
 
 bool RegisterPhone(int scanSec, std::wstring& tokenHex, std::wstring& why) {
@@ -172,7 +178,7 @@ bool RegisterPhone(int scanSec, std::wstring& tokenHex, std::wstring& why) {
     DbgEvent(L"register: candidate %012llX rssi=%d dBm", (unsigned long long)best, bestRssi);
 
     std::wstring reason;
-    if (!ReadPhoneToken(best, bestRandom, tokenHex, reason)) {
+    if (ReadPhoneToken(best, bestRandom, tokenHex, reason) != ProbeOutcome::Token) {
         why = L"연결은 했지만 토큰을 읽지 못했습니다 (" + reason + L")";
         return false;
     }
