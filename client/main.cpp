@@ -394,9 +394,11 @@ static DWORD WINAPI ScanThread(LPVOID) {
         bool reachable = false; DWORD latency = 0; int wsaErr = 0;
         bool isNear = false, bleAvail = false, useGatt = false;
         int rssi = -100;
+        int effThr = g_nearRssiThreshold;   // 이 샘플을 판정한 실효 임계값 (로그용)
 
-        // 컴패니언 앱이 이 PC에 붙은 적이 있으면(이번 세션 또는 과거), GATT 연결 여부 자체가 "재실 신호".
-        // 이 경우 광고/latency 폴백을 쓰지 않는다 - latency는 30~50m까지 닿아서 자리 비움을 놓친다.
+        // 컴패니언 앱이 이 PC에 붙은 적이 있으면(이번 세션 또는 과거), GATT 연결이 끊긴 것
+        // 자체가 자리 비움의 단서다. 다만 단서일 뿐이라 광고가 폰을 듣고 있으면 그쪽을 쓴다.
+        // latency 폴백만은 이 경우에도 쓰지 않는다 - 30~50m까지 닿아서 자리 비움을 놓친다.
         bool gattExpected = g_bleGatt.IsRunning() &&
             (g_bleGatt.EverSubscribed() || (g_gattSeen &&
                 (GetTickCount64() - g_monStartTick) > (ULONGLONG)g_gattGraceSec * 1000));
@@ -412,10 +414,17 @@ static DWORD WINAPI ScanThread(LPVOID) {
             } else {
                 // 히스테리시스: 잠금은 임계값 미만, 해제는 임계값+4 이상 (경계에서 깜빡임 방지)
                 int thr = g_gattRssiThreshold + (g_proxState == ProxState::Near ? 0 : 4);
+                effThr = thr;
                 isNear = (rssi >= thr);
             }
-        } else if (gattExpected) {
-            // 앱이 붙어 있어야 하는데 연결이 없음 = 범위 이탈(또는 앱 종료) → 부재로 판정
+        } else if (gattExpected && !(g_bleScanner.IsAvailable() && g_bleScanner.IsReceiving())) {
+            // 앱이 붙어 있어야 하는데 연결도 없고 광고도 안 들린다 → 부재로 판정.
+            //
+            // 광고가 들리면 이쪽으로 오지 않는다. 예전에는 GATT가 끊기기만 하면
+            // RSSI를 보지도 않고 부재로 단정했는데, 앱이 잠깐 떨어져 나간 것만으로
+            // -46dBm 으로 들리는 폰을 두고 화면을 잠갔다.
+            // 못 믿을 것은 latency 폴백(30~50m까지 닿아 자리 비움을 놓친다)이지
+            // 광고 RSSI가 아니다. 광고는 이 제품의 주력 경로다.
             useGatt = true; bleAvail = true; reachable = true;
             rssi = -100;
             isNear = false;
@@ -431,7 +440,11 @@ static DWORD WINAPI ScanThread(LPVOID) {
                 // BLE로 판단하는 동안은 RFCOMM 프로브를 생략:
                 // 같은 BT 어댑터에서 Classic 연결 시도가 BLE 스캔 시간을 빼앗아 광고 수신율을 떨어뜨림
                 reachable = true;
-                isNear = (rssi >= g_nearRssiThreshold);
+                // 히스테리시스: 잠금은 임계값 미만, 해제는 임계값+4 이상.
+                // GATT 경로에만 있었는데, 실측에서 착석 분포의 아래 꼬리가 임계값에
+                // 닿으면 1dB 흔들림에 NEAR/FAR 이 뒤집혔다. 같은 이유로 여기에도 필요하다.
+                effThr = g_nearRssiThreshold + (g_proxState == ProxState::Near ? 0 : 4);
+                isNear = (rssi >= effThr);
             } else if (g_targetAddr == 0) {
                 // 등록된 폰은 Classic 주소가 없다. 여기서 RFCOMM 을 찔러 봐야
                 // 붙을 상대도 없고 같은 라디오의 BLE 슬롯만 빼앗는다 (PROXIMITY.md 참고).
@@ -481,6 +494,7 @@ static DWORD WINAPI ScanThread(LPVOID) {
         auto* r = new ProbeResult{};
         r->reachable = reachable; r->latencyMs = latency; r->wsaError = wsaErr;
         r->rssiDbm = rssi; r->bleAvailable = bleAvail; r->gatt = useGatt;
+        r->thresholdDbm = effThr;
         r->state = g_proxState; r->prevState = prev;
         NowStr(r->timeStr, _countof(r->timeStr));
         if (g_proxState == ProxState::Near) {
@@ -772,10 +786,12 @@ static void OnResult(ProbeResult* r) {
     g_logCount++;
     bool transition = (r->state != r->prevState);
     if (transition)
-        DbgEvent(L"STATE %s -> %s  (%s rssi=%d dBm thr=%d, latency=%lums reachable=%d)",
+        DbgEvent(L"STATE %s -> %s  (%s rssi=%d dBm thr=%d set=%d, latency=%lums reachable=%d)",
             r->prevState == ProxState::Near ? L"NEAR" : L"FAR", r->state == ProxState::Near ? L"NEAR" : L"FAR",
             r->gatt ? L"GATT" : (r->bleAvailable ? L"adv" : L"latency"), r->rssiDbm,
-            r->gatt ? g_gattRssiThreshold : g_nearRssiThreshold, r->latencyMs, r->reachable ? 1 : 0);
+            r->thresholdDbm,                                          // 히스테리시스 적용된 실효값
+            r->gatt ? g_gattRssiThreshold : g_nearRssiThreshold,      // 설정값
+            r->latencyMs, r->reachable ? 1 : 0);
     if (transition && r->state == ProxState::Far) {
         FarEvent fe; fe.tickMs=GetTickCount64(); GetLocalTime(&fe.st);
         g_farEvents.push_back(fe);

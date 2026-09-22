@@ -38,6 +38,9 @@ struct ProbeResult {
     bool      gatt;          // true: v2(GATT 연결) RSSI, false: v1(광고) RSSI
     bool      bleAvailable;  // BLE RSSI 사용 가능 여부
     int       wsaError;
+    // 이 샘플을 판정할 때 실제로 쓴 임계값. 히스테리시스 때문에 설정값과 다를 수 있어
+    // (FAR에서 돌아올 때는 +4dB) 설정값만 찍으면 로그를 봐도 판정을 재현할 수 없다.
+    int       thresholdDbm;
     wchar_t   timeStr[32];
     ProxState state;
     ProxState prevState;
