@@ -17,6 +17,7 @@
 #include "ble_rssi.h"
 #include "ble_gatt.h"
 #include "irk.h"
+#include "ble_ident.h"
 #include "enterprise/supabase.h"
 
 // ---------------------------------------------------------------------------
@@ -40,6 +41,7 @@ static constexpr int ID_BTN_CENTER_IMG = 215;
 static constexpr int ID_BTN_BANNER_IMG = 216;
 static constexpr int ID_BTN_ENTERPRISE = 217;
 static constexpr int ID_BTN_IMPORT_IRK = 218;
+static constexpr int ID_BTN_REGISTER_PHONE = 219;
 static constexpr UINT WM_SCAN_RESULT = WM_USER + 100;
 
 // New combo IDs for simplified settings
@@ -430,6 +432,11 @@ static DWORD WINAPI ScanThread(LPVOID) {
                 // 같은 BT 어댑터에서 Classic 연결 시도가 BLE 스캔 시간을 빼앗아 광고 수신율을 떨어뜨림
                 reachable = true;
                 isNear = (rssi >= g_nearRssiThreshold);
+            } else if (g_targetAddr == 0) {
+                // 등록된 폰은 Classic 주소가 없다. 여기서 RFCOMM 을 찔러 봐야
+                // 붙을 상대도 없고 같은 라디오의 BLE 슬롯만 빼앗는다 (PROXIMITY.md 참고).
+                reachable = false;
+                latency = 0;
             } else {
                 // BLE 불가 → 기존 latency fallback.
                 // 단, GATT 서버가 폰을 기다리는 중이면 프로브 간격을 늘린다:
@@ -490,11 +497,33 @@ static DWORD WINAPI ScanThread(LPVOID) {
 
 // ---------------------------------------------------------------------------
 // PopulateCombo
+//
+// 목록은 원래 "페어링된 기기"였다. 등록된 폰은 페어링할 필요가 없는 것이 요점이라
+// (ble_ident.h) 목록에 없고, 그대로 두면 엉뚱한 페어링 기기가 대상으로 잡힌다.
+// 그래서 토큰이 등록돼 있으면 맨 앞에 "등록된 폰" 항목을 넣고 기본으로 고른다.
 // ---------------------------------------------------------------------------
+static bool g_comboPhoneEntry = false;   // 목록 0번이 "등록된 폰"인지
+
+// 콤보 선택을 g_paired 인덱스로 바꾼다. "등록된 폰" 항목이거나 범위 밖이면 -1
+static int ComboSelToPaired(int sel) {
+    if (g_comboPhoneEntry) sel -= 1;
+    return (sel >= 0 && sel < (int)g_paired.size()) ? sel : -1;
+}
+static bool ComboIsPhoneEntry(int sel) { return g_comboPhoneEntry && sel == 0; }
+
 static void PopulateCombo() {
     SendMessageW(g_hCombo, CB_RESETCONTENT, 0, 0);
     EnumPaired();
-    if (g_paired.empty()) {
+
+    AppConfig ccfg; LoadAppConfig(ccfg);
+    g_comboPhoneEntry = !ccfg.phoneToken.empty();
+    if (g_comboPhoneEntry) {
+        std::wstring head = ccfg.phoneToken.substr(0, (std::min)((size_t)8, ccfg.phoneToken.size()));
+        std::wstring it = L"등록된 폰  [토큰 " + head + L"]";  // 등록된 폰 [토큰 ...]
+        SendMessageW(g_hCombo, CB_ADDSTRING, 0, (LPARAM)it.c_str());
+    }
+
+    if (g_paired.empty() && !g_comboPhoneEntry) {
         SendMessageW(g_hCombo, CB_ADDSTRING, 0, (LPARAM)L"(\xD398\xC5B4\xB9C1\xB41C \xAE30\xAE30 \xC5C6\xC74C)");  // (페어링된 기기 없음)
         EnableWindow(g_hBtnStart, FALSE); return;
     }
@@ -504,14 +533,18 @@ static void PopulateCombo() {
             FmtAddr(g_paired[i].address).c_str(), g_paired[i].connected ? L" *" : L"");
         SendMessageW(g_hCombo, CB_ADDSTRING, 0, (LPARAM)it);
     }
-    for (size_t i = 0; i < g_paired.size(); i++) {
-        if (g_paired[i].address == g_targetAddr) {
-            SendMessageW(g_hCombo, CB_SETCURSEL, i, 0);
-            EnableWindow(g_hBtnStart, TRUE); return;
+    EnableWindow(g_hBtnStart, TRUE);
+
+    // 저장된 주소가 0이면 등록된 폰을 쓰던 것이다 → 0번(등록된 폰)이 그대로 기본이 된다
+    if (g_targetAddr != 0) {
+        for (size_t i = 0; i < g_paired.size(); i++) {
+            if (g_paired[i].address == g_targetAddr) {
+                SendMessageW(g_hCombo, CB_SETCURSEL, i + (g_comboPhoneEntry ? 1 : 0), 0);
+                return;
+            }
         }
     }
     SendMessageW(g_hCombo, CB_SETCURSEL, 0, 0);
-    EnableWindow(g_hBtnStart, TRUE);
 }
 
 // ---------------------------------------------------------------------------
@@ -519,7 +552,8 @@ static void PopulateCombo() {
 // ---------------------------------------------------------------------------
 static void StartMon() {
     int sel = (int)SendMessageW(g_hCombo, CB_GETCURSEL, 0, 0);
-    if (sel < 0 || sel >= (int)g_paired.size()) return;
+    int pairedIdx = ComboSelToPaired(sel);
+    if (!ComboIsPhoneEntry(sel) && pairedIdx < 0) return;
 
     // RSSI 임계값 읽기 (에디트 박스에서)
     wchar_t latBuf[16];
@@ -554,8 +588,15 @@ static void StartMon() {
     g_unlockDelaySec = kDelayValues[delayIdx];
 
     g_selectedIdx = sel;
-    g_targetAddr = g_paired[sel].address;
-    g_targetName = g_paired[sel].name;
+    if (ComboIsPhoneEntry(sel)) {
+        // 신원은 토큰으로만 확인한다. 주소나 이름으로도 매칭하게 두면
+        // 이름이 겹치는 남의 기기 광고가 같은 칼만 필터에 섞여 들어온다.
+        g_targetAddr = 0;
+        g_targetName = L"등록된 폰";   // 표시용. 광고 이름과는 절대 안 맞는다
+    } else {
+        g_targetAddr = g_paired[pairedIdx].address;
+        g_targetName = g_paired[pairedIdx].name;
+    }
     g_logCount = 0;
 
     // Save config (load first to preserve enterprise settings)
@@ -571,6 +612,8 @@ static void StartMon() {
     DbgEvent(L"START thr=%d dBm keepAlive=%lus idle=%ds unlockDelay=%ds bleTimeout=%lus lostMeansFar=%d irk=%d",
         g_nearRssiThreshold, g_keepAliveSec, g_idleCountdownSec, g_unlockDelaySec,
         cfg.bleTimeoutSec, cfg.bleLostMeansFar ? 1 : 0, cfg.bleIrk.empty() ? 0 : 1);
+    DbgEvent(L"ident: token=%d ovfBit=%d",
+        cfg.phoneToken.empty() ? 0 : 1, cfg.phoneOvfBit);
     // v2: GATT 서버를 먼저 시작 (폰 앱이 연결해 오면 1Hz RSSI 보고를 받음. 실패해도 v1/latency로 동작)
     g_gattRssiThreshold = cfg.gattRssiThreshold;
     g_gattSeen = cfg.gattSeen;
@@ -590,6 +633,10 @@ static void StartMon() {
     // 광고 자체가 폰에 잡히지 않았다. 스캔이 도는 동안에만 BLE 송신이 제대로 되는
     // 드라이버가 있는 것으로 보인다. 폴백 데이터도 얻을 수 있어 켜 두는 편이 안전하다.
     DbgEvent(L"v1 advertisement scan: on");
+    // 연결으로 신원을 확인하는 경로 (IRK 없이 동작). 등록된 토큰이 있을 때만 켜진다.
+    // 탐색 하한은 임계값보다 10dB 낮게 — 그보다 멀면 어차피 자리 판정에 쓸 수 없어
+    // 남의 폰에 연결을 시도할 이유가 없다.
+    g_bleScanner.SetIdentity(cfg.phoneToken, cfg.phoneOvfBit, g_nearRssiThreshold - 10);
     g_bleScanner.SetTimeoutSec(cfg.bleTimeoutSec);
     g_bleScanner.SetDebugLog(cfg.bleDebugLog ? GetConfigDir() + L"\\ble_scan_log.csv" : L"");
     g_bleScanner.Start(g_targetName, g_targetAddr);
@@ -862,30 +909,36 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         g_hCombo = CreateWindowExW(0, L"COMBOBOX", L"",
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-            115, y, 380, 200, hWnd, (HMENU)(UINT_PTR)ID_COMBO, hInst, nullptr);
+            115, y, 290, 200, hWnd, (HMENU)(UINT_PTR)ID_COMBO, hInst, nullptr);
 
         CreateWindowExW(0, L"BUTTON",
             L"\xC0C8\xB85C\xACE0\xCE68",  // 새로고침
-            WS_CHILD | WS_VISIBLE, 505, y, 70, 28, hWnd,
+            WS_CHILD | WS_VISIBLE, 412, y, 64, 28, hWnd,
             (HMENU)(UINT_PTR)ID_REFRESH, hInst, nullptr);
 
         g_hBtnStart = CreateWindowExW(0, L"BUTTON",
             L"\xC2DC\xC791",  // 시작
-            WS_CHILD | WS_VISIBLE, 585, y, 65, 28, hWnd,
+            WS_CHILD | WS_VISIBLE, 480, y, 58, 28, hWnd,
             (HMENU)(UINT_PTR)ID_START, hInst, nullptr);
 
         g_hBtnStop = CreateWindowExW(0, L"BUTTON",
             L"\xC911\xC9C0",  // 중지
-            WS_CHILD | WS_VISIBLE | WS_DISABLED, 658, y, 55, 28, hWnd,
+            WS_CHILD | WS_VISIBLE | WS_DISABLED, 542, y, 52, 28, hWnd,
             (HMENU)(UINT_PTR)ID_STOP, hInst, nullptr);
 
         CreateWindowExW(0, L"BUTTON", L"BT",
-            WS_CHILD | WS_VISIBLE, 720, y, 40, 28, hWnd,
+            WS_CHILD | WS_VISIBLE, 598, y, 34, 28, hWnd,
             (HMENU)(UINT_PTR)ID_BT_SETTINGS, hInst, nullptr);
 
-        // 아이폰 식별키 가져오기. 잠긴 폰을 알아보려면 이 키가 있어야 한다.
+        // 폰이 내주는 토큰으로 신원을 잡는다. Phone Link 설정도 IRK 도 필요 없다.
+        CreateWindowExW(0, L"BUTTON", L"폰 등록",
+            WS_CHILD | WS_VISIBLE, 636, y, 74, 28, hWnd,
+            (HMENU)(UINT_PTR)ID_BTN_REGISTER_PHONE, hInst, nullptr);
+
+        // 예전 방식: 레지스트리의 IRK 로 랜덤 주소를 푼다.
+        // 그 PC 에서 LE 본딩이 한 번 있어야 해서 '폰 등록' 이 안 될 때의 대비책이다.
         CreateWindowExW(0, L"BUTTON", L"기기 키",
-            WS_CHILD | WS_VISIBLE, 764, y, 62, 28, hWnd,
+            WS_CHILD | WS_VISIBLE, 714, y, 66, 28, hWnd,
             (HMENU)(UINT_PTR)ID_BTN_IMPORT_IRK, hInst, nullptr);
 
         // =================================================================
@@ -1135,11 +1188,15 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
         }
 
-        // Auto-start if config exists
-        if (g_targetAddr != 0) {
+        // Auto-start if config exists.
+        // 등록된 폰을 쓰던 경우 btAddress 는 0이라 아래 루프가 아니라 이쪽으로 걸린다.
+        if (g_targetAddr == 0 && g_comboPhoneEntry) {
+            SendMessageW(g_hCombo, CB_SETCURSEL, 0, 0);
+            PostMessage(hWnd, WM_COMMAND, ID_START, 0);
+        } else if (g_targetAddr != 0) {
             for (size_t i = 0; i < g_paired.size(); i++) {
                 if (g_paired[i].address == g_targetAddr) {
-                    SendMessageW(g_hCombo, CB_SETCURSEL, i, 0);
+                    SendMessageW(g_hCombo, CB_SETCURSEL, i + (g_comboPhoneEntry ? 1 : 0), 0);
                     PostMessage(hWnd, WM_COMMAND, ID_START, 0);
                     break;
                 }
@@ -1150,6 +1207,14 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_TIMER:
         if (wParam == IDT_COUNTDOWN && g_monitoring) {
+            // 프로버가 잠긴 폰을 찾아내면서 overflow 비트를 새로 배웠으면 저장한다.
+            // 다음 실행 때 후보를 훨씬 빨리 좁힌다 (없어도 동작은 한다).
+            int learned = g_bleScanner.TakeLearnedOverflowBit();
+            if (learned >= 0) {
+                AppConfig bcfg; LoadAppConfig(bcfg);
+                bcfg.phoneOvfBit = learned;
+                SaveAppConfig(bcfg);
+            }
             if (!g_bBlackActive) {
                 // Count down idle timer (both NEAR and FAR)
                 if (g_nCountdown > 0) g_nCountdown--;
@@ -1213,13 +1278,58 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             if(g_hChart)InvalidateRect(g_hChart,nullptr,FALSE);break;
         case ID_BT_SETTINGS:
             ShellExecuteW(nullptr,L"open",L"ms-settings:bluetooth",nullptr,nullptr,SW_SHOW);break;
+        case ID_BTN_REGISTER_PHONE: {
+            // 폰이 GATT 로 내주는 토큰을 한 번 읽어 저장해 둔다 (ble_ident.h).
+            // 앱을 화면에 띄워 두는 것이 조건이다 - 포그라운드 광고에만 이름과
+            // 서비스 UUID 가 실려 후보가 모호하지 않다. 잠긴 폰으로 등록하면 남의 폰을 집을 수 있다.
+            if (g_monitoring) {
+                MessageBoxW(hWnd,
+                    L"먼저 중지를 누른 뒤 등록하세요.\n"
+                    L"스캔과 연결이 같은 안테나를 나눠 쓰면 연결이 실패합니다.",
+                    L"폰 등록", MB_OK | MB_ICONINFORMATION);
+                break;
+            }
+            if (MessageBoxW(hWnd,
+                    L"아이폰에서 SSBeacon 앱을 실행해 화면에 띄우세요.\n"
+                    L"폰을 PC 가까이 두고, 준비되면 확인을 누르세요.",
+                    L"폰 등록", MB_OKCANCEL | MB_ICONINFORMATION) != IDOK) break;
+            HCURSOR oldCur = SetCursor(LoadCursor(nullptr, IDC_WAIT));
+            std::wstring token, why;
+            bool ok = RegisterPhone(6, token, why);
+            SetCursor(oldCur);
+            DbgEvent(L"register phone: %s", ok ? L"OK" : why.c_str());
+            if (ok) {
+                AppConfig pcfg; LoadAppConfig(pcfg);
+                pcfg.phoneToken = token;
+                pcfg.phoneOvfBit = -1;   // 비트는 잠긴 폰을 처음 탐색할 때 배운다
+                SaveAppConfig(pcfg);
+                // 목록 맨 앞에 "등록된 폰"이 생기도록 다시 채우고 그것을 고른다
+                g_targetAddr = 0;
+                PopulateCombo();
+                std::wstring head = token.substr(0, (std::min)((size_t)8, token.size()));
+                MessageBoxW(hWnd,
+                    (L"폰을 등록했습니다.\n\n기기 토큰 " + head +
+                     L"\n\n앱 화면에 같은 값이 보이는지 확인하세요.\n"
+                     L"이제 Phone Link 설정이나 기기 키 없이도 이 폰을 알아봅니다.").c_str(),
+                    L"폰 등록", MB_OK | MB_ICONINFORMATION);
+            } else {
+                MessageBoxW(hWnd,
+                    (L"등록하지 못했습니다.\n\n" + why +
+                     L"\n\n앱이 화면에 떠 있는지, 폰이 PC 가까이 있는지 확인하세요.").c_str(),
+                    L"폰 등록", MB_OK | MB_ICONWARNING);
+            }
+            break;
+        }
         case ID_BTN_IMPORT_IRK: {
             // 레지스트리의 IRK는 SYSTEM만 읽을 수 있어 승격이 필요하다 (irk.h 참고)
+            // IRK 는 페어링된 기기에만 있으므로 "등록된 폰" 항목으로는 가져올 수 없다.
             int sel = (int)SendMessageW(g_hCombo, CB_GETCURSEL, 0, 0);
-            std::wstring name = (sel >= 0 && sel < (int)g_paired.size())
-                ? g_paired[sel].name : g_targetName;
+            int pidx = ComboSelToPaired(sel);
+            std::wstring name = (pidx >= 0) ? g_paired[pidx].name
+                              : (ComboIsPhoneEntry(sel) ? L"" : g_targetName);
             if (name.empty()) {
-                MessageBoxW(hWnd, L"먼저 목록에서 기기를 선택하세요.",
+                MessageBoxW(hWnd, L"목록에서 페어링된 기기를 선택하세요.\n"
+                                  L"'등록된 폰'은 페어링이 없어 기기 키를 가져올 수 없습니다.",
                             L"기기 키 가져오기", MB_OK | MB_ICONINFORMATION);
                 break;
             }
@@ -1803,9 +1913,10 @@ int WINAPI wWinMain(HINSTANCE hI, HINSTANCE, LPWSTR, int nS) {
         }, (LPARAM)g_hFontOvlBtn);
     }
 
-    // Show settings if no config, hide if auto-starting
+    // Show settings if no config, hide if auto-starting.
+    // 등록된 폰을 쓰면 btAddress 는 0이므로 토큰 쪽도 같이 본다.
     AppConfig chk;
-    if (LoadAppConfig(chk) && chk.btAddress != 0) {
+    if (LoadAppConfig(chk) && (chk.btAddress != 0 || !chk.phoneToken.empty())) {
         ShowWindow(g_hWnd, SW_HIDE);
     } else {
         ShowWindow(g_hWnd, nS);

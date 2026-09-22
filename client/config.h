@@ -17,6 +17,11 @@ struct AppConfig {
     int gattRssiThreshold = -55;  // v2 임계값 (dBm, 폰이 측정한 연결 RSSI)
     bool bleLostMeansFar = true;  // BLE 끊김 = 범위 이탈. 컴패니언 앱이 상시 광고하므로 기본 켬
     std::wstring bleIrk;         // LE 본딩 기기의 IRK (32자리 hex) - iPhone 랜덤 주소 해석용
+    // IRK 를 대체하는 신원 확인 (ble_ident.h 참고). 본딩도 Phone Link 도 필요 없다.
+    std::wstring phoneToken;     // 폰이 GATT 로 내주는 16바이트 신원값 (32자리 hex)
+    // 폰의 Apple overflow 비트 번호. 후보를 좁히는 필터일 뿐 신원이 아니다 -
+    // 광고하는 UUID 가 바뀌면 같이 바뀌고, 그 외에도 가끔 옮겨간다 (실측: 116 -> 85).
+    int phoneOvfBit = -1;        // -1 = 아직 모름. 탐색에 성공하면 그때 배운다
     DWORD keepAliveSec = 5;
     DWORD scanIntervalSec = 2;
     int idleCountdownSec = 20;

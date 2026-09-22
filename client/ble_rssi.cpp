@@ -2,6 +2,10 @@
 // WinRT BluetoothLEAdvertisementWatcher를 사용하여 BLE 광고 패킷의 RSSI를 읽음
 // 키플과 동일한 원리: 물리적 신호 강도(dBm)를 칼만 필터로 스무딩
 
+// config.h 는 winsock2.h 를 끌어오므로 windows.h 를 끌고 오는
+// WinRT 헤더보다 먼저 와야 한다 (DbgEvent 용)
+#include "config.h"
+
 // WinRT 헤더 (PIMPL로 격리 - 이 파일에서만 사용)
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -10,6 +14,7 @@
 #include <winrt/Windows.Storage.Streams.h>
 
 #include "ble_rssi.h"
+#include "ble_ident.h"  // ReadPhoneToken - 연결로 신원 확인
 #include "ble_gatt.h"   // SS_IDENT_SERVICE_UUID (컴패니언 앱이 광고하는 UUID)
 #include <windows.h>
 #include <bcrypt.h>
@@ -79,6 +84,23 @@ struct BleRssiScanner::Impl {
     std::atomic<DWORD> timeoutMs{ 90000 };  // 이 시간 동안 수신 없으면 "끊김" (iOS 백그라운드 광고는 간격이 수십 초까지 벌어짐)
     std::mutex kalmanMutex;                // 칼만 필터 동기화
     HANDLE packetEvent{ CreateEventW(nullptr, FALSE, FALSE, nullptr) };  // 유효 패킷 수신 알림
+
+    // ---- 연결로 확인하는 신원 (IRK 대체). 설계 배경은 ble_ident.h ----
+    // 광고만으로는 잠긴 폰을 특정할 수 없어, 후보에 한 번 붙어 토큰을 읽고
+    // 주소를 묶는다. 그 뒤로는 주소가 바뀔 때까지 주소로 추적한다.
+    std::wstring identToken;                    // 등록된 토큰(32 hex). 비면 이 경로 꺼짐
+    std::atomic<int> identBit{ -1 };            // 학습된 overflow 비트 (-1 = 모름)
+    std::atomic<int> identBitLearned{ -1 };     // 새로 배워서 저장해야 할 값
+    std::atomic<int> probeFloor{ -75 };         // 이보다 약하면 탐색하지 않는다
+    std::atomic<uint64_t> boundAddr{ 0 };       // 토큰으로 확인된 현재 주소
+    std::atomic<ULONGLONG> boundSeenTick{ 0 };  // 그 주소를 마지막으로 본 시각
+
+    struct Cand { bool rnd; int rssi; int bit; ULONGLONG seen; };
+    std::mutex candMutex;
+    std::map<uint64_t, Cand> cands;             // overflow 비트 하나짜리 광고들
+    std::map<uint64_t, ULONGLONG> probedTick;   // 주소별 마지막 탐색 (재시도 억제)
+    HANDLE proberThread{ nullptr };
+    HANDLE proberStop{ nullptr };
 
     // 최근 수신 시각 링버퍼 (초당 수신 건수 계산용)
     static constexpr int kRateSlots = 256;
@@ -212,6 +234,107 @@ struct BleRssiScanner::Impl {
         return false;
     }
 
+    // Apple 백그라운드 광고의 overflow 영역: 제조사 데이터 = 01 + 16바이트 비트필드.
+    // 앱이 서비스 UUID 하나를 광고하면 그중 딱 한 비트만 켜진다.
+    // 주변에 훨씬 흔한 24바이트짜리 `01 09 20 22 ...` 메시지는 길이에서 걸러지고,
+    // 실측(주소 4048개)에서 이 모양은 13개뿐이었다. 비트가 하나가 아니면 -1.
+    static int SingleOverflowBit(BluetoothLEAdvertisement const& adv) {
+        try {
+            auto md = adv.ManufacturerData();
+            for (uint32_t i = 0; i < md.Size(); i++) {
+                if (md.GetAt(i).CompanyId() != 0x004C) continue;
+                auto buf = md.GetAt(i).Data();
+                if (buf.Length() != 17) continue;
+                auto r = Windows::Storage::Streams::DataReader::FromBuffer(buf);
+                if (r.ReadByte() != 0x01) continue;
+                int found = -1, n = 0;
+                for (int b = 0; b < 16; b++) {
+                    uint8_t v = r.ReadByte();
+                    for (int k = 0; k < 8; k++) {
+                        if (!(v & (1 << k))) continue;
+                        if (found < 0) found = b * 8 + k;
+                        n++;
+                    }
+                }
+                if (n == 1) return found;
+            }
+        } catch (...) {}
+        return -1;
+    }
+
+    // 후보 하나를 골라 붙어 보고, 토큰이 맞으면 그 주소를 묶는다.
+    // 스캔 콜백 스레드에서 하면 안 된다 - 연결은 최악 20초까지 걸린다.
+    static DWORD WINAPI ProberThunk(LPVOID p) { ((Impl*)p)->ProberLoop(); return 0; }
+
+    void ProberLoop() {
+        while (WaitForSingleObject(proberStop, 2000) == WAIT_TIMEOUT) {
+            // 스캔이 꺼져 있으면 논다. 스레드를 Impl 수명 내내 살려 두는 이유는
+            // 연결 한 번이 최악 20초라 Stop 에서 조인하면 UI 가 그만큼 멈추기 때문이다.
+            if (!running || identToken.empty()) continue;
+            ULONGLONG now = GetTickCount64();
+
+            // 묶인 주소가 아직 광고 중이면 할 일이 없다
+            if (boundAddr && (now - boundSeenTick) < 20000) continue;
+            if (boundAddr) {
+                DbgEvent(L"ident: %012llX went quiet, looking again",
+                         (unsigned long long)boundAddr.load());
+                boundAddr = 0;
+            }
+
+            uint64_t pick = 0; bool pickRnd = true; int pickBit = -1, pickRssi = -127;
+            {
+                std::lock_guard<std::mutex> lock(candMutex);
+                for (auto it = cands.begin(); it != cands.end(); ) {
+                    if (now - it->second.seen > 30000) it = cands.erase(it);
+                    else ++it;
+                }
+                // 주소는 주기적으로 바뀌므로 그냥 두면 계속 쌓인다
+                for (auto it = probedTick.begin(); it != probedTick.end(); ) {
+                    if (now - it->second > 300000) it = probedTick.erase(it);
+                    else ++it;
+                }
+                int want = identBit.load();
+                // 1차는 학습한 비트와 일치하는 후보만 본다. 못 찾으면 2차에서
+                // 전체를 신호 순으로 - 비트는 광고 UUID가 바뀌면 같이 옮겨간다.
+                for (int pass = 0; pass < 2 && !pick; pass++) {
+                    if (pass == 0 && want < 0) continue;
+                    for (auto const& [a, c] : cands) {
+                        if (pass == 0 && c.bit != want) continue;
+                        if (c.rssi < probeFloor) continue;   // 자리 판정에 쓸 수 없는 거리는 건드리지 않는다
+                        auto pit = probedTick.find(a);
+                        if (pit != probedTick.end() && (now - pit->second) < 60000) continue;
+                        if (c.rssi > pickRssi) {
+                            pick = a; pickRnd = c.rnd; pickBit = c.bit; pickRssi = c.rssi;
+                        }
+                    }
+                }
+                if (pick) probedTick[pick] = now;
+            }
+            if (!pick) continue;
+
+            std::wstring tok, why;
+            if (!ReadPhoneToken(pick, pickRnd, tok, why)) {
+                DbgEvent(L"ident: %012llX probe failed (%s)",
+                         (unsigned long long)pick, why.c_str());
+                continue;
+            }
+            if (_wcsicmp(tok.c_str(), identToken.c_str()) != 0) {
+                DbgEvent(L"ident: %012llX is someone else's phone",
+                         (unsigned long long)pick);
+                continue;
+            }
+            boundAddr = pick;
+            boundSeenTick = GetTickCount64();
+            DbgEvent(L"ident: bound to %012llX (%d dBm)",
+                     (unsigned long long)pick, pickRssi);
+            if (pickBit >= 0 && pickBit != identBit.load()) {
+                identBit = pickBit;
+                identBitLearned = pickBit;   // 설정에 저장하도록 알린다
+                DbgEvent(L"ident: overflow bit is now %d", pickBit);
+            }
+        }
+    }
+
     // 기기 이름 대소문자 무시 비교
     static bool NameContains(const std::wstring& advName, const std::wstring& target) {
         if (target.empty() || advName.empty()) return false;
@@ -236,6 +359,12 @@ BleRssiScanner::BleRssiScanner() : m_impl(new Impl()) {}
 
 BleRssiScanner::~BleRssiScanner() {
     Stop();
+    if (m_impl->proberThread) {
+        SetEvent(m_impl->proberStop);
+        WaitForSingleObject(m_impl->proberThread, 30000);
+        CloseHandle(m_impl->proberThread);
+        CloseHandle(m_impl->proberStop);
+    }
     m_impl->ClearIrk();
     CloseHandle(m_impl->packetEvent);
     delete m_impl;
@@ -300,10 +429,30 @@ bool BleRssiScanner::Start(const std::wstring& targetDeviceName, uint64_t target
             int16_t rssi = args.RawSignalStrengthInDBm();  // dBm, 음수값
 
             // 이 광고가 "내 폰"인지. IRK 해석이 유일하게 폰을 특정하는 방법이라 먼저 본다.
-            bool matched = m_impl->ResolveRpa(addr)
+            uint64_t bound = m_impl->boundAddr.load();
+            bool identMatch = (bound != 0 && addr == bound);
+            if (identMatch) {
+                m_impl->boundSeenTick = GetTickCount64();
+            } else if (!m_impl->identToken.empty()) {
+                // 아직 못 묶었으면 후보로만 쌓아 둔다. 붙는 일은 프로버 스레드가 한다.
+                int bit = Impl::SingleOverflowBit(args.Advertisement());
+                if (bit >= 0) {
+                    std::lock_guard<std::mutex> lock(m_impl->candMutex);
+                    auto& c = m_impl->cands[addr];
+                    c.rnd = (args.BluetoothAddressType()
+                             != Windows::Devices::Bluetooth::BluetoothAddressType::Public);
+                    c.rssi = rssi; c.bit = bit; c.seen = GetTickCount64();
+                }
+            }
+
+            bool matched = identMatch
+                || m_impl->ResolveRpa(addr)
                 || Impl::NameContains(advName, m_impl->targetName)
                 || (m_impl->targetAddr != 0 && addr == m_impl->targetAddr)
-                || (!m_impl->HasIrk() && Impl::HasOurService(args.Advertisement()));
+                // 서비스 UUID 는 앱 설치본마다 같으므로 폰을 특정하지 못한다.
+                // IRK 도 토큰도 없을 때의 임시방편일 뿐이다.
+                || (!m_impl->HasIrk() && m_impl->identToken.empty()
+                    && Impl::HasOurService(args.Advertisement()));
             int smoothedInt = -100;
 
             // -127 dBm은 실제 측정값이 아니라 Windows가 "범위 이탈"을 알리는 표식 → 필터에 넣지 않음
@@ -358,6 +507,11 @@ bool BleRssiScanner::Start(const std::wstring& targetDeviceName, uint64_t target
         m_impl->watcher.Start();
         m_impl->available = true;
         m_impl->running = true;
+
+        if (!m_impl->proberThread && !m_impl->identToken.empty()) {
+            m_impl->proberStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            m_impl->proberThread = CreateThread(nullptr, 0, Impl::ProberThunk, m_impl, 0, nullptr);
+        }
         return true;
 
     } catch (winrt::hresult_error const&) {
@@ -393,6 +547,15 @@ void BleRssiScanner::Stop() {
 
     m_impl->running = false;
     m_impl->receiving = false;
+
+    // 프로버 스레드는 그대로 두고(위 주석 참고) 묶인 주소만 버린다.
+    // 다시 시작하면 처음부터 후보를 모아 다시 확인한다.
+    m_impl->boundAddr = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_impl->candMutex);
+        m_impl->cands.clear();
+        m_impl->probedTick.clear();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -421,6 +584,20 @@ void BleRssiScanner::SetTimeoutSec(DWORD sec) {
     if (sec < 5) sec = 5;
     if (sec > 600) sec = 600;
     m_impl->timeoutMs = sec * 1000;
+}
+
+void BleRssiScanner::SetIdentity(const std::wstring& tokenHex, int ovfBit, int probeFloorRssi) {
+    m_impl->identToken = tokenHex;
+    m_impl->identBit = ovfBit;
+    m_impl->probeFloor = probeFloorRssi;
+}
+
+int BleRssiScanner::TakeLearnedOverflowBit() {
+    return m_impl->identBitLearned.exchange(-1);
+}
+
+uint64_t BleRssiScanner::BoundAddress() const {
+    return m_impl->boundAddr.load();
 }
 
 bool BleRssiScanner::SetIrk(const std::wstring& irkHex) {

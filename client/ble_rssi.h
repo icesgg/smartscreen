@@ -83,6 +83,18 @@ public:
     // 수신 끊김 판정 시간(초). 기본 90
     void SetTimeoutSec(DWORD sec);
 
+    // 연결로 신원을 확인하는 경로를 켠다 (IRK 대체, ble_ident.h 참고). Start() 전에 호출.
+    // tokenHex 가 비어 있으면 비활성. ovfBit 은 지난번에 배운 값(-1이면 모름).
+    // probeFloorRssi 보다 약한 기기는 건드리지 않는다 - 자리 판정에 쓸 수 없는 거리다.
+    void SetIdentity(const std::wstring& tokenHex, int ovfBit, int probeFloorRssi);
+
+    // 탐색 중 새로 배운 overflow 비트. 없으면 -1.
+    // 한 번 가져가면 -1 로 돌아가므로, 받은 쪽이 설정에 저장해야 한다.
+    int TakeLearnedOverflowBit();
+
+    // 토큰으로 확인된 현재 주소. 아직 못 찾았으면 0
+    uint64_t BoundAddress() const;
+
     // LE 본딩된 기기의 IRK(32자리 hex) 설정. Start() 전에 호출
     // 설정되면 랜덤 주소(RPA)로 광고하는 기기(iPhone 등)를 이름 없이도 식별
     bool SetIrk(const std::wstring& irkHex);

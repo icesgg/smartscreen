@@ -80,6 +80,8 @@ bool LoadAppConfig(AppConfig& cfg) {
     if (m.count(L"nearRssiThreshold")) cfg.nearRssiThreshold = _wtoi(m[L"nearRssiThreshold"].c_str());
     if (m.count(L"bleDebugLog")) cfg.bleDebugLog = (_wtoi(m[L"bleDebugLog"].c_str()) != 0);
     if (m.count(L"bleIrk")) cfg.bleIrk = m[L"bleIrk"];
+    if (m.count(L"phoneToken")) cfg.phoneToken = m[L"phoneToken"];
+    if (m.count(L"phoneOvfBit")) cfg.phoneOvfBit = _wtoi(m[L"phoneOvfBit"].c_str());
     if (m.count(L"bleTimeoutSec")) cfg.bleTimeoutSec = _wtoi(m[L"bleTimeoutSec"].c_str());
     if (m.count(L"bleGattServer")) cfg.bleGattServer = (_wtoi(m[L"bleGattServer"].c_str()) != 0);
     if (m.count(L"bleGattEncrypt")) cfg.bleGattEncrypt = (_wtoi(m[L"bleGattEncrypt"].c_str()) != 0);
@@ -99,7 +101,9 @@ bool LoadAppConfig(AppConfig& cfg) {
     if (m.count(L"anonKey")) cfg.anonKey = m[L"anonKey"];
     if (m.count(L"enterpriseRegistered")) cfg.enterpriseRegistered = (_wtoi(m[L"enterpriseRegistered"].c_str()) != 0);
 
-    return cfg.btAddress != 0;
+    // "읽을 설정이 있었는가". 예전에는 btAddress != 0 을 돌려줬는데,
+    // 등록된 폰을 쓰면 Classic 주소가 없어 0이라 그때 설정 전체가 무시됐다.
+    return true;
 }
 
 bool ImportBleIrkFile(AppConfig& cfg, const std::wstring& path) {
@@ -135,6 +139,8 @@ void SaveAppConfig(const AppConfig& cfg) {
     swprintf_s(buf, L"%d", cfg.nearRssiThreshold); m[L"nearRssiThreshold"] = buf;
     m[L"bleDebugLog"] = cfg.bleDebugLog ? L"1" : L"0";
     m[L"bleIrk"] = cfg.bleIrk;
+    m[L"phoneToken"] = cfg.phoneToken;
+    swprintf_s(buf, L"%d", cfg.phoneOvfBit); m[L"phoneOvfBit"] = buf;
     swprintf_s(buf, L"%lu", cfg.bleTimeoutSec); m[L"bleTimeoutSec"] = buf;
     m[L"bleGattServer"] = cfg.bleGattServer ? L"1" : L"0";
     m[L"bleGattEncrypt"] = cfg.bleGattEncrypt ? L"1" : L"0";
