@@ -258,41 +258,75 @@ Threshold −55 dBm; screen locked 13 s after standing up, unlocked on return.
 
 Packet gaps: median 1.7 s, p90 5.8 s, max 19.9 s.
 
-**Advertisement path, Intel internal radio, second desk (2026-09-23)**
+Those two are the original runs and their thresholds are superseded by
+the ones below. They are kept because the spread between them and the
+later runs is the argument for measuring per desk.
 
-Two minutes seated, two away, one back, with the walk at either end
-excluded. Percentiles of the smoothed value:
+**Both paths, Intel internal radio, second desk (2026-09-23)**
 
-| | n | min | median | max |
-|---|---|---|---|---|
-| seated | 281 | **−59** | −52 | −47 |
-| away | 50 | −76 | −66 | **−61** |
+Two minutes seated, two away, one back, twice, with the walk at either
+end excluded. Smoothed values:
 
-The two figures in bold are the ones that decide: the fifth percentile
-of the seated run is −55, but it is the −59 that would trip a threshold.
+| run | path | seated n | seated | away n | away |
+|---|---|---|---|---|---|
+| 07:56 | advertisement | 295 | −59 … −47 | 50 | −76 … **−61** |
+| 08:24 | advertisement | 202 | **−63** … −44 | 58 | −79 … −69 |
+| 08:24 | GATT | 115 | **−62** … −45 | 49 | −73 … **−66** |
 
-The distributions do not overlap: the worst seated sample is −59, the
-best away sample is −61. The threshold goes in that gap, at **−60**.
+Each run on its own separates cleanly, and each suggests a different
+threshold — the second advertisement run puts the boundary six dB lower
+than the first. Taken together the two runs overlap: seated reaches −63
+and away reaches −61.
 
-This is the run that showed the earlier −65 to be too low for this desk,
-not too high: away samples read as near 54 % of the time, and each one
-restarted the hold timer, so leaving was detected slowly and erratically.
-Seated also reached −47, above the −49 recorded before.
+### Count how long, not how often
 
-Absolute values are not portable, and these two runs disagree by more
-than 10 dB. Antennas differ by 10-20 dB between adapters, and body
+The fraction of samples below a threshold is the wrong statistic. A
+single dip changes nothing, because the state machine needs no reading
+above the threshold for `keepAliveSec` before it will say FAR. What
+matters is the longest run of consecutive seated samples below it, and
+how long an away stretch takes to produce one such run.
+
+Over both advertisement runs, with the five-second default:
+
+| threshold | longest seated run below | away detected after |
+|---|---|---|
+| −60 | **11 s** — locks while seated | 5 s / 9 s |
+| −61 | 2 s | 5 s / 9 s |
+| −64 | 0 s | 5 s / 9 s |
+| −69 | 0 s | 5 s / 17 s |
+| −70 | 0 s | never / 17 s |
+
+−60 was set from the first run alone, where seated bottomed out at −59.
+The second run has an eleven-second stretch below it while the user sat
+at the desk, which is a lock. Nothing in the first run's percentiles
+hinted at that; only running the measurement a second time found it.
+
+The GATT figures behave the same way: −60 leaves a three-second seated
+run, −61 and below leave none, and away is detected after five seconds
+all the way down to −71.
+
+**Both thresholds are −64.** Zero seated runs, detection in five to nine
+seconds, and four dB of slack before detection starts to slow. The
+hysteresis then asks for −60 to return to NEAR, which is above the best
+away sample of either path, so the state does not bounce back.
+
+### Re-measuring
+
+Absolute values are not portable: two runs at the same desk, minutes
+apart, disagreed by six dB, and the earlier USB-dongle figures by more
+than ten. Antennas differ by 10-20 dB between adapters, and body
 shadowing costs another 20-30 dB versus a phone on the desk.
-**Re-measure after changing adapter, desk, or where the phone is kept.**
-The procedure above is the one to repeat: seated, away, back, then
-compare the tails rather than the averages — the tails are what trip the
-threshold. `ble_scan_log.csv` and `gatt_rssi_log.csv` record what is
+**Re-measure after changing adapter, desk, or where the phone is kept,
+and measure twice.** Repeat the procedure above, then compare the tails
+rather than the averages, and count consecutive runs rather than
+fractions. `ble_scan_log.csv` and `gatt_rssi_log.csv` hold what is
 needed when `bleDebugLog=1`.
 
-The GATT threshold has **not** been measured this way. −55 came from the
-first run above and sat inside the seated distribution of the second,
-locking the screen on a decibel of noise while the user sat at the desk.
-It is now −60, borrowed from the advertisement figures because the two
-seated distributions nearly coincide, and should be re-measured.
+The two paths track each other closely: matched within two seconds, the
+GATT reading is a median 2 dB stronger than the advertisement reading
+(p5 −4, p95 +8, n=245). Measuring one and borrowing the other is
+defensible for a first guess, which is where −60 came from, but the
+borrowing is what left the GATT threshold unverified for a day.
 
 ---
 
