@@ -15,6 +15,7 @@ add_executable(SmartScreen WIN32
     client/blackscreen.cpp
     client/ble_rssi.cpp
     client/ble_gatt.cpp
+    client/irk.cpp
     client/enterprise/supabase.cpp
     client/p2p/discovery.cpp
     client/p2p/transfer.cpp

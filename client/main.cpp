@@ -16,6 +16,7 @@
 #include "blackscreen.h"
 #include "ble_rssi.h"
 #include "ble_gatt.h"
+#include "irk.h"
 #include "enterprise/supabase.h"
 
 // ---------------------------------------------------------------------------
@@ -38,6 +39,7 @@ static constexpr int ID_EDIT_DELAY   = 214;
 static constexpr int ID_BTN_CENTER_IMG = 215;
 static constexpr int ID_BTN_BANNER_IMG = 216;
 static constexpr int ID_BTN_ENTERPRISE = 217;
+static constexpr int ID_BTN_IMPORT_IRK = 218;
 static constexpr UINT WM_SCAN_RESULT = WM_USER + 100;
 
 // New combo IDs for simplified settings
@@ -881,6 +883,11 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             WS_CHILD | WS_VISIBLE, 720, y, 40, 28, hWnd,
             (HMENU)(UINT_PTR)ID_BT_SETTINGS, hInst, nullptr);
 
+        // 아이폰 식별키 가져오기. 잠긴 폰을 알아보려면 이 키가 있어야 한다.
+        CreateWindowExW(0, L"BUTTON", L"기기 키",
+            WS_CHILD | WS_VISIBLE, 764, y, 62, 28, hWnd,
+            (HMENU)(UINT_PTR)ID_BTN_IMPORT_IRK, hInst, nullptr);
+
         // =================================================================
         // Section 2: Protection Settings  (보호 설정)
         // =================================================================
@@ -1206,6 +1213,25 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             if(g_hChart)InvalidateRect(g_hChart,nullptr,FALSE);break;
         case ID_BT_SETTINGS:
             ShellExecuteW(nullptr,L"open",L"ms-settings:bluetooth",nullptr,nullptr,SW_SHOW);break;
+        case ID_BTN_IMPORT_IRK: {
+            // 레지스트리의 IRK는 SYSTEM만 읽을 수 있어 승격이 필요하다 (irk.h 참고)
+            int sel = (int)SendMessageW(g_hCombo, CB_GETCURSEL, 0, 0);
+            std::wstring name = (sel >= 0 && sel < (int)g_paired.size())
+                ? g_paired[sel].name : g_targetName;
+            if (name.empty()) {
+                MessageBoxW(hWnd, L"먼저 목록에서 기기를 선택하세요.",
+                            L"기기 키 가져오기", MB_OK | MB_ICONINFORMATION);
+                break;
+            }
+            HCURSOR oldCur = SetCursor(LoadCursor(nullptr, IDC_WAIT));
+            std::wstring msg;
+            bool ok = RequestIrkImport(name, msg);
+            SetCursor(oldCur);
+            DbgEvent(L"IRK import for %s: %s", name.c_str(), ok ? L"OK" : L"failed");
+            MessageBoxW(hWnd, msg.c_str(), L"기기 키 가져오기",
+                        MB_OK | (ok ? MB_ICONINFORMATION : MB_ICONWARNING));
+            break;
+        }
         case ID_RECONNECT:
             if(g_targetAddr!=0){EnableWindow(g_hBtnReconnect,FALSE);
                 SetWindowTextW(g_hBtnReconnect,L"...");
@@ -1705,6 +1731,26 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 // WinMain
 // ---------------------------------------------------------------------------
 int WINAPI wWinMain(HINSTANCE hI, HINSTANCE, LPWSTR, int nS) {
+    // IRK 가져오기용 보조 모드. UI 없이 실행하고 바로 끝난다.
+    // 뮤텍스보다 먼저 처리해야 본 프로그램이 떠 있어도 동작한다.
+    {
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if (argv) {
+            int rc = -1;
+            if (argc >= 3 && wcscmp(argv[1], L"--dump-irk") == 0) {
+                // SYSTEM 권한으로 실행됨: 레지스트리를 덤프하고 끝
+                rc = (DumpIrkFromRegistry(argv[2]) > 0) ? 0 : 1;
+            } else if (argc >= 3 && wcscmp(argv[1], L"--import-irk") == 0) {
+                // 관리자 권한으로 실행됨: SYSTEM 작업을 돌려 config에 저장
+                std::wstring m;
+                rc = ImportIrkElevated(argv[2], m) ? 0 : 1;
+            }
+            LocalFree(argv);
+            if (rc >= 0) return rc;
+        }
+    }
+
     HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"SmartScreen_Mutex_v1");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         MessageBoxW(nullptr, L"SmartScreen is already running.", L"SmartScreen", MB_OK|MB_ICONINFORMATION);

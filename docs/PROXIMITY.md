@@ -73,8 +73,22 @@ Two properties matter for deployment:
   service UUID only when no IRK is configured, which is the bootstrap case on
   a fresh PC.
 
-The extraction step is currently manual (a one-shot SYSTEM scheduled task)
-and is the weakest part of setup.
+Extraction is automated behind the "기기 키" button, because the key lives
+where only SYSTEM can read it and no amount of user instruction makes that
+pleasant. The app relaunches itself elevated (`--import-irk`), the elevated
+instance registers a one-shot scheduled task that runs the app once more as
+SYSTEM (`--dump-irk`), and that instance walks
+`Keys\<adapter>\<device>` and writes every IRK it finds to a temp file. The
+elevated instance then correlates those addresses against the paired BLE
+devices reported by WinRT, picks the one whose name matches the selected
+phone, stores it in config and deletes the temp file. Where exactly one key
+exists it is taken without the name check.
+
+Picking the right one matters: a bonded BLE mouse's IRK would resolve just as
+well and would then sit on the desk holding the screen open forever.
+
+The user still needs an LE bond to exist at all, which on Windows means
+pairing the phone through Phone Link once.
 
 ---
 
