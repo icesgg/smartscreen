@@ -10,7 +10,7 @@
 #include <winrt/Windows.Storage.Streams.h>
 
 #include "ble_rssi.h"
-#include "ble_gatt.h"   // SS_GATT_SERVICE_UUID (컴패니언 앱이 광고하는 UUID)
+#include "ble_gatt.h"   // SS_IDENT_SERVICE_UUID (컴패니언 앱이 광고하는 UUID)
 #include <windows.h>
 #include <bcrypt.h>
 #include <algorithm>
@@ -198,11 +198,16 @@ struct BleRssiScanner::Impl {
     // 포그라운드에서는 UUID가 광고에 실리지만, 잠금/백그라운드에서는 iOS가
     // Apple overflow 영역으로 옮겨 버려서 어차피 이 경로로는 안 보인다.
     static bool HasOurService(BluetoothLEAdvertisement const& adv) {
-        static const winrt::guid target = [] {
+        static const winrt::guid ident = [] {
+            GUID g{}; CLSIDFromString(SS_IDENT_SERVICE_UUID, &g); return winrt::guid(g);
+        }();
+        // 예전 앱 빌드는 PC 쪽 서비스 UUID를 광고했다. 둘 다 받아 준다.
+        static const winrt::guid legacy = [] {
             GUID g{}; CLSIDFromString(SS_GATT_SERVICE_UUID, &g); return winrt::guid(g);
         }();
         try {
-            for (auto const& u : adv.ServiceUuids()) if (u == target) return true;
+            for (auto const& u : adv.ServiceUuids())
+                if (u == ident || u == legacy) return true;
         } catch (...) {}
         return false;
     }

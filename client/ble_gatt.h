@@ -13,6 +13,13 @@
 #define SS_GATT_TICK_UUID     L"{7A1C0011-5353-4243-8E2B-9F3D5A6C7E10}"  // notify: PC -> 폰 (seq 1바이트)
 #define SS_GATT_RSSI_UUID     L"{7A1C0012-5353-4243-8E2B-9F3D5A6C7E10}"  // write : 폰 -> PC (int8 rssi, seq)
 
+// 폰이 올리는 신원 서비스 (ios/SSBeacon 의 kIdentUUID / kTokenUUID 와 동일해야 함).
+// 위의 서비스는 PC가, 이쪽은 폰이 올린다 - 일부러 다른 UUID를 쓴다.
+// 같은 값이면 폰 앱의 central 스캔이 옆자리 폰을 PC로 착각해 붙으려 든다.
+// 잠금 상태 광고에서는 이 UUID가 Apple overflow 영역의 비트 하나로만 남는다.
+#define SS_IDENT_SERVICE_UUID L"{7A1C0020-5353-4243-8E2B-9F3D5A6C7E10}"
+#define SS_IDENT_TOKEN_UUID   L"{7A1C0021-5353-4243-8E2B-9F3D5A6C7E10}"  // read : PC <- 폰 (16바이트)
+
 class BleGattServer {
 public:
     BleGattServer();

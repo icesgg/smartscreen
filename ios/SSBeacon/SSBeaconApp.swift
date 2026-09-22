@@ -5,6 +5,9 @@
 //  [광고] 이 앱이 주변장치로 서비스 UUID를 광고 → PC가 스캔해서 RSSI를 읽는다.
 //         PC는 스캔만 하면 되므로 어떤 USB 동글에서도 동작한다. 갱신은 수 초 간격.
 //         아이폰은 앱 없이 잠기면 광고를 멈추므로, 이 앱이 계속 광고하는 게 핵심이다.
+//         잠긴 상태 광고에는 이름도 UUID도 안 실려 주소만 남고, 그 주소는 주기적으로 바뀐다.
+//         그래서 이 앱은 신원 서비스(kIdentUUID)를 올려 두고, PC가 central로 붙어
+//         토큰을 한 번 읽어 내 폰임을 확정한다. Windows 쪽 IRK나 Phone Link 설정이 필요 없다.
 //
 //  [연결] PC가 GATT 서버가 되고 이 앱이 central로 붙는다. PC가 TICK을 보내면
 //         iOS가 잠금 상태에서도 앱을 깨우고, 앱이 연결 RSSI를 PC에 써 준다. 1초 갱신.
@@ -19,11 +22,19 @@
 
 import SwiftUI
 import CoreBluetooth
+import Security
 
 // PC(ble_gatt.h)와 반드시 동일해야 하는 UUID
 let kServiceUUID = CBUUID(string: "7A1C0010-5353-4243-8E2B-9F3D5A6C7E10")
 let kTickUUID    = CBUUID(string: "7A1C0011-5353-4243-8E2B-9F3D5A6C7E10")  // notify: PC -> 폰
 let kRssiUUID    = CBUUID(string: "7A1C0012-5353-4243-8E2B-9F3D5A6C7E10")  // write : 폰 -> PC
+
+// 이 폰이 직접 올리는 신원 서비스. PC가 central로 붙어 토큰을 읽고 "내 폰"임을 확인한다.
+// 위의 kServiceUUID(PC가 올리는 것)와 일부러 다른 UUID를 쓴다 - 같게 두면
+// 이 앱의 central 스캔이 옆자리 폰을 PC로 착각해 붙으려 든다.
+let kIdentUUID   = CBUUID(string: "7A1C0020-5353-4243-8E2B-9F3D5A6C7E10")
+let kTokenUUID   = CBUUID(string: "7A1C0021-5353-4243-8E2B-9F3D5A6C7E10")  // read  : PC <- 폰
+let kTokenDefaultsKey = "ssbeacon.identity.token"
 let kCentralRestoreId    = "com.smartscreen.ssbeacon.central"
 let kPeripheralRestoreId = "com.smartscreen.ssbeacon.peripheral"
 
@@ -36,6 +47,7 @@ final class LinkManager: NSObject, ObservableObject,
     @Published var isLinked = false
     @Published var lastRssi = 0
     @Published var reportCount = 0
+    @Published var tokenText = ""
 
     private var central: CBCentralManager!
     private var peripheralMgr: CBPeripheralManager!
@@ -43,6 +55,9 @@ final class LinkManager: NSObject, ObservableObject,
     private var rssiChar: CBCharacteristic?
     private var seq: UInt8 = 0
     private var discoverTries = 0
+
+    private var identAdded = false
+    private let token = LinkManager.loadOrCreateToken()
 
     // 우리 서비스를 제공하지 않는 PC는 한동안 건너뛴다.
     // (주변장치 역할을 못 하는 어댑터에 계속 붙었다 끊었다 하면 라디오만 낭비한다)
@@ -59,27 +74,72 @@ final class LinkManager: NSObject, ObservableObject,
 
     // MARK: - 광고 경로 (주변장치)
 
+    // 설치마다 한 번 만들어 두는 16바이트 임의값. 이게 이 폰의 신원이다.
+    // iOS는 기기의 IRK를 앱에 주지 않으므로, 식별자는 우리가 만들어 가지고 있어야 한다.
+    private static func loadOrCreateToken() -> Data {
+        if let d = UserDefaults.standard.data(forKey: kTokenDefaultsKey), d.count == 16 { return d }
+        var bytes = [UInt8](repeating: 0, count: 16)
+        if SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) != errSecSuccess {
+            for i in 0..<bytes.count { bytes[i] = UInt8.random(in: 0...255) }
+        }
+        let d = Data(bytes)
+        UserDefaults.standard.set(d, forKey: kTokenDefaultsKey)
+        return d
+    }
+
+    // 광고보다 먼저 신원 서비스를 올린다. 광고를 보고 찾아온 PC가
+    // 붙자마자 읽을 게 없으면 연결만 낭비하기 때문이다.
+    private func addIdentService() {
+        guard peripheralMgr.state == .poweredOn, !identAdded else { return }
+        // value 를 주면 CoreBluetooth 가 값을 캐시해 직접 응답한다 (읽기 전용이어야 함).
+        // 앱을 깨우지 않으므로 잠금/백그라운드에서도 응답이 확실하고 배터리도 안 쓴다.
+        let ch = CBMutableCharacteristic(type: kTokenUUID,
+                                         properties: [.read],
+                                         value: token,
+                                         permissions: [.readable])
+        let svc = CBMutableService(type: kIdentUUID, primary: true)
+        svc.characteristics = [ch]
+        peripheralMgr.add(svc)
+    }
+
     private func startAdvertising() {
-        guard peripheralMgr.state == .poweredOn, !peripheralMgr.isAdvertising else { return }
+        guard peripheralMgr.state == .poweredOn, identAdded, !peripheralMgr.isAdvertising else { return }
         // 포그라운드에서는 이름과 UUID가 그대로 실리고,
         // 백그라운드/잠금에서는 iOS가 이름을 빼고 UUID를 overflow 영역으로 옮긴다.
-        // 그래서 PC는 IRK로 광고 주소를 풀어 이 아이폰을 식별한다.
+        // overflow 에서는 UUID 하나당 비트 하나만 켜지므로 UUID 는 하나만 광고한다 -
+        // PC 는 "비트 하나짜리" 모양을 1차 필터로 쓰고, 신원은 붙어서 토큰으로 확정한다.
         peripheralMgr.startAdvertising([
             CBAdvertisementDataLocalNameKey: "SSBeacon",
-            CBAdvertisementDataServiceUUIDsKey: [kServiceUUID]
+            CBAdvertisementDataServiceUUIDsKey: [kIdentUUID]
         ])
     }
 
     func peripheralManagerDidUpdateState(_ p: CBPeripheralManager) {
         switch p.state {
-        case .poweredOn:    advText = "광고 시작 중"; startAdvertising()
+        case .poweredOn:    advText = "신원 서비스 등록 중"; addIdentService(); startAdvertising()
         case .poweredOff:   advText = "Bluetooth 꺼짐"; isAdvertising = false
         case .unauthorized: advText = "Bluetooth 권한 없음"
         default:            advText = "대기 중"
         }
     }
 
+    func peripheralManager(_ p: CBPeripheralManager, didAdd service: CBService, error: Error?) {
+        if let error = error {
+            advText = "신원 서비스 등록 실패: \(error.localizedDescription)"
+            return
+        }
+        guard service.uuid == kIdentUUID else { return }
+        identAdded = true
+        tokenText = token.prefix(4).map { String(format: "%02X", $0) }.joined()
+        startAdvertising()
+    }
+
     func peripheralManager(_ p: CBPeripheralManager, willRestoreState dict: [String: Any]) {
+        // 복원된 세션에는 서비스가 이미 올라와 있다. 다시 add 하면 실패한다.
+        if let svcs = dict[CBPeripheralManagerRestoredStateServicesKey] as? [CBMutableService],
+           svcs.contains(where: { $0.uuid == kIdentUUID }) {
+            identAdded = true
+        }
         isAdvertising = p.isAdvertising
     }
 
@@ -246,6 +306,12 @@ struct ContentView: View {
             if link.isLinked && link.reportCount > 0 {
                 Text("\(link.lastRssi) dBm  ·  보고 \(link.reportCount)회")
                     .font(.system(.footnote, design: .monospaced))
+            }
+
+            if !link.tokenText.isEmpty {
+                Text("기기 토큰 \(link.tokenText)")
+                    .font(.system(.footnote, design: .monospaced))
+                    .foregroundColor(.secondary)
             }
 
             Text("광고 하나만 켜져 있어도 동작합니다.\n앱을 위로 밀어 종료하지 마세요.")

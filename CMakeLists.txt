@@ -46,3 +46,9 @@ target_link_libraries(SmartScreen PRIVATE
 
 target_compile_definitions(SmartScreen PRIVATE UNICODE _UNICODE)
 target_compile_options(SmartScreen PRIVATE /utf-8)
+
+# 개발용 진단 도구. 페어링 없이 GATT 연결이 되는지 확인한다 (tools/probescan.cpp 머리말 참고).
+add_executable(ProbeScan tools/probescan.cpp)
+target_link_libraries(ProbeScan PRIVATE windowsapp ole32)
+target_compile_definitions(ProbeScan PRIVATE UNICODE _UNICODE)
+target_compile_options(ProbeScan PRIVATE /utf-8)
