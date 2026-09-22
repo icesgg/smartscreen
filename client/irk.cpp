@@ -253,11 +253,14 @@ bool ImportIrkElevated(const std::wstring& targetName, std::wstring& outMessage)
 bool RequestIrkImport(const std::wstring& targetName, std::wstring& outMessage) {
     if (IsElevated()) return ImportIrkElevated(targetName, outMessage);
 
-    std::wstring args = L"--import-irk \"" + targetName + L"\"";
+    // ExePath()는 임시 객체를 돌려준다. c_str()을 바로 넘기면 문장이 끝나는 순간
+    // 소멸해서 ShellExecuteExW가 깨진 경로를 읽는다. 반드시 지역 변수에 담아 둔다.
+    const std::wstring exe = ExePath();
+    const std::wstring args = L"--import-irk \"" + targetName + L"\"";
     SHELLEXECUTEINFOW ei{ sizeof(ei) };
     ei.fMask = SEE_MASK_NOCLOSEPROCESS;
     ei.lpVerb = L"runas";                 // UAC 승격 요청
-    ei.lpFile = ExePath().c_str();
+    ei.lpFile = exe.c_str();
     ei.lpParameters = args.c_str();
     ei.nShow = SW_HIDE;
     if (!ShellExecuteExW(&ei)) {
