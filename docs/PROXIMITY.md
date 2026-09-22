@@ -2,7 +2,8 @@
 
 How SmartScreen decides whether the user is at the desk, why it is built this
 way, and what was measured. Written after replacing the original
-latency-based detector (2026-09-21/22).
+latency-based detector (2026-09-21/22), and again after replacing the IRK
+with a token the phone serves (2026-09-23).
 
 ---
 
@@ -34,7 +35,8 @@ only three carried a name; none was the phone.
 
 **Its address rotates.** The advertised address is a Resolvable Private
 Address that changes roughly every 15 minutes, so a stored address matches
-nothing. Resolving it requires the phone's IRK (see below).
+nothing. Working out which phone it is takes a connection, or its IRK;
+both are below.
 
 **It stops advertising when locked.** This is the decisive one. With the
 screen off, the phone went silent: over 10 minutes of a locked phone lying
@@ -49,46 +51,121 @@ which is what made the constraint look like an iOS limitation at first.
 
 ---
 
-## Identifying the phone: IRK
+## Identifying the phone
 
-The phone's advertised address is generated from its Identity Resolving Key:
+A locked phone advertises a rotating Resolvable Private Address and
+nothing else, so the packet alone never says which phone it is. Two
+mechanisms answer that: a token the phone serves over GATT, which is how
+it works now, and the IRK, which is what it replaced and is still carried
+where a bond happens to exist.
 
-```
-ah(IRK, prand) = AES-128(IRK, 0…0 ‖ prand)   // low 24 bits == address hash
-```
+### The phone serves a token
 
-Windows receives the IRK when an LE bond is created and stores it under
+`ios/SSBeacon` publishes a GATT service (`7A1C0020`) holding a 16-byte
+value generated once at install, in a read-only characteristic
+(`7A1C0021`). The PC connects as a central, reads it, compares it with
+the value stored at registration, and disconnects
+(`client/ble_ident.cpp`).
+
+Measured: a locked, **unpaired** iPhone with the app in the background
+accepts the connection, serves discovery, and returns the token. No bond
+and no registry are involved, which is the entire point — the IRK route
+below needs an LE bond, and on Windows that means setting up Phone Link
+once.
+
+The characteristic carries its value inline rather than answering a
+delegate callback, so CoreBluetooth serves it from its own cache without
+waking the app. That is what makes the read dependable while the phone
+is locked, and it costs no battery.
+
+The connection is for identity only. RSSI still comes from
+advertisements: WinRT exposes no connection RSSI, and CoreBluetooth's
+`readRSSI()` is central-side only, so a phone acting as a peripheral
+cannot measure it either. The link is dropped as soon as the token is
+read, because holding it open can stop the phone advertising.
+
+Registration requires the app to be **in the foreground**, where iOS
+still puts the name and service UUID in the packet. Registering from a
+locked phone would mean choosing a candidate blind, and the candidate
+could be a colleague's.
+
+The phone hosts this service under a different UUID from the one the PC
+hosts for the connection path. With one UUID for both, the app's own
+central scan finds a neighbouring phone and tries to treat it as a PC.
+
+### Narrowing the candidates
+
+Connecting to every unknown address in range would be slow and rude, so
+candidates are filtered first, by the shape of Apple's overflow area.
+
+A backgrounded iOS app's service UUIDs move into manufacturer data type
+`0x01` as a 128-bit field. One advertised UUID lights exactly one bit,
+giving a 17-byte payload with a popcount of one. Over a capture of 4048
+addresses, 954 carried a type `0x01` message but only 13 had that shape;
+the rest were 24-byte `01 09 20 22 …` messages with 41 to 75 bits set,
+which the length alone rejects.
+
+The bit is learned by observation. Apple's hash is never computed, and
+does not need to be known. What the bit is **not** is an identity:
+
+- it moves when the advertised UUID changes — observed 116 → 85 → 31,
+  the last when the app switched from advertising `7A1C0010` to
+  `7A1C0020`
+- it survived a phone reboot, so it is not per-boot either; yet it did
+  move once between days for reasons still unknown
+- a neighbouring phone was observed setting the same bit, connected to,
+  and rejected by the token read
+
+So it is a filter that keeps the candidate list short, and one that
+heals itself: when it goes stale the scanner widens to any single-bit
+advertiser and relearns the bit from whichever one answers with the
+right token. Anything weaker than ten dB below the threshold is skipped
+— a phone that far away cannot hold the screen open anyway.
+
+Probing runs on its own thread. A connection attempt takes seconds and
+can take twenty, which is far too long to spend in a scan callback.
+
+### IRK, the earlier route
+
+Windows receives the phone's IRK when an LE bond is created and stores it
+under
 `HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Keys\<adapter>\<device>`,
-readable only as SYSTEM. `client/ble_rssi.cpp` re-derives the hash for each
-random address with bcrypt and accepts the ones that match.
+readable only as SYSTEM. `client/ble_rssi.cpp` re-derives
+`ah(IRK, prand) = AES-128(IRK, 0…0 ‖ prand)` with bcrypt for each random
+address and accepts the ones whose low 24 bits match.
 
-Two properties matter for deployment:
+The IRK belongs to the **phone**, not the PC, so the same value works on
+every PC and can be copied rather than re-extracted. It also keeps
+working after the bond that produced it is deleted, because it lives in
+config from then on.
 
-- The IRK belongs to the **phone**, not the PC. The same value works on every
-  PC, so it can be copied rather than re-extracted.
-- It is the **only** signal that identifies one particular phone. The
-  companion app's service UUID is shared by every install of the app, so
-  matching on it alone would let a colleague's phone hold the screen open.
-  The scanner therefore resolves the address first and falls back to the
-  service UUID only when no IRK is configured, which is the bootstrap case on
-  a fresh PC.
-
-Extraction is automated behind the "기기 키" button, because the key lives
-where only SYSTEM can read it and no amount of user instruction makes that
-pleasant. The app relaunches itself elevated (`--import-irk`), the elevated
-instance registers a one-shot scheduled task that runs the app once more as
-SYSTEM (`--dump-irk`), and that instance walks
-`Keys\<adapter>\<device>` and writes every IRK it finds to a temp file. The
-elevated instance then correlates those addresses against the paired BLE
+Extraction is automated behind the "기기 키" button: the app relaunches
+itself elevated (`--import-irk`), that instance registers a one-shot
+scheduled task running the app as SYSTEM (`--dump-irk`), which walks
+`Keys\<adapter>\<device>` and writes every IRK it finds to a temp file.
+The elevated instance correlates those addresses against the paired BLE
 devices reported by WinRT, picks the one whose name matches the selected
-phone, stores it in config and deletes the temp file. Where exactly one key
-exists it is taken without the name check.
+phone, stores it and deletes the temp file. Where exactly one key exists
+it is taken without the name check.
 
-Picking the right one matters: a bonded BLE mouse's IRK would resolve just as
+Picking the right one matters: a bonded BLE mouse's IRK resolves just as
 well and would then sit on the desk holding the screen open forever.
 
-The user still needs an LE bond to exist at all, which on Windows means
-pairing the phone through Phone Link once.
+This path still runs, and still runs first when an IRK is configured. It
+is no longer the way in, because no amount of automation removes the
+pairing step it depends on.
+
+### Choosing the target
+
+The device list offers paired devices, which contradicts a design whose
+point is not needing a pairing. A registered phone therefore heads the
+list and is selected by default. Choosing it turns off address and name
+matching entirely, so a paired device that happens to advertise cannot
+feed the same filter, and skips the RFCOMM probe, which has no address
+to reach.
+
+This was not hypothetical. With the phone unpaired and absent from the
+list, the target silently became a pair of Bluetooth headphones.
 
 ---
 
@@ -101,12 +178,20 @@ The PC prefers whichever is available. Nothing to configure.
 | Roles | app = peripheral, PC = scanner | PC = peripheral, app = central |
 | PC must support | BLE scanning | BLE **peripheral role** |
 | Update rate | median 1.7 s, p90 5.8 s, max 20 s | 1 s |
-| Identification | IRK | the connection itself |
+| Identification | a token read over GATT | the connection itself |
 | Works on | every adapter tested | one of four adapters tested |
 
 **Advertisement path** (`client/ble_rssi.cpp`). The app advertises; the PC
-scans and resolves the address. This is the default because scanning works
-everywhere.
+scans, and confirms which advertiser is the phone by reading its token.
+This is the default because scanning works everywhere.
+
+**Losing the connection is not absence.** Once the app has connected, a
+dropped GATT link is a hint that the user left, but only a hint: if the
+scanner can still hear the phone, the advertisement path decides. Absence
+requires both to be quiet. Treating the drop alone as absence blanked the
+screen while the phone was a metre away and audible at −46 dBm, because
+the app had briefly dropped its link. What must **not** be used as a
+fallback here is the latency probe, which reaches 30-50 m.
 
 **GATT connection path** (`client/ble_gatt.cpp`). The PC runs a GATT server
 with two characteristics: the PC notifies `TICK`, which wakes the app even
@@ -150,7 +235,10 @@ any Bluetooth 5.x dongle.
 
 ## Measurements
 
-Phone locked, in a trouser pocket, companion app running.
+Phone locked and the companion app running throughout. In the first two
+runs the phone was in a trouser pocket; in the third it stayed wherever
+it is normally kept, which is the condition that matters — see the
+warning at the end of this section.
 
 **GATT path, Intel internal radio**
 
@@ -168,12 +256,43 @@ Threshold −55 dBm; screen locked 13 s after standing up, unlocked on return.
 | seated | −49 … −61 dBm |
 | 10 m away | −69 … −75 dBm |
 
-Threshold −65 dBm. Packet gaps: median 1.7 s, p90 5.8 s, max 19.9 s.
+Packet gaps: median 1.7 s, p90 5.8 s, max 19.9 s.
 
-Absolute values are not portable. Antennas differ by 10-20 dB between
-adapters, and body shadowing costs another 20-30 dB versus a phone on the
-desk. **Re-measure after changing adapter or desk**; the procedure is in
-`dist/README.txt` §4.
+**Advertisement path, Intel internal radio, second desk (2026-09-23)**
+
+Two minutes seated, two away, one back, with the walk at either end
+excluded. Percentiles of the smoothed value:
+
+| | n | min | median | max |
+|---|---|---|---|---|
+| seated | 281 | **−59** | −52 | −47 |
+| away | 50 | −76 | −66 | **−61** |
+
+The two figures in bold are the ones that decide: the fifth percentile
+of the seated run is −55, but it is the −59 that would trip a threshold.
+
+The distributions do not overlap: the worst seated sample is −59, the
+best away sample is −61. The threshold goes in that gap, at **−60**.
+
+This is the run that showed the earlier −65 to be too low for this desk,
+not too high: away samples read as near 54 % of the time, and each one
+restarted the hold timer, so leaving was detected slowly and erratically.
+Seated also reached −47, above the −49 recorded before.
+
+Absolute values are not portable, and these two runs disagree by more
+than 10 dB. Antennas differ by 10-20 dB between adapters, and body
+shadowing costs another 20-30 dB versus a phone on the desk.
+**Re-measure after changing adapter, desk, or where the phone is kept.**
+The procedure above is the one to repeat: seated, away, back, then
+compare the tails rather than the averages — the tails are what trip the
+threshold. `ble_scan_log.csv` and `gatt_rssi_log.csv` record what is
+needed when `bleDebugLog=1`.
+
+The GATT threshold has **not** been measured this way. −55 came from the
+first run above and sat inside the seated distribution of the second,
+locking the screen on a decibel of noise while the user sat at the desk.
+It is now −60, borrowed from the advertisement figures because the two
+seated distributions nearly coincide, and should be re-measured.
 
 ---
 
@@ -188,8 +307,16 @@ track faster. R=10.0 on both.
 `−127 dBm` is Windows' out-of-range marker rather than a measurement and is
 discarded before it reaches the filter.
 
-**Hysteresis.** On the GATT path, locking uses the threshold and unlocking
-uses threshold+4 dB, so a value sitting on the boundary does not flap.
+**Hysteresis.** Locking uses the threshold and unlocking uses
+threshold+4 dB, so a value sitting on the boundary does not flap. Only
+the GATT path had this at first; the advertisement path compared straight
+against the threshold, and once the seated distribution's lower tail
+reached it, a decibel of noise flipped the verdict.
+
+**The log records the threshold that decided.** State transitions print
+the effective value — hysteresis applied — next to the configured one.
+Printing only the setting hides the 4 dB and makes a verdict impossible
+to reproduce from the log afterwards.
 
 **Timeout.** No packet for `bleTimeoutSec` (default 90 s) means the signal is
 lost. With the companion app advertising this is generous; without it, sparse
@@ -267,3 +394,35 @@ Recorded because most were invisible without instrumentation.
   one.
 - Header order: `config.h` pulls in `winsock2.h` and had to precede the WinRT
   headers, which pull in `windows.h`.
+- `LoadAppConfig` returned whether a Classic address was stored rather than
+  whether a config was read, and its caller applied every other setting
+  inside that `if`. A registered phone has no Classic address, so the whole
+  configuration was about to be discarded on startup.
+- `GattDeviceService` is `IClosable`. Left open, Windows holds the LE
+  connection, and after a handful of probes every later connection returns
+  `Unreachable`.
+- `ConnectionStatus` and `GattSession` are not usable as a gate: a discovery
+  that succeeded reported `Disconnected` and `Closed` throughout, because
+  Windows connects only for the duration of the operation.
+
+Three of these were dormant until link encryption was turned off. Without
+it the companion app never connected, so the code that runs once it has —
+the GATT threshold, the absence rule, the config flag — had never
+executed and had never been shown to be wrong. Turning on a path that
+has never run is not a small change.
+
+**Wrong guesses, recorded so they are not made again.** An hour went
+into a fault where BLE scanning kept working while every outgoing
+connection returned `Unreachable`. It was blamed in turn on contention
+with A2DP headphones, on a stale bond against a rotating address, on the
+service-handle leak above, and on a bond left on the phone. Each was
+plausible, each was wrong, and disconnecting, unpairing and restarting
+the radio changed nothing. A reboot cleared it. A radio toggle reloads
+the driver; it does not reset the controller. Worth reaching for earlier
+than it was.
+
+The overflow bit was also assumed to change on reboot, from a single
+observation of it moving overnight. It does not: it survived a reboot
+and moved when the advertised UUID changed. The conclusion drawn from
+the wrong reason — that it cannot serve as an identity — happened to
+hold.
