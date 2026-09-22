@@ -3,12 +3,12 @@
 
 // User-configurable settings
 DWORD  g_nearLatencyMs    = 200;
-int    g_nearRssiThreshold = -50;  // BLE RSSI 임계값 (dBm). 이 값 이상이면 NEAR
+int    g_nearRssiThreshold = -65;  // BLE RSSI 임계값 (dBm). 이 값 이상이면 NEAR
 int    g_gattRssiThreshold = -55;  // v2(GATT) 임계값 (dBm). 폰이 측정한 연결 RSSI 기준
 bool   g_gattSeen = false;
 DWORD  g_gattGraceSec = 90;
 ULONGLONG g_monStartTick = 0;
-bool   g_bleLostMeansFar = false;  // 기본 false: iPhone은 잠금 시 광고가 멈추므로 끊김을 이탈로 보면 안 됨
+bool   g_bleLostMeansFar = true;   // 컴패니언 앱이 계속 광고하므로 끊김 = 이탈. 앱을 안 쓰면 0으로
 DWORD  g_keepAliveSec     = 5;
 DWORD  g_scanIntervalSec  = 2;
 int    g_idleCountdownSec = 20;

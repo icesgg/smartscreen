@@ -22,7 +22,7 @@
 enum class ProxState { Far, Near };
 
 inline const wchar_t* StateStr(ProxState s) {
-    return (s == ProxState::Near) ? L"WITHIN 1M" : L"FAR";
+    return (s == ProxState::Near) ? L"NEAR" : L"FAR";
 }
 
 struct PairedDevice {

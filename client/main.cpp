@@ -895,7 +895,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             L"\xC2E0\xD638 \xAC15\xB3C4:",  // 신호 강도:
             WS_CHILD | WS_VISIBLE | SS_RIGHT,
             20, row1Y + 3, 80, 20, hWnd, nullptr, hInst, nullptr);
-        g_hEditLatency = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"-50",
+        g_hEditLatency = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"-65",
             WS_CHILD | WS_VISIBLE | ES_CENTER,
             105, row1Y, 50, 24, hWnd, (HMENU)(UINT_PTR)ID_EDIT_LATENCY, hInst, nullptr);
         CreateWindowExW(0, L"STATIC", L"dBm \xC774\xC0C1",  // dBm 이상
