@@ -749,6 +749,10 @@ static void OnResult(ProbeResult* r) {
     if(r->state==ProxState::Near){wchar_t lb[128];
         swprintf_s(lb,L"  \xADFC\xCC98   (\xC720\xD734: %ds)", g_nCountdown);  // 근처 (유휴: Ns)
         SetWindowTextW(g_hStateLabel,lb);
+    } else if (r->bleAvailable && r->rssiDbm <= -100) {
+        // 신호가 약해서가 아니라 폰 신호가 아예 끊긴 경우.
+        // 앱을 위로 밀어 종료했거나 iOS가 앱을 내린 상황이라 사용자가 알아야 한다.
+        SetWindowTextW(g_hStateLabel, L"  멀리  (폰 신호 없음 - 앱 확인)");
     } else SetWindowTextW(g_hStateLabel,L"  \xBA40\xB9AC");  // 멀리
 
     wchar_t ev[256]=L"";
