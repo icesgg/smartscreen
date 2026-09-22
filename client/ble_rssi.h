@@ -67,6 +67,9 @@ public:
     // BLE 스캐너가 사용 가능한지 (WinRT 초기화 성공 여부)
     bool IsAvailable() const;
 
+    // 최근 10초간 수신한 대상 기기 광고 수 (초당 환산). 튜닝 시 신호가 얼마나 촘촘한지 확인용
+    double RecentPacketRate() const;
+
     // 마지막 유효 패킷 수신 시각 (GetTickCount64). 없으면 0
     ULONGLONG LastReceivedTick() const;
 

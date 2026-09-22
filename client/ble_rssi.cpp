@@ -80,6 +80,27 @@ struct BleRssiScanner::Impl {
     std::mutex kalmanMutex;                // 칼만 필터 동기화
     HANDLE packetEvent{ CreateEventW(nullptr, FALSE, FALSE, nullptr) };  // 유효 패킷 수신 알림
 
+    // 최근 수신 시각 링버퍼 (초당 수신 건수 계산용)
+    static constexpr int kRateSlots = 256;
+    ULONGLONG rateTicks[kRateSlots]{};
+    std::atomic<uint32_t> rateHead{ 0 };
+    std::mutex rateMutex;
+
+    void NotePacket(ULONGLONG now) {
+        std::lock_guard<std::mutex> lock(rateMutex);
+        rateTicks[rateHead % kRateSlots] = now;
+        rateHead++;
+    }
+
+    double PacketRate() {
+        std::lock_guard<std::mutex> lock(rateMutex);
+        ULONGLONG now = GetTickCount64();
+        int n = 0;
+        for (int i = 0; i < kRateSlots; i++)
+            if (rateTicks[i] != 0 && (now - rateTicks[i]) <= 10000) n++;
+        return n / 10.0;
+    }
+
     // 진단 로그 (CSV) - 경로가 비어 있으면 비활성
     std::wstring logPath;
     FILE* logFile{ nullptr };
@@ -293,8 +314,10 @@ bool BleRssiScanner::Start(const std::wstring& targetDeviceName, uint64_t target
                 }
                 m_impl->rawRssi = rssi;
                 m_impl->smoothedRssi = smoothedInt;
-                m_impl->lastReceivedTick = GetTickCount64();
+                ULONGLONG nowTick = GetTickCount64();
+                m_impl->lastReceivedTick = nowTick;
                 m_impl->receiving = true;
+                m_impl->NotePacket(nowTick);
                 SetEvent(m_impl->packetEvent);
             }
 
@@ -377,6 +400,10 @@ void BleRssiScanner::SetDebugLog(const std::wstring& path) {
 // ---------------------------------------------------------------------------
 // IRK 설정 (32자리 hex, Start 전에 호출). 빈 문자열이면 RPA 해석 비활성
 // ---------------------------------------------------------------------------
+double BleRssiScanner::RecentPacketRate() const {
+    return m_impl->PacketRate();
+}
+
 ULONGLONG BleRssiScanner::LastReceivedTick() const {
     return m_impl->lastReceivedTick;
 }

@@ -383,7 +383,6 @@ static DWORD WINAPI ScanThread(LPVOID) {
     g_lastNearTick = 0;
     // RFCOMM 프로브 결과 캐시 (폰 연결 대기 중에는 프로브를 띄엄띄엄 돌린다)
     ULONGLONG lastProbeTick = 0;
-    ULONGLONG lastPostTick = 0;
     bool  cachedReachable = false;
     DWORD cachedLatency = 0;
     int   cachedErr = 0;
@@ -479,14 +478,7 @@ static DWORD WINAPI ScanThread(LPVOID) {
             DWORD since = (DWORD)(now - g_lastNearTick), keepMs = g_keepAliveSec * 1000;
             r->timerRemainMs = (since < keepMs) ? (keepMs - since) : 0;
         } else r->timerRemainMs = 0;
-        // 포그라운드의 앱은 초당 10회까지 광고한다. 판정은 매 패킷마다 하되,
-        // 목록/차트 갱신은 1초에 한 번으로 줄인다 (상태가 바뀌는 순간은 항상 보여준다).
-        if (prev != g_proxState || lastPostTick == 0 || (now - lastPostTick) >= 1000) {
-            lastPostTick = now;
-            PostMessage(g_hWnd, WM_SCAN_RESULT, 0, (LPARAM)r);
-        } else {
-            delete r;
-        }
+        PostMessage(g_hWnd, WM_SCAN_RESULT, 0, (LPARAM)r);
         // 대상 기기의 BLE 패킷이 도착하면 주기를 기다리지 않고 즉시 재판정
         HANDLE waits[3] = { g_hStopEvent, g_bleScanner.PacketEvent(), g_bleGatt.ReportEvent() };
         if (WaitForMultipleObjects(3, waits, FALSE, g_scanIntervalSec * 1000) == WAIT_OBJECT_0) break;
@@ -827,8 +819,10 @@ static void OnResult(ProbeResult* r) {
     const wchar_t* gattSt = !g_bleGatt.IsRunning() ? L"off"
         : (g_bleGatt.IsClientSubscribed() ? L"linked" : L"waiting");
     if(r->bleAvailable)
-        swprintf_s(status,L"  \"%s\"  |  %s  |  RSSI: %d dBm%s  |  Near>=%d dBm  |  GATT: %s  |  Idle: %ds",
+        // 초당 수신 건수: 신호가 얼마나 촘촘한지 보면서 임계값을 잡을 수 있다
+        swprintf_s(status,L"  \"%s\"  |  %s  |  RSSI: %d dBm%s  |  %.1f/s  |  Near>=%d dBm  |  GATT: %s  |  Idle: %ds",
             g_targetName.c_str(),StateStr(r->state),r->rssiDbm,r->gatt?L" (GATT)":L"",
+            g_bleScanner.RecentPacketRate(),
             r->gatt?g_gattRssiThreshold:g_nearRssiThreshold,gattSt,g_nCountdown);
     else
         swprintf_s(status,L"  \"%s\"  |  %s  |  Latency: %lu ms  |  BLE: N/A  |  GATT: %s  |  Idle: %ds",
