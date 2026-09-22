@@ -1,17 +1,20 @@
-// SSBeaconApp.swift - SmartScreen 컴패니언 v2
+// SSBeaconApp.swift - SmartScreen 컴패니언
 //
-// v1(광고 방식)의 한계: iOS는 백그라운드/잠금 상태에서 BLE '광고'를 10~50초에 한 번으로 조인다.
-//   → 자리를 떠도 PC가 10~50초 뒤에야 알아챔.
-// v2(연결 방식): 역할을 뒤집는다.
-//   PC = GATT 서버(주변장치), 이 앱 = central.
-//   PC가 TICK 알림을 보낼 때마다 iOS가 (잠금 상태에서도) 앱을 깨우고,
-//   앱은 연결 RSSI를 읽어 PC에 써 준다 → PC는 ~1Hz로 RSSI를 받는다.
-//   연결된 BLE 링크는 광고와 달리 백그라운드 스로틀을 받지 않는다.
+// PC 쪽 어댑터에 따라 두 경로가 있고, 이 앱은 둘 다 동시에 준비해 둔다.
 //
-// 배터리: PC가 "사용자 입력이 멈췄을 때"만 TICK을 보낸다(입력 중이면 앱을 아예 깨우지 않음).
+//  [광고] 이 앱이 주변장치로 서비스 UUID를 광고 → PC가 스캔해서 RSSI를 읽는다.
+//         PC는 스캔만 하면 되므로 어떤 USB 동글에서도 동작한다. 갱신은 수 초 간격.
+//         아이폰은 앱 없이 잠기면 광고를 멈추므로, 이 앱이 계속 광고하는 게 핵심이다.
+//
+//  [연결] PC가 GATT 서버가 되고 이 앱이 central로 붙는다. PC가 TICK을 보내면
+//         iOS가 잠금 상태에서도 앱을 깨우고, 앱이 연결 RSSI를 PC에 써 준다. 1초 갱신.
+//         단, PC 어댑터가 BLE 주변장치 역할을 지원해야 한다 (못 하는 동글이 많다).
+//
+// PC는 연결 경로가 살아 있으면 그쪽을, 아니면 광고 경로를 쓴다.
 //
 // 필수 Xcode 설정 (README.md 참고):
-//  - Background Modes > "Uses Bluetooth LE accessories"  (bluetooth-central)
+//  - Background Modes > "Uses Bluetooth LE accessories"     (bluetooth-central)
+//  - Background Modes > "Acts as a Bluetooth LE accessory"  (bluetooth-peripheral)
 //  - Privacy - Bluetooth Always Usage Description
 
 import SwiftUI
@@ -21,72 +24,107 @@ import CoreBluetooth
 let kServiceUUID = CBUUID(string: "7A1C0010-5353-4243-8E2B-9F3D5A6C7E10")
 let kTickUUID    = CBUUID(string: "7A1C0011-5353-4243-8E2B-9F3D5A6C7E10")  // notify: PC -> 폰
 let kRssiUUID    = CBUUID(string: "7A1C0012-5353-4243-8E2B-9F3D5A6C7E10")  // write : 폰 -> PC
-let kRestoreId   = "com.smartscreen.ssbeacon.central"
+let kCentralRestoreId    = "com.smartscreen.ssbeacon.central"
+let kPeripheralRestoreId = "com.smartscreen.ssbeacon.peripheral"
 
-final class LinkManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
-    @Published var stateText = "초기화 중"
-    @Published var isConnected = false
+final class LinkManager: NSObject, ObservableObject,
+                         CBCentralManagerDelegate, CBPeripheralDelegate,
+                         CBPeripheralManagerDelegate {
+    @Published var advText = "광고 준비 중"
+    @Published var linkText = "PC 찾는 중"
+    @Published var isAdvertising = false
+    @Published var isLinked = false
     @Published var lastRssi = 0
     @Published var reportCount = 0
 
     private var central: CBCentralManager!
+    private var peripheralMgr: CBPeripheralManager!
     private var pc: CBPeripheral?
     private var rssiChar: CBCharacteristic?
     private var seq: UInt8 = 0
     private var discoverTries = 0
 
+    // 우리 서비스를 제공하지 않는 PC는 한동안 건너뛴다.
+    // (주변장치 역할을 못 하는 어댑터에 계속 붙었다 끊었다 하면 라디오만 낭비한다)
+    private var skipUntil: [UUID: Date] = [:]
+    private let skipWindow: TimeInterval = 600
+
     override init() {
         super.init()
-        // RestoreIdentifier: 앱이 종료돼도 iOS가 연결/알림 이벤트로 다시 깨워준다
         central = CBCentralManager(delegate: self, queue: nil,
-                                   options: [CBCentralManagerOptionRestoreIdentifierKey: kRestoreId])
+            options: [CBCentralManagerOptionRestoreIdentifierKey: kCentralRestoreId])
+        peripheralMgr = CBPeripheralManager(delegate: self, queue: nil,
+            options: [CBPeripheralManagerOptionRestoreIdentifierKey: kPeripheralRestoreId])
     }
+
+    // MARK: - 광고 경로 (주변장치)
+
+    private func startAdvertising() {
+        guard peripheralMgr.state == .poweredOn, !peripheralMgr.isAdvertising else { return }
+        // 포그라운드에서는 이름과 UUID가 그대로 실리고,
+        // 백그라운드/잠금에서는 iOS가 이름을 빼고 UUID를 overflow 영역으로 옮긴다.
+        // 그래서 PC는 IRK로 광고 주소를 풀어 이 아이폰을 식별한다.
+        peripheralMgr.startAdvertising([
+            CBAdvertisementDataLocalNameKey: "SSBeacon",
+            CBAdvertisementDataServiceUUIDsKey: [kServiceUUID]
+        ])
+    }
+
+    func peripheralManagerDidUpdateState(_ p: CBPeripheralManager) {
+        switch p.state {
+        case .poweredOn:    advText = "광고 시작 중"; startAdvertising()
+        case .poweredOff:   advText = "Bluetooth 꺼짐"; isAdvertising = false
+        case .unauthorized: advText = "Bluetooth 권한 없음"
+        default:            advText = "대기 중"
+        }
+    }
+
+    func peripheralManager(_ p: CBPeripheralManager, willRestoreState dict: [String: Any]) {
+        isAdvertising = p.isAdvertising
+    }
+
+    func peripheralManagerDidStartAdvertising(_ p: CBPeripheralManager, error: Error?) {
+        if let error = error {
+            advText = "광고 실패: \(error.localizedDescription)"
+            isAdvertising = false
+        } else {
+            advText = "광고 중"
+            isAdvertising = true
+        }
+    }
+
+    // MARK: - 연결 경로 (중앙장치)
 
     private func startScanOrConnect() {
         guard central.state == .poweredOn else { return }
         if let p = pc, p.state == .connected { return }
-
-        // 이미 연결돼 있는(다른 앱이 띄운) 기기가 있으면 재사용
-        let known = central.retrieveConnectedPeripherals(withServices: [kServiceUUID])
-        if let p = known.first {
-            pc = p; p.delegate = self
-            central.connect(p, options: nil)
-            stateText = "PC에 연결 중"
-        }
-        // 이전 PC로의 재연결 대기와 별개로 스캔도 계속 돌린다.
-        // 스캔을 멈추면 다른 PC(노트북 등)로 옮겼을 때 영영 찾지 못한다.
-        // 백그라운드 스캔은 서비스 UUID를 명시해야 동작한다
         if !central.isScanning {
+            // 백그라운드 스캔은 서비스 UUID를 명시해야 동작한다
             central.scanForPeripherals(withServices: [kServiceUUID], options: nil)
-            if pc == nil { stateText = "PC 찾는 중" }
         }
     }
 
-    // MARK: CBCentralManagerDelegate
     func centralManagerDidUpdateState(_ c: CBCentralManager) {
         switch c.state {
-        case .poweredOn:    stateText = "Bluetooth 켜짐"; startScanOrConnect()
-        case .poweredOff:   stateText = "Bluetooth 꺼짐"; isConnected = false
-        case .unauthorized: stateText = "Bluetooth 권한 없음 (설정에서 허용)"
-        case .unsupported:  stateText = "BLE 미지원 기기"
-        default:            stateText = "대기 중"
+        case .poweredOn:  startScanOrConnect()
+        case .poweredOff: isLinked = false; linkText = "Bluetooth 꺼짐"
+        default: break
         }
     }
 
     func centralManager(_ c: CBCentralManager, willRestoreState dict: [String: Any]) {
-        // iOS가 앱을 복원: 이전 연결을 이어받는다
         if let list = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral],
            let p = list.first {
             pc = p
             p.delegate = self
-            isConnected = (p.state == .connected)
-            stateText = isConnected ? "연결 복원됨" : "연결 복원 중"
+            isLinked = (p.state == .connected)
         }
     }
 
     func centralManager(_ c: CBCentralManager, didDiscover p: CBPeripheral,
                         advertisementData: [String: Any], rssi RSSI: NSNumber) {
-        // 다른 PC를 찾았으면 이전 PC로의 대기 중인 연결은 취소하고 갈아탄다
+        // 서비스를 제공하지 않는다고 확인된 PC는 일정 시간 건너뛴다
+        if let until = skipUntil[p.identifier], until > Date() { return }
         if let old = pc, old.identifier != p.identifier {
             c.cancelPeripheralConnection(old)
         }
@@ -94,52 +132,57 @@ final class LinkManager: NSObject, ObservableObject, CBCentralManagerDelegate, C
         pc = p
         p.delegate = self
         c.connect(p, options: nil)
-        stateText = "PC에 연결 중"
+        linkText = "PC에 연결 중"
     }
 
     func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
-        isConnected = true
-        stateText = "연결됨"
+        isLinked = true
+        linkText = "연결됨"
         discoverTries = 0
-        // nil = 전체 탐색. UUID 필터를 주면 iOS 캐시 때문에 실제로 있는 서비스를 놓치기도 한다
-        p.discoverServices(nil)
+        p.discoverServices(nil)   // 전체 탐색: UUID 필터는 iOS 캐시 경로를 타서 놓치기도 한다
     }
 
     func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
-        isConnected = false
+        isLinked = false
         rssiChar = nil
-        stateText = "연결 끊김 - 재연결 대기"
-        // 타임아웃 없는 connect(): 범위 안으로 돌아오면 iOS가 백그라운드에서도 자동 재연결
-        c.connect(p, options: nil)
-        startScanOrConnect()   // 동시에 스캔도 재개 (다른 PC로 옮겼을 수 있음)
+        // 건너뛰기로 표시된 PC면 재연결을 걸지 않는다 (붙었다 끊었다 반복 방지)
+        if let until = skipUntil[p.identifier], until > Date() {
+            linkText = "이 PC는 광고 경로 사용"
+        } else {
+            linkText = "연결 끊김 - 재연결 대기"
+            c.connect(p, options: nil)   // 타임아웃 없는 connect: 범위 안으로 오면 자동 재연결
+        }
+        startScanOrConnect()
     }
 
     func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
-        isConnected = false
-        stateText = "연결 실패 - 재시도"
-        c.connect(p, options: nil)
+        isLinked = false
+        linkText = "연결 실패 - 재시도"
         startScanOrConnect()
     }
 
     // MARK: CBPeripheralDelegate
+
     func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
         if let svc = p.services?.first(where: { $0.uuid == kServiceUUID }) {
             discoverTries = 0
+            skipUntil[p.identifier] = nil
             p.discoverCharacteristics([kTickUUID, kRssiUUID], for: svc)
             return
         }
         let n = p.services?.count ?? 0
         discoverTries += 1
-        if discoverTries <= 3 {
-            stateText = "서비스 찾는 중 (\(n)개 발견, 재시도 \(discoverTries))"
+        if discoverTries <= 2 {
+            linkText = "서비스 찾는 중 (\(n)개, 재시도 \(discoverTries))"
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                 guard self != nil, p.state == .connected else { return }
                 p.discoverServices(nil)
             }
         } else {
-            // 끊었다 다시 붙으면 iOS가 GATT 목록을 다시 읽는다
-            stateText = "서비스 없음 (\(n)개) - 재연결"
+            // 이 PC는 GATT 서버를 제공하지 않는다. 광고 경로로 충분하므로 매달리지 않는다.
+            linkText = "이 PC는 광고 경로 사용"
             discoverTries = 0
+            skipUntil[p.identifier] = Date().addingTimeInterval(skipWindow)
             central.cancelPeripheralConnection(p)
         }
     }
@@ -149,29 +192,27 @@ final class LinkManager: NSObject, ObservableObject, CBCentralManagerDelegate, C
             if ch.uuid == kTickUUID { p.setNotifyValue(true, for: ch) }
             if ch.uuid == kRssiUUID { rssiChar = ch }
         }
-        stateText = "보고 중"
+        linkText = "보고 중"
     }
 
-    // PC가 보낸 TICK → 앱이 깨어남 → RSSI 측정 요청
+    // PC가 보낸 TICK -> 앱이 깨어남 -> RSSI 측정 요청
     func peripheral(_ p: CBPeripheral, didUpdateValueFor ch: CBCharacteristic, error: Error?) {
         guard ch.uuid == kTickUUID else { return }
         if let d = ch.value, d.count >= 1 { seq = d[0] }
         p.readRSSI()
     }
 
-    // RSSI 측정 완료 → PC로 전송
+    // RSSI 측정 완료 -> PC로 전송
     func peripheral(_ p: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
         guard error == nil, let ch = rssiChar else { return }
         let v = RSSI.intValue
         guard v < 0, v > -127 else { return }   // 127 = 측정 불가
         var bytes = [UInt8(bitPattern: Int8(clamping: v)), seq]
         let data = Data(bytes: &bytes, count: 2)
-        // withoutResponse: 왕복 대기 없이 빠르게. 미지원이면 withResponse로 대체
         let type: CBCharacteristicWriteType =
             p.canSendWriteWithoutResponse && ch.properties.contains(.writeWithoutResponse)
             ? .withoutResponse : .withResponse
         p.writeValue(data, for: ch, type: type)
-
         DispatchQueue.main.async {
             self.lastRssi = v
             self.reportCount += 1
@@ -183,17 +224,31 @@ struct ContentView: View {
     @StateObject private var link = LinkManager()
 
     var body: some View {
-        VStack(spacing: 20) {
+        VStack(spacing: 18) {
             Text("SmartScreen Link").font(.title2).bold()
-            Circle()
-                .fill(link.isConnected ? Color.green : Color.gray)
-                .frame(width: 80, height: 80)
-            Text(link.stateText).font(.headline)
-            if link.isConnected {
-                Text("\(link.lastRssi) dBm").font(.system(.title3, design: .monospaced))
-                Text("보고 \(link.reportCount)회").font(.caption).foregroundColor(.secondary)
+
+            HStack(spacing: 28) {
+                VStack(spacing: 6) {
+                    Circle().fill(link.isAdvertising ? Color.green : Color.gray)
+                        .frame(width: 54, height: 54)
+                    Text("광고").font(.caption)
+                }
+                VStack(spacing: 6) {
+                    Circle().fill(link.isLinked ? Color.green : Color.gray)
+                        .frame(width: 54, height: 54)
+                    Text("연결").font(.caption)
+                }
             }
-            Text("앱을 위로 밀어 종료하지 마세요.\n홈으로 나가거나 잠가도 연결은 유지됩니다.")
+
+            Text(link.advText).font(.subheadline)
+            Text(link.linkText).font(.subheadline)
+
+            if link.isLinked && link.reportCount > 0 {
+                Text("\(link.lastRssi) dBm  ·  보고 \(link.reportCount)회")
+                    .font(.system(.footnote, design: .monospaced))
+            }
+
+            Text("광고 하나만 켜져 있어도 동작합니다.\n앱을 위로 밀어 종료하지 마세요.")
                 .font(.footnote).foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
         }

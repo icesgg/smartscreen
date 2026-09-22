@@ -583,15 +583,14 @@ static void StartMon() {
         DbgEvent(L"GATT server disabled by config");
     }
 
-    // v1 광고 스캔은 컴패니언 앱을 안 쓰는 PC에서만 돌린다.
-    // 같은 어댑터에서 Active 스캔과 주변장치 광고가 겹치면 광고가 Aborted 되는 일이 있다.
-    bool useAdvScan = !(g_bleGatt.IsRunning() && cfg.gattSeen);
-    DbgEvent(L"v1 advertisement scan: %s", useAdvScan ? L"on" : L"off (companion expected)");
-    if (useAdvScan) {
-        g_bleScanner.SetTimeoutSec(cfg.bleTimeoutSec);
-        g_bleScanner.SetDebugLog(cfg.bleDebugLog ? GetConfigDir() + L"\\ble_scan_log.csv" : L"");
-        g_bleScanner.Start(g_targetName, g_targetAddr);
-    }
+    // v1 광고 스캔은 항상 켠다.
+    // 라디오를 나눠 쓰는 게 걱정되어 껐던 적이 있는데, 그 뒤로 어떤 USB 동글에서는
+    // 광고 자체가 폰에 잡히지 않았다. 스캔이 도는 동안에만 BLE 송신이 제대로 되는
+    // 드라이버가 있는 것으로 보인다. 폴백 데이터도 얻을 수 있어 켜 두는 편이 안전하다.
+    DbgEvent(L"v1 advertisement scan: on");
+    g_bleScanner.SetTimeoutSec(cfg.bleTimeoutSec);
+    g_bleScanner.SetDebugLog(cfg.bleDebugLog ? GetConfigDir() + L"\\ble_scan_log.csv" : L"");
+    g_bleScanner.Start(g_targetName, g_targetAddr);
 
     cfg.btAddress = g_targetAddr;
     cfg.nearLatencyMs = g_nearLatencyMs;
