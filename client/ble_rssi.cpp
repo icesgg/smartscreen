@@ -10,6 +10,7 @@
 #include <winrt/Windows.Storage.Streams.h>
 
 #include "ble_rssi.h"
+#include "ble_gatt.h"   // SS_GATT_SERVICE_UUID (컴패니언 앱이 광고하는 UUID)
 #include <windows.h>
 #include <bcrypt.h>
 #include <algorithm>
@@ -165,6 +166,19 @@ struct BleRssiScanner::Impl {
         return hit;
     }
 
+    // 컴패니언 앱이 광고하는 서비스 UUID인지
+    // (포그라운드에서는 UUID가 광고에 그대로 실린다. 잠금/백그라운드에서는
+    //  iOS가 Apple overflow 영역으로 옮겨 버려서 이 경로로는 안 보이고, IRK 해석이 필요하다)
+    static bool HasOurService(BluetoothLEAdvertisement const& adv) {
+        static const winrt::guid target = [] {
+            GUID g{}; CLSIDFromString(SS_GATT_SERVICE_UUID, &g); return winrt::guid(g);
+        }();
+        try {
+            for (auto const& u : adv.ServiceUuids()) if (u == target) return true;
+        } catch (...) {}
+        return false;
+    }
+
     // 기기 이름 대소문자 무시 비교
     static bool NameContains(const std::wstring& advName, const std::wstring& target) {
         if (target.empty() || advName.empty()) return false;
@@ -253,7 +267,8 @@ bool BleRssiScanner::Start(const std::wstring& targetDeviceName, uint64_t target
             int16_t rssi = args.RawSignalStrengthInDBm();  // dBm, 음수값
 
             // 대상 기기 이름과 매칭 확인
-            bool matched = Impl::NameContains(advName, m_impl->targetName)
+            bool matched = Impl::HasOurService(args.Advertisement())
+                || Impl::NameContains(advName, m_impl->targetName)
                 || (m_impl->targetAddr != 0 && addr == m_impl->targetAddr)
                 || m_impl->ResolveRpa(addr);
             int smoothedInt = -100;
