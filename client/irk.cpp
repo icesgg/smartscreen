@@ -164,6 +164,30 @@ static bool NameMatches(const std::wstring& a, const std::wstring& b) {
     return x.find(y) != std::wstring::npos || y.find(x) != std::wstring::npos;
 }
 
+// 승격된 자식은 종료 코드밖에 못 돌려줘서 실패 사유가 통째로 사라진다.
+// 사유를 파일로 남기고 부모가 읽어서 그대로 보여준다.
+static std::wstring ResultPath() { return GetConfigDir() + L"\\irk_result.tmp"; }
+
+static void WriteResult(const std::wstring& msg) {
+    FILE* f = nullptr;
+    _wfopen_s(&f, ResultPath().c_str(), L"w,ccs=UTF-8");
+    if (!f) return;
+    fwprintf(f, L"%s", msg.c_str());
+    fclose(f);
+}
+
+static std::wstring ReadResult() {
+    FILE* f = nullptr;
+    _wfopen_s(&f, ResultPath().c_str(), L"r,ccs=UTF-8");
+    if (!f) return L"";
+    std::wstring out;
+    wchar_t buf[512];
+    while (fgetws(buf, _countof(buf), f)) out += buf;
+    fclose(f);
+    DeleteFileW(ResultPath().c_str());
+    return out;
+}
+
 bool ImportIrkElevated(const std::wstring& targetName, std::wstring& outMessage) {
     const std::wstring dumpPath = GetConfigDir() + L"\\irk_export.tmp";
     DeleteFileW(dumpPath.c_str());
@@ -175,11 +199,17 @@ bool ImportIrkElevated(const std::wstring& targetName, std::wstring& outMessage)
     std::wstring run = L"schtasks.exe /run /tn " + std::wstring(kTaskName);
     std::wstring del = L"schtasks.exe /delete /tn " + std::wstring(kTaskName) + L" /f";
 
-    if (!RunHidden(create, 20000)) {
+    DWORD createExit = 1;
+    bool created = RunHidden(create, 20000, &createExit);
+    DbgEvent(L"IRK: schtasks create ok=%d exit=%lu", created ? 1 : 0, createExit);
+    if (!created || createExit != 0) {
         outMessage = L"예약 작업을 만들지 못했습니다. 관리자 권한으로 실행됐는지 확인하세요.";
+        WriteResult(outMessage);
         return false;
     }
-    bool ran = RunHidden(run, 20000);
+    DWORD runExit = 1;
+    bool ran = RunHidden(run, 20000, &runExit);
+    DbgEvent(L"IRK: schtasks run ok=%d exit=%lu", ran ? 1 : 0, runExit);
 
     // 작업은 비동기로 돌기 시작한다. 덤프 파일이 생길 때까지 잠깐 기다린다.
     bool haveFile = false;
@@ -195,10 +225,12 @@ bool ImportIrkElevated(const std::wstring& targetName, std::wstring& outMessage)
 
     if (!haveFile) {
         outMessage = L"SYSTEM 작업이 키를 내보내지 못했습니다.";
+        WriteResult(outMessage);
         return false;
     }
 
     auto irks = ReadDump(dumpPath);
+    DbgEvent(L"IRK: %zu key(s) in registry", irks.size());
     DeleteFileW(dumpPath.c_str());   // 키를 디스크에 남기지 않는다
 
     if (irks.empty()) {
@@ -206,11 +238,13 @@ bool ImportIrkElevated(const std::wstring& targetName, std::wstring& outMessage)
                      L"아이폰이 이 PC와 BLE 본딩된 적이 없는 상태입니다.\n"
                      L"Windows 설정 > 모바일 장치에서 \"휴대폰과 연결\"로\n"
                      L"아이폰을 한 번 연결한 뒤 다시 시도하세요.";
+        WriteResult(outMessage);
         return false;
     }
 
     // 어느 것이 대상 기기 것인지 고른다
     auto paired = PairedLeDevices();
+    DbgEvent(L"IRK: %zu paired BLE device(s)", paired.size());
     std::wstring chosen;
     std::wstring chosenName;
     for (auto const& [addr, hex] : irks) {
@@ -232,6 +266,7 @@ bool ImportIrkElevated(const std::wstring& targetName, std::wstring& outMessage)
                         L"아이폰을 \"휴대폰과 연결\"로 한 번 연결한 뒤 다시 시도하세요.",
                    irks.size(), targetName.c_str());
         outMessage = buf;
+        WriteResult(outMessage);
         return false;
     }
 
@@ -244,6 +279,7 @@ bool ImportIrkElevated(const std::wstring& targetName, std::wstring& outMessage)
     outMessage = L"기기 키를 가져왔습니다. (" + chosenName + L")\n\n"
                  L"이제 아이폰이 잠긴 상태에서도 인식됩니다.\n"
                  L"\"시작\"을 다시 눌러 주세요.";
+    WriteResult(outMessage);
     return true;
 }
 
@@ -255,6 +291,7 @@ bool RequestIrkImport(const std::wstring& targetName, std::wstring& outMessage) 
 
     // ExePath()는 임시 객체를 돌려준다. c_str()을 바로 넘기면 문장이 끝나는 순간
     // 소멸해서 ShellExecuteExW가 깨진 경로를 읽는다. 반드시 지역 변수에 담아 둔다.
+    DeleteFileW(ResultPath().c_str());   // 이전 실행 결과가 남지 않게
     const std::wstring exe = ExePath();
     const std::wstring args = L"--import-irk \"" + targetName + L"\"";
     SHELLEXECUTEINFOW ei{ sizeof(ei) };
@@ -275,15 +312,12 @@ bool RequestIrkImport(const std::wstring& targetName, std::wstring& outMessage) 
     GetExitCodeProcess(ei.hProcess, &code);
     CloseHandle(ei.hProcess);
 
+    // 승격된 쪽이 남긴 사유를 그대로 보여준다 (종료 코드만으로는 알 수 없다)
+    std::wstring detail = ReadResult();
     if (code == 0) {
-        outMessage = L"기기 키를 가져왔습니다.\n\n"
-                     L"이제 아이폰이 잠긴 상태에서도 인식됩니다.\n"
-                     L"\"시작\"을 다시 눌러 주세요.";
+        outMessage = detail.empty() ? L"기기 키를 가져왔습니다." : detail;
         return true;
     }
-    outMessage = L"기기 키를 가져오지 못했습니다.\n\n"
-                 L"아이폰이 이 PC와 BLE 본딩되어 있어야 합니다.\n"
-                 L"Windows 설정 > 모바일 장치에서 \"휴대폰과 연결\"로\n"
-                 L"아이폰을 한 번 연결한 뒤 다시 시도하세요.";
+    outMessage = detail.empty() ? L"기기 키를 가져오지 못했습니다. (사유 불명)" : detail;
     return false;
 }
