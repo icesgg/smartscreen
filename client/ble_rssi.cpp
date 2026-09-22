@@ -146,6 +146,11 @@ struct BleRssiScanner::Impl {
         return ok;
     }
 
+    bool HasIrk() {
+        std::lock_guard<std::mutex> lock(rpaMutex);
+        return irkKeys[0] != nullptr;
+    }
+
     bool ResolveRpa(uint64_t addr) {
         if (((addr >> 46) & 3) != 1) return false;   // 상위 2bit 01 = resolvable private
         std::lock_guard<std::mutex> lock(rpaMutex);
@@ -166,9 +171,11 @@ struct BleRssiScanner::Impl {
         return hit;
     }
 
-    // 컴패니언 앱이 광고하는 서비스 UUID인지
-    // (포그라운드에서는 UUID가 광고에 그대로 실린다. 잠금/백그라운드에서는
-    //  iOS가 Apple overflow 영역으로 옮겨 버려서 이 경로로는 안 보이고, IRK 해석이 필요하다)
+    // 컴패니언 앱이 광고하는 서비스 UUID인지.
+    // 이 UUID는 앱을 쓰는 모든 폰이 똑같이 광고하므로 "내 폰"을 가리지 못한다
+    // (옆자리 동료 폰도 걸린다). IRK가 있으면 그쪽만 쓰고, 없을 때만 보조로 쓴다.
+    // 포그라운드에서는 UUID가 광고에 실리지만, 잠금/백그라운드에서는 iOS가
+    // Apple overflow 영역으로 옮겨 버려서 어차피 이 경로로는 안 보인다.
     static bool HasOurService(BluetoothLEAdvertisement const& adv) {
         static const winrt::guid target = [] {
             GUID g{}; CLSIDFromString(SS_GATT_SERVICE_UUID, &g); return winrt::guid(g);
@@ -266,11 +273,11 @@ bool BleRssiScanner::Start(const std::wstring& targetDeviceName, uint64_t target
             uint64_t addr = args.BluetoothAddress();
             int16_t rssi = args.RawSignalStrengthInDBm();  // dBm, 음수값
 
-            // 대상 기기 이름과 매칭 확인
-            bool matched = Impl::HasOurService(args.Advertisement())
+            // 이 광고가 "내 폰"인지. IRK 해석이 유일하게 폰을 특정하는 방법이라 먼저 본다.
+            bool matched = m_impl->ResolveRpa(addr)
                 || Impl::NameContains(advName, m_impl->targetName)
                 || (m_impl->targetAddr != 0 && addr == m_impl->targetAddr)
-                || m_impl->ResolveRpa(addr);
+                || (!m_impl->HasIrk() && Impl::HasOurService(args.Advertisement()));
             int smoothedInt = -100;
 
             // -127 dBm은 실제 측정값이 아니라 Windows가 "범위 이탈"을 알리는 표식 → 필터에 넣지 않음
