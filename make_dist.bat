@@ -34,6 +34,13 @@ copy /Y "%SRC%ios\SSBeacon\README.md" "%OUT%\ios\SSBeacon\" >nul
 if errorlevel 1 exit /b 1
 echo   ios\SSBeacon\
 
+REM The threshold has to be measured on the machine it runs on, and chapter 4
+REM of README.txt sends the reader to this script to do it. Shipping it is what
+REM keeps that instruction true on a PC that has no checkout.
+copy /Y "%SRC%tools\rssi-threshold.ps1" "%OUT%\" >nul
+if errorlevel 1 exit /b 1
+echo   rssi-threshold.ps1
+
 REM Produced by running BtCheck on the user's PC; must not ship in the bundle.
 if exist "%OUT%\BtCheck_result.txt" del "%OUT%\BtCheck_result.txt"
 
