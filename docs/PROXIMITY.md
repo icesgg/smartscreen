@@ -278,37 +278,48 @@ threshold — the second advertisement run puts the boundary six dB lower
 than the first. Taken together the two runs overlap: seated reaches −63
 and away reaches −61.
 
-### Count how long, not how often
+### One sample below is a lock
 
-The fraction of samples below a threshold is the wrong statistic. A
-single dip changes nothing, because the state machine needs no reading
-above the threshold for `keepAliveSec` before it will say FAR. What
-matters is the longest run of consecutive seated samples below it, and
-how long an away stretch takes to produce one such run.
+On the BLE paths there is no grace period. A single smoothed reading
+below the threshold moves the state to FAR, and `ActivateBlackScreen`
+follows the transition immediately:
 
-Over both advertisement runs, with the five-second default:
+```c
+ULONGLONG holdMs = bleAvail ? 0 : (ULONGLONG)g_keepAliveSec * 1000;
+```
 
-| threshold | longest seated run below | away detected after |
+`keepAliveSec` applies only to the latency path. The reasoning holds:
+advertisements arrive a median of 1.7 s apart and sometimes twenty, the
+smoothed value does not move between them, so waiting adds delay without
+adding evidence.
+
+The consequence for choosing a threshold is blunt. **It has to sit below
+the lowest seated reading, not below some average or percentile of
+them.** One unlucky fade is a blanked screen in front of a user who
+never moved.
+
+| run | path | lowest seated |
 |---|---|---|
-| −60 | **11 s** — locks while seated | 5 s / 9 s |
-| −61 | 2 s | 5 s / 9 s |
-| −64 | 0 s | 5 s / 9 s |
-| −69 | 0 s | 5 s / 17 s |
-| −70 | 0 s | never / 17 s |
+| 07:56 | advertisement | −59 |
+| 08:24 | advertisement | **−63** |
+| 08:24 | GATT | −62 |
 
-−60 was set from the first run alone, where seated bottomed out at −59.
-The second run has an eleven-second stretch below it while the user sat
-at the desk, which is a lock. Nothing in the first run's percentiles
-hinted at that; only running the measurement a second time found it.
+**Both thresholds are −64**: below every seated reading measured, while
+every away stretch is caught within five to nine seconds, with four dB
+of slack before detection starts to slow. The hysteresis then asks for
+−60 to return to NEAR, above the best away sample of either path, so the
+state does not bounce back.
 
-The GATT figures behave the same way: −60 leaves a three-second seated
-run, −61 and below leave none, and away is detected after five seconds
-all the way down to −71.
+−60 had been set from the first run alone, where seated bottomed out at
+−59. The second run reached −63. Nothing in the first run's percentiles
+hinted at it; only measuring twice found it.
 
-**Both thresholds are −64.** Zero seated runs, detection in five to nine
-seconds, and four dB of slack before detection starts to slow. The
-hysteresis then asks for −60 to return to NEAR, which is above the best
-away sample of either path, so the state does not bounce back.
+A desktop later ran at −55 and blanked while its user sat still: seated
+had reached −56, one dB past the line.
+
+So: measure twice, and compare the *minimum* of seated against the
+*maximum* of away. Percentiles and averages both hide the one sample
+that does the damage.
 
 ### Re-measuring
 
@@ -317,10 +328,11 @@ apart, disagreed by six dB, and the earlier USB-dongle figures by more
 than ten. Antennas differ by 10-20 dB between adapters, and body
 shadowing costs another 20-30 dB versus a phone on the desk.
 **Re-measure after changing adapter, desk, or where the phone is kept,
-and measure twice.** Repeat the procedure above, then compare the tails
-rather than the averages, and count consecutive runs rather than
-fractions. `ble_scan_log.csv` and `gatt_rssi_log.csv` hold what is
-needed when `bleDebugLog=1`.
+and measure twice.** Repeat the procedure above, then compare the lowest
+seated reading against the highest away reading. Averages and
+percentiles both hide the one sample that blanks the screen.
+`ble_scan_log.csv` and `gatt_rssi_log.csv` hold what is needed when
+`bleDebugLog=1`.
 
 The two paths track each other closely: matched within two seconds, the
 GATT reading is a median 2 dB stronger than the advertisement reading
