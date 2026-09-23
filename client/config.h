@@ -5,7 +5,10 @@
 struct AppConfig {
     BTH_ADDR btAddress = 0;
     DWORD nearLatencyMs = 200;
-    int nearRssiThreshold = -65;  // BLE 광고 RSSI 임계값 (dBm). 실측: 착석 -49~-61, 10m 이탈 -69~-75
+    // 임계값 기본값은 자리마다 다시 재는 것이 전제다 (docs/PROXIMITY.md, dist/README.txt 4장).
+    // 측정한 세 자리에서 착석 구간이 이 아래로 5초 이상 이어진 적이 없어, 붙어 있는
+    // 사람을 잘못 잠그지는 않는 쪽으로 잡았다. 늦게 잠기는 것이 잘못 잠기는 것보다 낫다.
+    int nearRssiThreshold = -65;  // [광고] 경로 (dBm)
     bool bleDebugLog = false;     // BLE 광고 진단 로그 (ble_scan_log.csv)
     DWORD bleTimeoutSec = 90;     // BLE 수신 끊김 판정 시간(초). 주머니 속 iPhone은 광고 간격이 70초까지 벌어짐
     bool bleGattServer = true;    // v2: PC가 GATT 서버가 되어 폰 앱의 1Hz RSSI 보고를 받음
@@ -14,7 +17,9 @@ struct AppConfig {
     bool bleGattEncrypt = false;
     bool gattSeen = false;        // 컴패니언 앱이 연결된 적 있음 → 이후 미연결은 "부재"로 간주
     DWORD gattGraceSec = 90;      // 시작 후 앱 연결을 기다리는 시간(초)
-    int gattRssiThreshold = -55;  // v2 임계값 (dBm, 폰이 측정한 연결 RSSI)
+    // -55 였는데, 실측에서 착석 분포(-62~-45) 안에 들어가 있어 자리에 앉아 있는데도
+    // 화면을 잠갔다. 연결 경로가 실제로 붙기 전에는 이 값이 쓰인 적이 없어 드러나지 않았다.
+    int gattRssiThreshold = -65;  // [연결] 경로 (dBm, 폰이 측정한 연결 RSSI)
     bool bleLostMeansFar = true;  // BLE 끊김 = 범위 이탈. 컴패니언 앱이 상시 광고하므로 기본 켬
     std::wstring bleIrk;         // LE 본딩 기기의 IRK (32자리 hex) - iPhone 랜덤 주소 해석용
     // IRK 를 대체하는 신원 확인 (ble_ident.h 참고). 본딩도 Phone Link 도 필요 없다.
