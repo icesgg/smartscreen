@@ -76,6 +76,13 @@ and no registry are involved, which is the entire point — the IRK route
 below needs an LE bond, and on Windows that means setting up Phone Link
 once.
 
+Confirmed end to end on a second machine (2026-09-23). A desktop was
+registered, the stored IRK was then deleted, and with the phone locked
+the scanner kept it bound and held NEAR on the token alone. Binding took
+2313 ms — a connect, a discovery and a read — which against a fifteen
+minute address rotation is under a third of a percent of the radio's
+time.
+
 The characteristic carries its value inline rather than answering a
 delegate callback, so CoreBluetooth serves it from its own cache without
 waking the app. That is what makes the read dependable while the phone
