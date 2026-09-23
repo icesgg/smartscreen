@@ -59,6 +59,9 @@ mechanisms answer that: a token the phone serves over GATT, which is how
 it works now, and the IRK, which is what it replaced and is still carried
 where a bond happens to exist.
 
+A shorter walk-through of the same mechanism, in Korean, is in
+[IDENTIFICATION.md](IDENTIFICATION.md).
+
 ### The phone serves a token
 
 `ios/SSBeacon` publishes a GATT service (`7A1C0020`) holding a 16-byte
