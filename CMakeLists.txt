@@ -18,6 +18,7 @@ add_executable(SmartScreen WIN32
     client/ble_ident.cpp
     client/irk.cpp
     client/enterprise/supabase.cpp
+    client/enterprise/auth.cpp
     client/p2p/discovery.cpp
     client/p2p/transfer.cpp
     client/video/player.cpp
@@ -43,6 +44,7 @@ target_link_libraries(SmartScreen PRIVATE
     propsys
     windowsapp
     bcrypt
+    crypt32          # DPAPI: 리프레시 토큰을 이 사용자/이 PC 에 묶어 둔다
 )
 
 target_compile_definitions(SmartScreen PRIVATE UNICODE _UNICODE)
@@ -57,8 +59,10 @@ add_executable(BtCheck tools/btcheck.cpp)
 add_executable(AdvScan tools/advscan.cpp)
 # 페어링 없이 잠긴 폰에서 신원 토큰을 읽을 수 있는지 (tools/probescan.cpp 머리말 참고)
 add_executable(ProbeScan tools/probescan.cpp)
+# 구글 로그인 부품(PKCE/루프백/DPAPI) 자체 점검. Supabase 없이 돌아간다.
+add_executable(AuthTest tools/authtest.cpp client/enterprise/auth.cpp)
 
-foreach(t BtCheck AdvScan ProbeScan)
+foreach(t BtCheck AdvScan ProbeScan AuthTest)
     target_link_libraries(${t} PRIVATE windowsapp ole32)
     target_compile_definitions(${t} PRIVATE UNICODE _UNICODE)
     target_compile_options(${t} PRIVATE /utf-8)
