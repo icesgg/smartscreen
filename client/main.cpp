@@ -382,6 +382,11 @@ static DWORD WINAPI ReconnectThread(LPVOID) {
 // ---------------------------------------------------------------------------
 // Worker thread
 // ---------------------------------------------------------------------------
+// 지금 무엇으로 폰을 알아보고 있는지. 화면에는 어느 쪽이든 똑같이 NEAR 로
+// 보여서, 등록을 건너뛴 PC 가 예전 IRK 경로로 돌고 있는 것을 아무도 못 알아챘다.
+static bool g_hasToken = false;
+static bool g_hasIrk = false;
+
 static DWORD WINAPI ScanThread(LPVOID) {
     g_proxState = ProxState::Far;
     g_lastNearTick = 0;
@@ -650,6 +655,8 @@ static void StartMon() {
     // 연결으로 신원을 확인하는 경로 (IRK 없이 동작). 등록된 토큰이 있을 때만 켜진다.
     // 탐색 하한은 임계값보다 10dB 낮게 — 그보다 멀면 어차피 자리 판정에 쓸 수 없어
     // 남의 폰에 연결을 시도할 이유가 없다.
+    g_hasToken = !cfg.phoneToken.empty();
+    g_hasIrk = !cfg.bleIrk.empty();
     g_bleScanner.SetIdentity(cfg.phoneToken, cfg.phoneOvfBit, g_nearRssiThreshold - 10);
     g_bleScanner.SetTimeoutSec(cfg.bleTimeoutSec);
     g_bleScanner.SetDebugLog(cfg.bleDebugLog ? GetConfigDir() + L"\\ble_scan_log.csv" : L"");
@@ -883,15 +890,22 @@ static void OnResult(ProbeResult* r) {
     wchar_t status[300];
     const wchar_t* gattSt = !g_bleGatt.IsRunning() ? L"off"
         : (g_bleGatt.IsClientSubscribed() ? L"linked" : L"waiting");
+    // 잠긴 아이폰을 특정하는 수단. 둘 다 없으면 특정할 방법이 원천적으로 없고,
+    // 그래도 화면은 멀쩡해 보이므로 여기에 드러내 둔다.
+    const wchar_t* idSt =
+        (!g_hasToken && !g_hasIrk)             ? L"없음!"
+        : !g_hasToken                          ? L"IRK"
+        : (g_bleScanner.BoundAddress() == 0)   ? (g_hasIrk ? L"IRK/토큰 대기" : L"토큰 대기")
+        :                                        (g_hasIrk ? L"토큰+IRK" : L"토큰");
     if(r->bleAvailable)
         // 초당 수신 건수: 신호가 얼마나 촘촘한지 보면서 임계값을 잡을 수 있다
-        swprintf_s(status,L"  \"%s\"  |  %s  |  RSSI: %d dBm%s  |  %.1f/s  |  Near>=%d dBm  |  GATT: %s  |  Idle: %ds",
+        swprintf_s(status,L"  \"%s\"  |  %s  |  RSSI: %d dBm%s  |  %.1f/s  |  Near>=%d dBm  |  ID: %s  |  GATT: %s  |  Idle: %ds",
             g_targetName.c_str(),StateStr(r->state),r->rssiDbm,r->gatt?L" (GATT)":L"",
             g_bleScanner.RecentPacketRate(),
-            r->gatt?g_gattRssiThreshold:g_nearRssiThreshold,gattSt,g_nCountdown);
+            r->gatt?g_gattRssiThreshold:g_nearRssiThreshold,idSt,gattSt,g_nCountdown);
     else
-        swprintf_s(status,L"  \"%s\"  |  %s  |  Latency: %lu ms  |  BLE: N/A  |  GATT: %s  |  Idle: %ds",
-            g_targetName.c_str(),StateStr(r->state),r->latencyMs,gattSt,g_nCountdown);
+        swprintf_s(status,L"  \"%s\"  |  %s  |  Latency: %lu ms  |  BLE: N/A  |  ID: %s  |  GATT: %s  |  Idle: %ds",
+            g_targetName.c_str(),StateStr(r->state),r->latencyMs,idSt,gattSt,g_nCountdown);
     SetWindowTextW(g_hStatus,status);
     UpdateOverlayState();
 }
