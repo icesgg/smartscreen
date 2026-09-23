@@ -329,12 +329,24 @@ So about a third of advertisement-path locks were one unlucky packet. The
 price is a median 1.7 s of extra delay on a real departure, and at most
 six.
 
-The cost on a real departure was measured directly, in a walk-away test on
-the laptop at −64. The smoothed GATT value fell from −53 to −66 over four
-seconds and stayed there; the first below-threshold sample landed at
-17:38:37.8 and the second 2.0 s behind it, so the rule moves that lock to
-17:38:39.8. The screen blanked on a departure that had happened, two
-seconds later than before.
+The cost on a real departure was then measured with the rule running
+(2026-09-23, laptop, both thresholds −64). Four deliberate walk-aways,
+three heard on the advertisement path and one over GATT, and every one of
+them locked on the second below-threshold sample rather than the first:
+
+| path | first below | second below | added |
+|---|---|---|---|
+| advertisement | −67 | −72 | +2.6 s |
+| advertisement | −65 | −65 | +0.7 s |
+| advertisement | −65 | −66 | +0.9 s |
+| GATT | −66 | −67 | +1.0 s |
+
+The cap never fired and no seated stretch locked. The GATT row is the one
+worth having. Both paths share every line of the rule except which
+accessor supplies the sample tick, so that one line is the only part a run
+on the advertisement path does not exercise — and had it been wrong, the
+symptom would have been a lock at the six-second cap instead of at one
+second, which no amount of reading the code rules out.
 
 What this does **not** fix is the shape of the seated distribution. A run
 of two is common wherever a run of one is, so **the threshold still has to
