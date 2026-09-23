@@ -5,5 +5,9 @@ build/
 *.pdb
 *.ilk
 main.cpp.bak
-dist/
+# dist/ 는 손으로 조립하는 배포 폴더다. exe 와 ios 사본은 빌드 산출물이라
+# 추적하지 않지만, README.txt 는 사용자가 읽는 유일한 문서이고 손으로 쓰는
+# 것이라 추적한다. 디렉터리 대신 내용물을 제외해야 아래 부정 규칙이 먹는다.
+dist/*
+!dist/README.txt
 *.zip

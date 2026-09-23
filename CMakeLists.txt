@@ -48,8 +48,18 @@ target_link_libraries(SmartScreen PRIVATE
 target_compile_definitions(SmartScreen PRIVATE UNICODE _UNICODE)
 target_compile_options(SmartScreen PRIVATE /utf-8)
 
-# 개발용 진단 도구. 페어링 없이 GATT 연결이 되는지 확인한다 (tools/probescan.cpp 머리말 참고).
+# 진단 도구들. 배포 묶음에 같이 넣으므로 제품과 같은 빌드에서 나와야 한다 -
+# 손으로 복사해 두면 소스가 바뀌어도 낡은 exe 가 그대로 따라간다.
+
+# 어댑터가 무엇을 지원한다고 보고하는지 (드라이버 보고값이라 믿을 수 없다)
+add_executable(BtCheck tools/btcheck.cpp)
+# 다른 PC 에서 돌려 이 PC 의 BLE 광고가 실제로 나가는지 확인
+add_executable(AdvScan tools/advscan.cpp)
+# 페어링 없이 잠긴 폰에서 신원 토큰을 읽을 수 있는지 (tools/probescan.cpp 머리말 참고)
 add_executable(ProbeScan tools/probescan.cpp)
-target_link_libraries(ProbeScan PRIVATE windowsapp ole32)
-target_compile_definitions(ProbeScan PRIVATE UNICODE _UNICODE)
-target_compile_options(ProbeScan PRIVATE /utf-8)
+
+foreach(t BtCheck AdvScan ProbeScan)
+    target_link_libraries(${t} PRIVATE windowsapp ole32)
+    target_compile_definitions(${t} PRIVATE UNICODE _UNICODE)
+    target_compile_options(${t} PRIVATE /utf-8)
+endforeach()
