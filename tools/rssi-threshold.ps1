@@ -57,9 +57,12 @@ function Format-Clock([double] $sec) {
 # ---------------------------------------------------------------------------
 function Read-RssiLog([string] $path, [string] $kind, [string] $sessionSel) {
     if (-not (Test-Path $path)) {
-        Write-Verbose "없음: $path"
+        $script:diag = "파일이 없다. bleDebugLog=1 로 바꾸고 앱을 다시 시작해야 생긴다."
         return @()
     }
+    $fi = Get-Item $path
+    $script:diag = ''
+    $script:diagRows = 0        # 주석/헤더가 아닌 줄 전체
     $sessions = New-Object System.Collections.ArrayList
     $cur      = New-Object System.Collections.ArrayList
     # 앱이 로그를 열어 둔 채로 돌고 있는 게 정상이다 (측정 중에 돌려 보게 된다).
@@ -79,6 +82,7 @@ function Read-RssiLog([string] $path, [string] $kind, [string] $sessionSel) {
         }
         if ($line.StartsWith('time,')) { continue }
         if ($line.Length -eq 0) { continue }
+        $script:diagRows++
 
         $f = $line.Split(',')
         if ($kind -eq 'adv') {
@@ -101,14 +105,35 @@ function Read-RssiLog([string] $path, [string] $kind, [string] $sessionSel) {
     [void]$sessions.Add($cur)
 
     $withData = @($sessions | Where-Object { $_.Count -gt 0 })
-    if ($withData.Count -eq 0) { return @() }
+    if ($withData.Count -eq 0) {
+        # 왜 비었는지가 곧 다음에 할 일이라, 경우를 갈라서 말해 준다.
+        $stamp = "({0:N0} B, 마지막 기록 {1:HH:mm:ss})" -f $fi.Length, $fi.LastWriteTime
+        if ($script:diagRows -eq 0) {
+            $script:diag = "파일은 있는데 기록된 줄이 없다 $stamp. " +
+                "bleDebugLog=1 로 바꾼 뒤 앱을 다시 시작했는지 확인."
+        } elseif ($kind -eq 'adv') {
+            $script:diag = "줄은 {0:N0}개 있는데 matched=1 인 줄이 하나도 없다 $stamp. " -f $script:diagRows
+            $script:diag += "폰을 식별하지 못한 상태다 - 상태 표시줄의 ID: 항목을 볼 것."
+        } else {
+            $script:diag = "줄은 {0:N0}개 있는데 쓸 수 있는 값이 없다 $stamp." -f $script:diagRows
+        }
+        return @()
+    }
 
     if ($sessionSel -eq 'All') {
         $all = New-Object System.Collections.ArrayList
         foreach ($s in $withData) { foreach ($x in $s) { [void]$all.Add($x) } }
         return $all.ToArray()
     }
-    if ($sessionSel -eq 'Last') { return $withData[-1].ToArray() }
+    if ($sessionSel -eq 'Last') {
+        # 지금 돌고 있는 실행에 데이터가 없는데 예전 실행 것을 조용히 돌려주면,
+        # 재지 않은 값으로 임계값을 정하게 된다. 그 경우는 반드시 말해 준다.
+        if ($sessions[$sessions.Count - 1].Count -eq 0) {
+            $script:diag = "경고: 마지막 실행에는 데이터가 없어 그 이전 실행 것을 쓴다. " +
+                "지금 측정한 값이 아니다. bleDebugLog=1 인지 확인할 것."
+        }
+        return $withData[-1].ToArray()
+    }
     $n = 0
     if ([int]::TryParse($sessionSel, [ref]$n) -and $n -ge 1 -and $n -le $withData.Count) {
         return $withData[$n - 1].ToArray()
@@ -185,10 +210,15 @@ foreach ($p in $paths) {
     $samples = Read-RssiLog $p.Path $p.Kind $Session
     Write-Host ("[{0} 경로]  {1}" -f $p.Name, (Split-Path $p.Path -Leaf)) -ForegroundColor Cyan
     if ($samples.Count -eq 0) {
-        Write-Host "  이 세션에 데이터가 없다 (bleDebugLog=1 인지, 이 경로를 실제로 썼는지 확인)" -ForegroundColor DarkYellow
+        Write-Host ("  " + $script:diag) -ForegroundColor DarkYellow
+        Write-Host ("  경로: {0}" -f $p.Path) -ForegroundColor DarkGray
+        if ($p.Kind -eq 'gatt') {
+            Write-Host "  (GATT 경로는 폰 앱이 PC에 연결될 때만 쌓인다. 광고 경로만으로도 측정은 된다)" -ForegroundColor DarkGray
+        }
         Write-Host ""
         continue
     }
+    if ($script:diag) { Write-Host ("  " + $script:diag) -ForegroundColor Yellow }
     Write-Host ("  세션 전체 n={0}  {1} ~ {2}" -f $samples.Count, (Format-Clock $samples[0].T), (Format-Clock $samples[-1].T))
 
     if ($Timeline) {
