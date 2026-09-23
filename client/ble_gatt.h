@@ -52,6 +52,10 @@ public:
     // 마지막으로 구독이 끊긴 시각 (GetTickCount64). 끊긴 적 없으면 0
     ULONGLONG LostTick() const;
 
+    // 마지막 RSSI 보고 시각 (GetTickCount64). 보고가 없으면 0.
+    // 같은 값이면 같은 보고를 다시 보고 있는 것이다 - 판정에서 샘플을 셀 때 쓴다.
+    ULONGLONG LastReportTick() const;
+
     // RSSI 보고/연결 상태 변화 시 신호되는 auto-reset 이벤트 (판정 스레드 깨우기용)
     HANDLE ReportEvent() const;
 

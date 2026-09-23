@@ -395,6 +395,10 @@ static DWORD WINAPI ScanThread(LPVOID) {
     bool  cachedReachable = false;
     DWORD cachedLatency = 0;
     int   cachedErr = 0;
+    // 임계값 미만이 연속 몇 "샘플" 이어졌는지. 시간이 아니라 샘플 수로 센다.
+    int       belowCount = 0;
+    ULONGLONG belowFirstTick = 0;   // 이 구간의 첫 미만 샘플 시각 (상한 계산용)
+    ULONGLONG belowSampleTick = 0;  // 마지막으로 센 샘플의 식별자 (같으면 다시 세지 않는다)
     while (true) {
         bool reachable = false; DWORD latency = 0; int wsaErr = 0;
         bool isNear = false, bleAvail = false, useGatt = false;
@@ -488,13 +492,35 @@ static DWORD WINAPI ScanThread(LPVOID) {
 
         if (isNear) {
             g_lastNearTick = now;
+            belowCount = 0; belowFirstTick = 0; belowSampleTick = 0;
             if (g_proxState == ProxState::Far) g_proxState = ProxState::Near;
-        } else {
-            // BLE 모드: 패킷 사이에는 새 정보가 없으므로(스무딩 값 고정) 유예시간은 지연만 추가함 → 즉시 Far
-            // latency 모드: 측정값이 매번 흔들리므로 기존 유예시간 유지
-            ULONGLONG holdMs = bleAvail ? 0 : (ULONGLONG)g_keepAliveSec * 1000;
-            if (g_proxState == ProxState::Near && (now - g_lastNearTick) >= holdMs)
-                g_proxState = ProxState::Far;
+        } else if (g_proxState == ProxState::Near) {
+            bool goFar;
+            if (!bleAvail) {
+                // latency 모드: 측정값이 매번 흔들리므로 기존 유예시간 유지
+                goFar = (now - g_lastNearTick) >= (ULONGLONG)g_keepAliveSec * 1000;
+            } else if (rssi <= -100) {
+                // 약한 게 아니라 신호가 아예 없다 (수신 타임아웃, 또는 연결도 광고도 없음).
+                // 이건 페이딩이 아니라 부재이므로 기다릴 이유가 없다.
+                goFar = true;
+            } else {
+                // 패킷 사이에는 새 정보가 없다 - 그래서 시간 유예는 지연만 늘린다.
+                // 하지만 두 번째 패킷은 실제로 새 정보다. 그래서 시간이 아니라 샘플을 센다:
+                // 새 샘플이 연속 두 번 임계값 미만일 때만 잠근다. 단발 페이딩으로
+                // 앉아 있는 사람 앞에서 화면이 꺼지던 것이 이걸로 사라진다.
+                ULONGLONG sampleTick = useGatt ? g_bleGatt.LastReportTick()
+                                               : g_bleScanner.LastReceivedTick();
+                if (sampleTick != belowSampleTick) {
+                    if (belowCount == 0) belowFirstTick = now;
+                    belowSampleTick = sampleTick;
+                    ++belowCount;
+                }
+                // 두 번째 샘플을 무한정 기다리면 안 된다: 걸어나가면서 신호가 끊기면
+                // 다음 샘플이 영영 안 오고, 수신 타임아웃은 90초다. 상한을 둔다.
+                goFar = (belowCount >= 2) ||
+                        (now - belowFirstTick) >= BELOW_SAMPLE_CAP_MS;
+            }
+            if (goFar) g_proxState = ProxState::Far;
         }
         auto* r = new ProbeResult{};
         r->reachable = reachable; r->latencyMs = latency; r->wsaError = wsaErr;

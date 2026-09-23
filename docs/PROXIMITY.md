@@ -288,25 +288,59 @@ threshold — the second advertisement run puts the boundary six dB lower
 than the first. Taken together the two runs overlap: seated reaches −63
 and away reaches −61.
 
-### One sample below is a lock
+### Two samples below is a lock
 
-On the BLE paths there is no grace period. A single smoothed reading
-below the threshold moves the state to FAR, and `ActivateBlackScreen`
-follows the transition immediately:
+There is no *time* grace period on the BLE paths, and there should not be:
+the smoothed value does not move between packets, so waiting on a clock
+adds delay without adding evidence. `keepAliveSec` still applies only to
+the latency path.
+
+Counting *samples* is a different question, because the second packet is
+new evidence. The state machine requires two consecutive new samples
+below the threshold before it moves to FAR:
 
 ```c
-ULONGLONG holdMs = bleAvail ? 0 : (ULONGLONG)g_keepAliveSec * 1000;
+if (sampleTick != belowSampleTick) { if (belowCount == 0) belowFirstTick = now; ++belowCount; }
+goFar = (belowCount >= 2) || (now - belowFirstTick) >= BELOW_SAMPLE_CAP_MS;
 ```
 
-`keepAliveSec` applies only to the latency path. The reasoning holds:
-advertisements arrive a median of 1.7 s apart and sometimes twenty, the
-smoothed value does not move between them, so waiting adds delay without
-adding evidence.
+`sampleTick` is the arrival time of the packet or report that produced the
+reading, so re-judging the same smoothed value does not count twice. That
+distinction is the whole point: the scan loop also wakes on a timer, and
+counting loop iterations would reinstate exactly the time delay the
+paragraph above rejects.
 
-The consequence for choosing a threshold is blunt. **It has to sit below
-the lowest seated reading, not below some average or percentile of
-them.** One unlucky fade is a blanked screen in front of a user who
-never moved.
+The wait has to be bounded. A phone that goes quiet while its owner walks
+away may never deliver a second sample, and the receive timeout is 90 s;
+without a cap a real departure could hold the screen open for a minute and
+a half. `BELOW_SAMPLE_CAP_MS` is 6 s, just past the measured p90 packet gap
+of 5.8 s, so nine times in ten the second sample decides and the cap never
+binds. When it does bind, six seconds of silence is itself weak evidence of
+distance.
+
+Measured over every below-threshold run in the accumulated logs at −64:
+
+| path | runs | one sample only, now ignored | two or more | cap expiry |
+|---|---|---|---|---|
+| advertisement | 114 | **35** | 74 | 5 |
+| GATT | 23 | **4** | 19 | 0 |
+
+So about a third of advertisement-path locks were one unlucky packet. The
+price is a median 1.7 s of extra delay on a real departure, and at most
+six.
+
+The cost on a real departure was measured directly, in a walk-away test on
+the laptop at −64. The smoothed GATT value fell from −53 to −66 over four
+seconds and stayed there; the first below-threshold sample landed at
+17:38:37.8 and the second 2.0 s behind it, so the rule moves that lock to
+17:38:39.8. The screen blanked on a departure that had happened, two
+seconds later than before.
+
+What this does **not** fix is the shape of the seated distribution. A run
+of two is common wherever a run of one is, so **the threshold still has to
+sit below the lowest seated reading**. The rule buys a margin against
+single unlucky packets and nothing more; it is not a substitute for
+measuring.
 
 | run | path | lowest seated |
 |---|---|---|
@@ -343,6 +377,13 @@ seated reading against the highest away reading. Averages and
 percentiles both hide the one sample that blanks the screen.
 `ble_scan_log.csv` and `gatt_rssi_log.csv` hold what is needed when
 `bleDebugLog=1`.
+
+`tools/rssi-threshold.ps1` does the arithmetic. Given the segment times it
+reads both logs, trims the walk off either end, and replays the actual FAR
+rule over the samples, so what it reports is the highest threshold at which
+the seated run would not have locked — not a percentile. It defaults to the
+last session, which matters: both logs are appended to across runs, so the
+same clock time occurs in them many times over.
 
 The two paths track each other closely: matched within two seconds, the
 GATT reading is a median 2 dB stronger than the advertisement reading

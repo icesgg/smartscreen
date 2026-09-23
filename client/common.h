@@ -60,6 +60,13 @@ static constexpr DWORD CHART_WINDOW_MS = 30 * 60 * 1000;
 static constexpr int   CHART_HEIGHT    = 80;
 static constexpr DWORD WARMUP_MS       = 120000;
 
+// BLE 경로에서 임계값 미만 샘플 하나만으로 잠그지 않기 위한 상한.
+// 두 번째 샘플을 이 시간까지 기다렸다가, 그 안에 안 오면 하나로도 잠근다.
+// 광고 간격 실측이 중앙값 1.7초 / p90 5.8초(PROXIMITY.md)라 6초면 열 번 중
+// 아홉 번은 상한이 걸리기 전에 두 번째 샘플이 도착한다. 상한이 걸리는 나머지
+// 한 번은 6초간 광고가 아예 없었다는 뜻이라, 그 자체가 멀어졌다는 약한 증거다.
+static constexpr DWORD BELOW_SAMPLE_CAP_MS = 6000;
+
 // ---------------------------------------------------------------------------
 // User-configurable settings (global)
 // ---------------------------------------------------------------------------

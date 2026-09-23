@@ -354,4 +354,5 @@ DWORD BleGattServer::ReportAgeMs() const {
 }
 
 ULONGLONG BleGattServer::LostTick() const { return m_impl->lostTick; }
+ULONGLONG BleGattServer::LastReportTick() const { return m_impl->lastReportTick; }
 HANDLE BleGattServer::ReportEvent() const { return m_impl->reportEvent; }
