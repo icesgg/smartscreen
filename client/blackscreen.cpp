@@ -104,14 +104,14 @@ static LRESULT CALLBACK BannerProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM l
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC hdc = BeginPaint(hWnd, &ps);
         RECT rc; GetClientRect(hWnd, &rc);
+        // 이 창은 이미지가 있을 때만 만들어진다. 그래도 방어적으로 검게 채운다 -
+        // 예전처럼 자리표시자를 그리면, 만드는 조건이 나중에 바뀌었을 때
+        // 사용자 화면에 개발용 상자가 뜬다.
         if (s_imgBanner) {
             Gdiplus::Graphics gfx(hdc);
             gfx.DrawImage(s_imgBanner, 0, 0, rc.right, rc.bottom);
         } else {
-            HBRUSH br = CreateSolidBrush(RGB(40, 40, 60));
-            FillRect(hdc, &rc, br); DeleteObject(br);
-            SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, RGB(120, 120, 150));
-            DrawTextW(hdc, L"banner.png\n(300x400)\nimages\\", -1, &rc, DT_CENTER | DT_VCENTER | DT_WORDBREAK);
+            FillRect(hdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
         }
         EndPaint(hWnd, &ps); return 0;
     }
@@ -140,15 +140,20 @@ static LRESULT CALLBACK BlackScreenProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
                 hWnd, (HMENU)(UINT_PTR)IDC_BTN_RELEASE, GetModuleHandle(nullptr), nullptr);
             if (g_hFont) SendMessage(hBtn, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
-            int bannerW = 300, bannerH = 400;
-            POINT pt = { m.rc.left + mw - bannerW - 40, m.rc.top + 80 };
-            ClientToScreen(hWnd, &pt);
-            HWND hb = CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW, BANNER_CLASS, L"",
-                WS_POPUP | WS_VISIBLE | WS_BORDER,
-                pt.x, pt.y, bannerW, bannerH,
-                hWnd, nullptr, GetModuleHandle(nullptr), nullptr);
-            if (hb) s_banners.push_back(hb);
+            // 배너는 이미지가 있을 때만 만든다. 없으면 자리만 차지하는 빈 상자가
+            // 화면 오른쪽에 남는데, 그건 설정이 비었다는 개발용 표시였지
+            // 사용자에게 보일 것이 아니다.
+            if (s_imgBanner) {
+                int bannerW = 300, bannerH = 400;
+                POINT pt = { m.rc.left + mw - bannerW - 40, m.rc.top + 80 };
+                ClientToScreen(hWnd, &pt);
+                HWND hb = CreateWindowExW(
+                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW, BANNER_CLASS, L"",
+                    WS_POPUP | WS_VISIBLE | WS_BORDER,
+                    pt.x, pt.y, bannerW, bannerH,
+                    hWnd, nullptr, GetModuleHandle(nullptr), nullptr);
+                if (hb) s_banners.push_back(hb);
+            }
         }
 
         // 영상은 MFPlay 가 호스트 창을 가득 채우는 방식이라, 큰 창에 그대로
