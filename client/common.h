@@ -102,6 +102,9 @@ extern std::vector<FarEvent>     g_farEvents;
 extern HWND      g_hBlackScreen;
 extern bool      g_bBlackActive;
 extern bool      g_bManualLock;
+// 재보기 마법사가 도는 동안 참. 자리를 비우는 것이 절차의 일부라
+// 그냥 두면 재는 도중에 화면이 꺼진다.
+extern bool      g_measuring;
 extern int       g_nCountdown;
 extern int       g_unlockTimer;
 extern wchar_t   g_ovlInfo[128];

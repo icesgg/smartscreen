@@ -35,6 +35,7 @@ HHOOK     g_hKeyHook       = nullptr;
 int       g_nCountdown     = 20;
 bool      g_bBlackActive   = false;
 bool      g_bManualLock    = false;
+bool      g_measuring      = false;
 int       g_unlockTimer    = 0;
 wchar_t   g_ovlInfo[128]   = L"";
 ULONGLONG g_lockStartTick  = 0;

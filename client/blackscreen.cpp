@@ -286,6 +286,9 @@ void ActivateBlackScreen() {
     if (g_bBlackActive) return;
     // 방금 마우스/키보드를 썼다 = 사람이 앞에 있다 → RSSI와 무관하게 잠그지 않음
     if (g_lastInputTick != 0 && (GetTickCount64() - g_lastInputTick) < 5000) return;
+    // 재보기 중에는 자리를 비우는 것이 절차의 일부다. 여기서 잠그면 측정이
+    // 끊기고, 사용자는 자기가 뭘 잘못한 줄 안다.
+    if (g_measuring) return;
     // 원격으로 쓰는 중이면 폰이 책상에 없는 게 정상이다. 여기서 잠그면
     // 원격 사용자 화면만 가린다 - 가려야 할 책상 앞에는 아무도 없다.
     // 사용자가 직접 누른 잠금은 이 경로로 오지 않으므로 그대로 걸린다.

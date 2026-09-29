@@ -2196,6 +2196,312 @@ static void SimpleRefresh() {
     InvalidateRect(g_hSimple, nullptr, FALSE);
 }
 
+// ---------------------------------------------------------------------------
+// 재보기 마법사
+// ---------------------------------------------------------------------------
+// 거리 3단계가 근거를 갖게 만드는 곳이다. 같은 "보통"이 자리와 어댑터에 따라
+// 10~20 dB 달라져서, 재보지 않으면 3단계는 그냥 임의의 숫자다.
+//
+// 재는 김에 어댑터도 본다. 값싼 동글 중에 신호 세기를 제대로 내주지 않는 것이
+// 있는데, 드라이버는 멀쩡하다고 보고하므로 (docs/PROXIMITY.md 의 어댑터 표:
+// BARROT 두 종이 지원한다고 보고하고 동작하지 않았다) 실제로 재 보는 것
+// 말고는 확인할 방법이 없다. 여기서 안 걸러지면 사용자는 "왜 안 잠기지"를
+// 영영 알 수 없다.
+static constexpr int WZ_W = 440, WZ_H = 330;
+static constexpr int IDW_NEXT = 701, IDW_CANCEL = 702;
+static constexpr int IDT_WIZ = 31;
+
+// 걸어나가는 20초는 어느 쪽에도 넣지 않는다. 그 동안은 아직 신호가 세서
+// 섞으면 두 구간이 겹쳐 보인다 (dist/README.txt 4장과 같은 이유).
+static constexpr int kWzSeated = 60, kWzWalk = 20, kWzAway = 45;
+
+static HWND g_hWiz = nullptr, g_hWizProg = nullptr, g_hWizNext = nullptr;
+static int  g_wzPhase = 0;      // 0 안내 / 1 착석 / 2 이동 / 3 비움 / 4 결과
+static int  g_wzLeft = 0;
+static std::vector<int> g_wzSeated, g_wzAway;
+static ULONGLONG g_wzLastTick = 0;
+static std::wstring g_wzTitle, g_wzBody;
+static int  g_wzBase = 0;
+static bool g_wzOk = false;
+
+static void WzRange(const std::vector<int>& v, int& lo, int& hi) {
+    lo = 999; hi = -999;
+    for (int x : v) { lo = (std::min)(lo, x); hi = (std::max)(hi, x); }
+}
+
+// 새 패킷이 왔을 때만 한 번 센다. 같은 값을 반복해서 담으면 표본이 부풀어
+// 어댑터가 멀쩡한 것처럼 보인다 - 바로 그걸 찾으려는 참인데.
+static void WzCollect(std::vector<int>* into) {
+    ULONGLONG tick; int rssi;
+    if (g_bleGatt.IsHealthy() && g_bleGatt.LastReportTick() != 0) {
+        tick = g_bleGatt.LastReportTick(); rssi = g_bleGatt.GetRawRssi();
+    } else {
+        tick = g_bleScanner.LastReceivedTick(); rssi = g_bleScanner.GetRawRssi();
+    }
+    if (tick == 0 || tick == g_wzLastTick) return;
+    g_wzLastTick = tick;
+    if (rssi <= -100 || rssi >= 0) return;   // 측정값이 아니라 표식이다
+    if (into) into->push_back(rssi);
+}
+
+static void WzJudge() {
+    int sLo, sHi, aLo, aHi;
+    WzRange(g_wzSeated, sLo, sHi);
+    WzRange(g_wzAway, aLo, aHi);
+    int sn = (int)g_wzSeated.size(), an = (int)g_wzAway.size();
+    g_wzOk = false;
+    wchar_t buf[512];
+
+    if (sn < 15 || an < 8) {
+        g_wzTitle = L"신호를 거의 못 받았어요";
+        swprintf_s(buf,
+            L"앉아 있을 때 %d번, 비웠을 때 %d번밖에 못 받았어요.\n\n"
+            L"폰에서 SSBeacon 앱이 켜져 있는지, 그리고 이 컴퓨터의 블루투스가 "
+            L"켜져 있는지 확인해 주세요.", sn, an);
+        g_wzBody = buf;
+        DbgEvent(L"재보기: 표본 부족 (착석 %d, 비움 %d)", sn, an);
+        return;
+    }
+
+    // 값이 전혀 흔들리지 않으면 재고 있는 게 아니다. 진짜 무선 신호는 아무도
+    // 움직이지 않아도 1분이면 몇 dB 는 흔들린다.
+    if ((sHi - sLo) <= 1) {
+        g_wzTitle = L"이 블루투스 장치는 세기를 못 재요";
+        swprintf_s(buf,
+            L"1분 동안 %d번을 받았는데 값이 %d dBm 에서 거의 움직이지 않았어요.\n\n"
+            L"진짜로 재는 장치라면 가만히 있어도 값이 몇 칸은 흔들립니다. "
+            L"이 장치는 신호 세기를 흉내만 내고 있어서 거리로 쓸 수 없어요.\n\n"
+            L"다른 블루투스 동글로 바꾸는 게 좋습니다.", sn, sLo);
+        g_wzBody = buf;
+        DbgEvent(L"재보기: 어댑터가 세기를 안 낸다 (착석 %d개, %d..%d dBm)", sn, sLo, sHi);
+        return;
+    }
+
+    // 앉았을 때와 비웠을 때가 안 갈리면, 이 자리에서는 신호만으로 판단할 수 없다.
+    if (sLo - 2 <= aHi) {
+        g_wzTitle = L"앉아 있을 때와 비울 때가 구분되지 않아요";
+        swprintf_s(buf,
+            L"앉아 있을 때 %d~%d, 비웠을 때 %d~%d 로 겹칩니다.\n\n"
+            L"폰을 몸에 지니고 계셨다면 책상 위에 두고, 자리를 비울 때 더 멀리 "
+            L"가서 다시 해 보세요.", sLo, sHi, aLo, aHi);
+        g_wzBody = buf;
+        DbgEvent(L"재보기: 구간이 겹친다 (착석 %d..%d, 비움 %d..%d)", sLo, sHi, aLo, aHi);
+        return;
+    }
+
+    // "보통" 은 앉아 있을 때의 가장 약한 값보다 낮게 잡는다. 평균이 아니라
+    // 끝값을 보는 이유는, 한 번만 밑돌아도 앉은 사람 앞에서 화면이 꺼지기 때문이다.
+    g_wzBase = sLo - 2;
+    g_wzOk = true;
+    g_wzTitle = L"다 됐어요";
+    swprintf_s(buf,
+        L"앉아 있을 때  %d ~ %d\n"
+        L"자리 비웠을 때  %d ~ %d\n\n"
+        L"이 자리에 맞게 \"보통\" 을 맞췄어요. "
+        L"\"가까이\" 는 더 빨리 잠기고, \"멀리\" 는 더 늦게 잠깁니다.",
+        sLo, sHi, aLo, aHi);
+    g_wzBody = buf;
+    DbgEvent(L"재보기: 착석 %d..%d (%d개), 비움 %d..%d (%d개) -> 기준 %d dBm",
+             sLo, sHi, sn, aLo, aHi, an, g_wzBase);
+}
+
+static void WzSetPhase(int ph) {
+    g_wzPhase = ph;
+    g_wzLastTick = 0;
+    switch (ph) {
+    case 1: g_wzLeft = kWzSeated; break;
+    case 2: g_wzLeft = kWzWalk;   break;
+    case 3: g_wzLeft = kWzAway;   break;
+    case 4: WzJudge();            break;
+    }
+    if (g_hWizProg) {
+        SendMessageW(g_hWizProg, PBM_SETRANGE32, 0, (ph == 1 ? kWzSeated : ph == 2 ? kWzWalk : kWzAway));
+        SendMessageW(g_hWizProg, PBM_SETPOS, 0, 0);
+        ShowWindow(g_hWizProg, (ph >= 1 && ph <= 3) ? SW_SHOW : SW_HIDE);
+    }
+    if (g_hWizNext)
+        SetWindowTextW(g_hWizNext, ph == 0 ? L"시작하기" : ph == 4 ? (g_wzOk ? L"이대로 쓰기" : L"닫기") : L"");
+    if (g_hWizNext) ShowWindow(g_hWizNext, (ph == 0 || ph == 4) ? SW_SHOW : SW_HIDE);
+    if (g_hWiz) InvalidateRect(g_hWiz, nullptr, TRUE);
+}
+
+static LRESULT CALLBACK WizProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE: {
+        HINSTANCE hI = GetModuleHandle(nullptr);
+        g_hWizProg = CreateWindowExW(0, PROGRESS_CLASS, L"",
+            WS_CHILD | PBS_SMOOTH, 26, 186, WZ_W - 72, 8, hWnd, nullptr, hI, nullptr);
+        SendMessageW(g_hWizProg, PBM_SETBARCOLOR, 0, (LPARAM)kAccent);
+        SendMessageW(g_hWizProg, PBM_SETBKCOLOR, 0, (LPARAM)RGB(0xC4, 0xC4, 0xC4));
+
+        g_hWizNext = CreateWindowExW(0, L"BUTTON", L"시작하기",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 26, WZ_H - 96, WZ_W - 72, 42,
+            hWnd, (HMENU)(UINT_PTR)IDW_NEXT, hI, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"그만두기",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, WZ_W - 140, 14, 100, 30,
+            hWnd, (HMENU)(UINT_PTR)IDW_CANCEL, hI, nullptr);
+
+        EnumChildWindows(hWnd, [](HWND h, LPARAM f) -> BOOL {
+            SendMessage(h, WM_SETFONT, (WPARAM)f, TRUE); return TRUE;
+        }, (LPARAM)g_hFont);
+        SetTimer(hWnd, IDT_WIZ, 500, nullptr);
+        return 0;
+    }
+
+    case WM_ERASEBKGND: {
+        RECT rc; GetClientRect(hWnd, &rc);
+        if (!g_hPanelBrush) g_hPanelBrush = CreateSolidBrush(kPanelBg);
+        FillRect((HDC)wParam, &rc, g_hPanelBrush);
+        return 1;
+    }
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC hdc = BeginPaint(hWnd, &ps);
+        const wchar_t* title; const wchar_t* body;
+        wchar_t live[96] = L"";
+        switch (g_wzPhase) {
+        case 0:
+            title = L"내 자리에 맞게 재보기";
+            body  = L"2분쯤 걸려요. 폰은 평소 두는 자리에 그대로 두세요.\n"
+                    L"주머니에 넣고 다닌다면 주머니에 넣은 채로 하세요.";
+            break;
+        case 1:
+            title = L"1/3  자리에 앉아 계세요";
+            body  = L"컴퓨터를 건드리지 말고 그냥 앉아 계시면 돼요.";
+            swprintf_s(live, L"%d초 남음   ·   %d번 받음", g_wzLeft, (int)g_wzSeated.size());
+            break;
+        case 2:
+            title = L"2/3  이제 자리를 비워 주세요";
+            body  = L"화면이 안 보이는 곳까지 걸어가세요.\n걸어가는 동안은 재지 않아요.";
+            swprintf_s(live, L"%d초 남음", g_wzLeft);
+            break;
+        case 3:
+            title = L"3/3  그대로 계세요";
+            body  = L"곧 끝나요. 자리로 돌아오지 마세요.";
+            swprintf_s(live, L"%d초 남음   ·   %d번 받음", g_wzLeft, (int)g_wzAway.size());
+            break;
+        default:
+            title = g_wzTitle.c_str();
+            body  = g_wzBody.c_str();
+            break;
+        }
+
+        SetBkMode(hdc, TRANSPARENT);
+        RECT t = { 26, 56, WZ_W - 46, 96 };
+        HFONT of = (HFONT)SelectObject(hdc, g_hFontBig ? g_hFontBig : g_hFont);
+        SetTextColor(hdc, g_wzPhase == 4 && !g_wzOk ? RGB(0xC0, 0x30, 0x30) : kInk);
+        DrawTextW(hdc, title, -1, &t, DT_LEFT | DT_WORDBREAK);
+
+        SelectObject(hdc, g_hFont);
+        SetTextColor(hdc, kInkSoft);
+        RECT b = { 26, 104, WZ_W - 46, WZ_H - 110 };
+        DrawTextW(hdc, body, -1, &b, DT_LEFT | DT_WORDBREAK);
+
+        if (live[0]) {
+            SetTextColor(hdc, kAccent);
+            RECT l = { 26, 202, WZ_W - 46, 226 };
+            DrawTextW(hdc, live, -1, &l, DT_LEFT | DT_SINGLELINE);
+        }
+        SelectObject(hdc, of);
+        EndPaint(hWnd, &ps); return 0;
+    }
+
+    case WM_DRAWITEM: {
+        auto* di = (DRAWITEMSTRUCT*)lParam;
+        if (di->CtlType != ODT_BUTTON) break;
+        bool down = (di->itemState & ODS_SELECTED) != 0;
+        bool accent = (di->CtlID == IDW_NEXT);
+        wchar_t label[64] = L"";
+        GetWindowTextW(di->hwndItem, label, _countof(label));
+        COLORREF fill = accent ? (down ? kAccentDn : kAccent) : (down ? kTilePress : kPanelBg);
+        COLORREF edge = accent ? fill : kTileEdge;
+        COLORREF ink  = accent ? RGB(255, 255, 255) : kInkSoft;
+        DrawTile(di->hDC, di->rcItem, fill, edge, ink, label, g_hFont, accent ? 14 : 10);
+        return TRUE;
+    }
+
+    case WM_TIMER: {
+        if (wParam != IDT_WIZ) break;
+        if (g_wzPhase == 1) WzCollect(&g_wzSeated);
+        else if (g_wzPhase == 3) WzCollect(&g_wzAway);
+        else if (g_wzPhase == 2) WzCollect(nullptr);   // 걸어가는 중: 버린다
+
+        if (g_wzPhase >= 1 && g_wzPhase <= 3) {
+            static int half = 0;
+            if (++half >= 2) {   // 타이머는 0.5초, 카운트다운은 1초
+                half = 0;
+                if (--g_wzLeft <= 0) WzSetPhase(g_wzPhase + 1);
+                else {
+                    int total = (g_wzPhase == 1 ? kWzSeated : g_wzPhase == 2 ? kWzWalk : kWzAway);
+                    SendMessageW(g_hWizProg, PBM_SETPOS, total - g_wzLeft, 0);
+                }
+            }
+            InvalidateRect(hWnd, nullptr, TRUE);
+        }
+        return 0;
+    }
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDW_CANCEL) { DestroyWindow(hWnd); return 0; }
+        if (LOWORD(wParam) == IDW_NEXT) {
+            if (g_wzPhase == 0) {
+                g_wzSeated.clear(); g_wzAway.clear();
+                WzSetPhase(1);
+            } else if (g_wzPhase == 4) {
+                if (g_wzOk) {
+                    AppConfig c; LoadAppConfig(c);
+                    c.measuredBaseRssi = g_wzBase;
+                    SaveAppConfig(c);
+                    SimpleApplyDist(SimpleDistStep());   // 새 기준으로 다시 계산
+                    SimpleRefresh();
+                }
+                DestroyWindow(hWnd);
+            }
+        }
+        return 0;
+
+    case WM_CLOSE: DestroyWindow(hWnd); return 0;
+
+    case WM_DESTROY:
+        KillTimer(hWnd, IDT_WIZ);
+        g_hWiz = nullptr; g_hWizProg = nullptr; g_hWizNext = nullptr;
+        g_measuring = false;      // 다시 잠길 수 있게
+        if (g_hSimple) { EnableWindow(g_hSimple, TRUE); SetForegroundWindow(g_hSimple); }
+        return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+static void OpenWizard(HWND parent) {
+    if (g_hWiz) { SetForegroundWindow(g_hWiz); return; }
+    if (!g_monitoring) {
+        MessageBoxW(parent,
+            L"먼저 보호를 켜야 신호를 받을 수 있어요.\n[고급 설정] 에서 시작을 눌러 주세요.",
+            L"내 자리에 맞게 재보기", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSEXW wc = {}; wc.cbSize = sizeof(wc); wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc = WizProc; wc.hInstance = GetModuleHandle(nullptr);
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"SmartScreenWizard";
+        RegisterClassExW(&wc); reg = true;
+    }
+    RECT pr; GetWindowRect(parent, &pr);
+    g_wzPhase = 0; g_wzOk = false;
+    g_wzSeated.clear(); g_wzAway.clear();
+    // 재는 동안 화면이 꺼지면 측정이 끊긴다. 자리를 비우는 것이 절차의 일부라
+    // 그냥 두면 반드시 꺼진다.
+    g_measuring = true;
+    g_hWiz = CreateWindowExW(0, L"SmartScreenWizard", L"내 자리에 맞게 재보기",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        pr.left + 20, pr.top + 60, WZ_W, WZ_H,
+        parent, nullptr, GetModuleHandle(nullptr), nullptr);
+    if (g_hWiz) { ShowWindow(g_hWiz, SW_SHOW); WzSetPhase(0); }
+    else g_measuring = false;
+}
+
 static LRESULT CALLBACK SimpleProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
@@ -2417,7 +2723,7 @@ static LRESULT CALLBACK SimpleProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
         case IDS_PHONE:   SendMessageW(g_hWnd, WM_COMMAND, ID_BTN_REGISTER_PHONE, 0); SimpleRefresh(); break;
         case IDS_IMAGE:   SendMessageW(g_hWnd, WM_COMMAND, ID_BTN_CENTER_IMG, 0); break;
         case IDS_LOCKNOW: SendMessageW(g_hWnd, WM_COMMAND, ID_BTN_BLACKNOW, 0); break;
-        case IDS_MEASURE: MessageBoxW(hWnd, L"재보기는 다음 단계에서 붙입니다.", L"SmartScreen", MB_OK); break;
+        case IDS_MEASURE: OpenWizard(hWnd); break;
         }
         return 0;
     }
