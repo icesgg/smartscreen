@@ -65,6 +65,14 @@ BARROT 칩 동글 2종은 "지원함"이라고 보고하고도 동작하지 않�
    → Info.plist `UIBackgroundModes` 에 두 값이 모두 있어야 한다
 3. Info → `Privacy - Bluetooth Always Usage Description` 추가
 
+계정 연동(구글 로그인)에는 **추가 설정이 없다.** `ASWebAuthenticationSession`
+이 콜백 스킴(`ssbeacon://`)을 직접 가로채므로 Info.plist 의 URL Types 에
+등록하지 않아도 된다. 찾지 말 것.
+
+다만 App Store 심사 지침 4.8 은 서드파티 소셜 로그인을 넣은 앱에
+Sign in with Apple 도 함께 제공할 것을 요구한다. 구글만 넣은 채로
+제출하면 리젝 사유가 될 수 있다 (Supabase 는 Apple provider 도 지원한다).
+
 ## 테스트 주의
 
 - Xcode 디버거가 붙어 있으면 백그라운드 동작이 실제와 다르다.
