@@ -229,6 +229,8 @@ static void UpdateOverlayState() {
     } else if (g_bBlackActive) {
         if (g_unlockTimer > 0)
             swprintf_s(g_ovlLine2, L"\xC7A0\xAE08  \u2022  %d\xCD08 \xD6C4 \xD574\xC81C", g_unlockTimer);  // 잠금 · Ns 후 해제
+        else if (g_bManualLock)
+            wcscpy_s(g_ovlLine2, L"잠금  •  [해제] 를 눌러야 풀립니다");
         else
             wcscpy_s(g_ovlLine2, L"\xC7A0\xAE08");  // 잠금
         g_ovlColor = RGB(235, 70, 70);
@@ -894,8 +896,13 @@ static void OnResult(ProbeResult* r) {
     }
     if(g_hChart)InvalidateRect(g_hChart,nullptr,FALSE);
 
-    // BT NEAR + black screen active -> start unlock delay (both Auto and Manual)
-    if (r->state == ProxState::Near && g_bBlackActive && g_unlockTimer <= 0) {
+    // 폰이 돌아오면 자동으로 풀어 준다. 단 사용자가 직접 잠근 것은 예외다 -
+    // 그건 "자리에 있어도 가려 두겠다"는 명시적 의사라, 폰이 곁에 있다는
+    // 이유로 되돌리면 그 의사를 뒤집는 것이 된다. 풀려면 [해제] 를 누른다.
+    //
+    // g_bManualLock 은 두 잠금 버튼이 세팅해 왔지만 아무도 읽지 않았다.
+    // 그래서 지금까지 수동 잠금도 자동으로 풀렸다.
+    if (r->state == ProxState::Near && g_bBlackActive && !g_bManualLock && g_unlockTimer <= 0) {
         g_unlockTimer = g_unlockDelaySec;
         if (g_unlockTimer <= 0) DeactivateBlackScreen(); // delay=0 -> instant
     }
@@ -1354,6 +1361,13 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                     ActivateBlackScreen();
                 }
             }
+            // 잠긴 뒤에 원격으로 붙었다면 풀어 준다. 자리를 비웠다가 원격으로
+            // 들어오는 것이 흔한 순서인데, 안 풀면 원격 화면이 검은 채로 시작한다.
+            // 직접 잠근 것은 건드리지 않는다 - 원격이든 아니든 그 의사가 우선이다.
+            if (g_bBlackActive && !g_bManualLock && IsRemoteSession()) {
+                DbgEvent(L"원격 세션이 감지되어 잠금을 푼다");
+                DeactivateBlackScreen();
+            }
             if (g_bBlackActive && g_unlockTimer > 0) {
                 g_unlockTimer--;
                 if (g_unlockTimer <= 0) DeactivateBlackScreen();
@@ -1361,6 +1375,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             wchar_t cdl[96];
             if (g_bBlackActive && g_unlockTimer > 0)
                 swprintf_s(cdl, L"  \xC7A0\xAE08 - %d\xCD08 \xD6C4 \xD574\xC81C", g_unlockTimer);  // 잠금 - N초 후 해제
+            else if (g_bBlackActive && g_bManualLock)
+                wcscpy_s(cdl, L"  직접 잠금 - [해제] 필요");
             else if (g_bBlackActive)
                 swprintf_s(cdl, L"  \xC7A0\xAE08 \xC911");  // 잠금 중
             else if (g_proxState == ProxState::Near)

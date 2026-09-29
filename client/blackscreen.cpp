@@ -6,6 +6,9 @@
 static constexpr int IDC_BTN_RELEASE = 301;
 static constexpr int IDT_VIDEO_TICK  = 20;
 static bool s_videoMode = false;
+// 원격이라 건너뛰었다는 기록을 한 번만 남기기 위한 것. 이게 없으면
+// 자리를 비운 내내 2초마다 같은 줄이 쌓인다.
+static bool s_remoteNoted = false;
 
 static Gdiplus::Image* s_imgCenter = nullptr;
 static Gdiplus::Image* s_imgBanner = nullptr;
@@ -192,10 +195,31 @@ void RegisterBlackScreenClasses(HINSTANCE hInst) {
 // ---------------------------------------------------------------------------
 // Activate / Deactivate
 // ---------------------------------------------------------------------------
+// 이 세션이 원격으로 표시되고 있는지 (원격 데스크톱/터미널 서비스).
+// 세션이 원격으로 연결/재연결되면 값이 바뀌므로 그때그때 물어본다.
+//
+// 이 판정은 RDP 계열만 안다. TeamViewer, AnyDesk, Chrome 원격 데스크톱 같은
+// 도구는 콘솔 세션을 그대로 쓰기 때문에 여기 걸리지 않는다. 그런 도구를
+// 쓴다면 별도 판정이 필요하다 - 지금 코드는 모르는 척하지 않고 모른다.
+bool IsRemoteSession() {
+    return GetSystemMetrics(SM_REMOTESESSION) != 0;
+}
+
 void ActivateBlackScreen() {
     if (g_bBlackActive) return;
     // 방금 마우스/키보드를 썼다 = 사람이 앞에 있다 → RSSI와 무관하게 잠그지 않음
     if (g_lastInputTick != 0 && (GetTickCount64() - g_lastInputTick) < 5000) return;
+    // 원격으로 쓰는 중이면 폰이 책상에 없는 게 정상이다. 여기서 잠그면
+    // 원격 사용자 화면만 가린다 - 가려야 할 책상 앞에는 아무도 없다.
+    // 사용자가 직접 누른 잠금은 이 경로로 오지 않으므로 그대로 걸린다.
+    if (IsRemoteSession()) {
+        if (!s_remoteNoted) {
+            DbgEvent(L"원격 세션이라 자동 잠금을 건너뛴다");
+            s_remoteNoted = true;
+        }
+        return;
+    }
+    s_remoteNoted = false;
     if (g_proxState == ProxState::Near) {
         g_nCountdown = g_idleCountdownSec;
         return;
