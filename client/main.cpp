@@ -19,6 +19,7 @@
 #include "irk.h"
 #include "ble_ident.h"
 #include "enterprise/supabase.h"
+#include "enterprise/auth.h"
 
 // ---------------------------------------------------------------------------
 // UI IDs
@@ -43,6 +44,27 @@ static constexpr int ID_BTN_ENTERPRISE = 217;
 static constexpr int ID_BTN_IMPORT_IRK = 218;
 static constexpr int ID_BTN_REGISTER_PHONE = 219;
 static constexpr UINT WM_SCAN_RESULT = WM_USER + 100;
+// 구글 로그인은 사용자가 브라우저에서 시간을 쓰므로 몇 분이 걸린다.
+// UI 스레드에서 부르면 그동안 창이 멎으므로 작업 스레드에서 돌리고 결과만 보낸다.
+static constexpr UINT WM_LOGIN_RESULT = WM_USER + 101;
+
+// 제품이 쓰는 Supabase 프로젝트. config 에 값이 있으면 그쪽이 이긴다.
+// anon key 가 여기 박혀 있는 것은 설계대로다 - 공개되도록 만들어진 값이고,
+// device_tokens 를 지키는 것은 키가 아니라 RLS 다 (supabase/device_tokens.sql).
+static const wchar_t* kDefaultSupabaseUrl =
+    L"https://vnonoschrzbgvyeduosm.supabase.co";
+static const wchar_t* kDefaultAnonKey =
+    L"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZub25vc2NocnpiZ3Z5ZWR1b3NtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU2NzkyNjQsImV4cCI6MjA5MTI1NTI2NH0.KqkmH7UtcR4ihFDMmAMfWRH0O2P2s__Jglzr5QWIzfc";
+
+// 로그인 스레드가 UI 로 돌려보내는 결과
+struct LoginResult {
+    bool         ok = false;
+    std::wstring err;
+    std::wstring email;
+    std::wstring userId;
+    std::wstring refresh;    // DPAPI 로 봉해진 값
+    std::wstring phoneToken; // 비어 있으면 "폰에서 아직 로그인 안 함"
+};
 
 // New combo IDs for simplified settings
 static constexpr int ID_COMBO_DISTANCE = 220;
@@ -537,6 +559,39 @@ static DWORD WINAPI ScanThread(LPVOID) {
         HANDLE waits[3] = { g_hStopEvent, g_bleScanner.PacketEvent(), g_bleGatt.ReportEvent() };
         if (WaitForMultipleObjects(3, waits, FALSE, g_scanIntervalSec * 1000) == WAIT_OBJECT_0) break;
     }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// 구글 로그인 (작업 스레드)
+// ---------------------------------------------------------------------------
+// 브라우저에서 사용자가 쓰는 시간이 있어 최악 몇 분이다. UI 스레드에서 부르면
+// 그동안 설정 창이 통째로 멎으므로, 여기서 돌리고 결과만 창으로 보낸다.
+static volatile bool g_loginBusy = false;
+
+static DWORD WINAPI LoginThread(LPVOID) {
+    AppConfig cfg;
+    LoadAppConfig(cfg);
+    std::wstring url = cfg.serverUrl.empty() ? kDefaultSupabaseUrl : cfg.serverUrl;
+    std::wstring key = cfg.anonKey.empty() ? kDefaultAnonKey : cfg.anonKey;
+
+    auto* r = new LoginResult{};
+    AuthSession s;
+    if (!SignInWithGoogle(url, key, s, r->err)) {
+        PostMessage(g_hWnd, WM_LOGIN_RESULT, 0, (LPARAM)r);
+        return 0;
+    }
+    // 여기까지 왔으면 로그인은 됐다. 뒤에서 무엇이 실패하든 세션은 저장할 값이다.
+    r->ok = true;
+    r->email = s.email;
+    r->userId = s.userId;
+    ProtectSecret(s.refreshToken, r->refresh);
+
+    std::wstring token, err;
+    if (!FetchDeviceToken(url, key, s, token, err)) r->err = err;
+    else r->phoneToken = token;   // 빈 값일 수 있다 = 폰에서 아직 로그인 안 함
+
+    PostMessage(g_hWnd, WM_LOGIN_RESULT, 0, (LPARAM)r);
     return 0;
 }
 
@@ -1335,6 +1390,36 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         case ID_BT_SETTINGS:
             ShellExecuteW(nullptr,L"open",L"ms-settings:bluetooth",nullptr,nullptr,SW_SHOW);break;
         case ID_BTN_REGISTER_PHONE: {
+            // 등록하는 방법이 둘이다. 목적이 같으므로 버튼을 늘리지 않고 여기서 고른다.
+            //  - 계정: 폰과 PC 가 같은 구글 계정으로 로그인하면 서버가 같은 토큰을 준다.
+            //          블루투스도, 앱을 화면에 띄울 필요도 없다.
+            //  - 블루투스: 예전 방식. 인터넷이 없어도 되고 서버가 죽어도 된다.
+            int how = MessageBoxW(hWnd,
+                L"어떻게 등록할까요?\n\n"
+                L"[예]  구글 계정으로 등록  (권장)\n"
+                L"       아이폰 앱에서도 같은 계정으로 로그인하면 끝납니다.\n"
+                L"       폰을 가까이 둘 필요도, 앱을 띄울 필요도 없습니다.\n\n"
+                L"[아니오]  블루투스로 직접 등록\n"
+                L"       앱을 화면에 띄우고 폰을 PC 가까이 두세요.\n"
+                L"       인터넷 없이 됩니다.",
+                L"폰 등록", MB_YESNOCANCEL | MB_ICONQUESTION);
+            if (how == IDCANCEL) break;
+            if (how == IDYES) {
+                if (g_loginBusy) {
+                    MessageBoxW(hWnd, L"이미 로그인 중입니다.\n브라우저 창을 확인하세요.",
+                                L"폰 등록", MB_OK | MB_ICONINFORMATION);
+                    break;
+                }
+                MessageBoxW(hWnd,
+                    L"브라우저가 열립니다. 구글 계정으로 로그인하세요.\n\n"
+                    L"로그인이 끝나면 브라우저 창을 닫고 여기로 돌아오면 됩니다.",
+                    L"폰 등록", MB_OK | MB_ICONINFORMATION);
+                g_loginBusy = true;
+                EnableWindow(GetDlgItem(hWnd, ID_BTN_REGISTER_PHONE), FALSE);
+                // 브라우저에서 보내는 시간이 있어 UI 스레드에서 부르면 창이 멎는다
+                CloseHandle(CreateThread(nullptr, 0, LoginThread, nullptr, 0, nullptr));
+                break;
+            }
             // 폰이 GATT 로 내주는 토큰을 한 번 읽어 저장해 둔다 (ble_ident.h).
             // 앱을 화면에 띄워 두는 것이 조건이다 - 포그라운드 광고에만 이름과
             // 서비스 UUID 가 실려 후보가 모호하지 않다. 잠긴 폰으로 등록하면 남의 폰을 집을 수 있다.
@@ -1831,6 +1916,61 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_SCAN_RESULT:{
         auto*r=(ProbeResult*)lParam;OnResult(r);
         InvalidateRect(g_hStateLabel,nullptr,TRUE);delete r;break;
+    }
+    case WM_LOGIN_RESULT: {
+        auto* r = (LoginResult*)lParam;
+        g_loginBusy = false;
+        EnableWindow(GetDlgItem(hWnd, ID_BTN_REGISTER_PHONE), TRUE);
+
+        if (!r->ok) {
+            DbgEvent(L"google login failed: %s", r->err.c_str());
+            MessageBoxW(hWnd,
+                (L"로그인하지 못했습니다.\n\n" + r->err).c_str(),
+                L"폰 등록", MB_OK | MB_ICONWARNING);
+            delete r; break;
+        }
+
+        AppConfig c; LoadAppConfig(c);
+        if (c.serverUrl.empty()) c.serverUrl = kDefaultSupabaseUrl;
+        if (c.anonKey.empty())   c.anonKey   = kDefaultAnonKey;
+        c.authRefresh = r->refresh;
+        c.authUserId  = r->userId;
+        c.authEmail   = r->email;
+        if (!r->phoneToken.empty()) {
+            c.phoneToken  = r->phoneToken;
+            c.phoneOvfBit = -1;   // 비트는 잠긴 폰을 처음 탐색할 때 배운다
+        }
+        SaveAppConfig(c);
+        DbgEvent(L"google login: %s (phone token: %s)", r->email.c_str(),
+                 r->phoneToken.empty() ? L"none yet" : L"received");
+
+        if (!r->err.empty()) {
+            // 로그인은 됐는데 토큰 조회가 실패했다. 다시 로그인시킬 일은 아니다.
+            MessageBoxW(hWnd,
+                (L"" + r->email + L" 로 로그인했습니다.\n\n"
+                 L"다만 폰 정보를 가져오지 못했습니다:\n" + r->err +
+                 L"\n\n잠시 뒤 다시 시도하세요.").c_str(),
+                L"폰 등록", MB_OK | MB_ICONWARNING);
+        } else if (r->phoneToken.empty()) {
+            // 오류가 아니다. 순서상 폰이 아직 안 올라온 것뿐이라 그렇게 말해 준다.
+            MessageBoxW(hWnd,
+                (L"" + r->email + L" 로 로그인했습니다.\n\n"
+                 L"아직 이 계정에 등록된 폰이 없습니다.\n"
+                 L"아이폰에서 SSBeacon 앱을 열고 같은 계정으로 로그인한 뒤,\n"
+                 L"여기서 다시 [폰 등록] 을 누르세요.").c_str(),
+                L"폰 등록", MB_OK | MB_ICONINFORMATION);
+        } else {
+            g_targetAddr = 0;
+            PopulateCombo();
+            std::wstring head = r->phoneToken.substr(
+                0, (std::min)((size_t)8, r->phoneToken.size()));
+            MessageBoxW(hWnd,
+                (L"폰을 등록했습니다.\n\n계정 " + r->email +
+                 L"\n기기 토큰 " + head +
+                 L"\n\n이 계정으로 로그인하면 다른 PC 에서도 같은 폰을 알아봅니다.").c_str(),
+                L"폰 등록", MB_OK | MB_ICONINFORMATION);
+        }
+        delete r; break;
     }
 
     case WM_SIZE:{

@@ -34,6 +34,12 @@ struct AppConfig {
     int unlockDelaySec = 0;
     std::wstring centerImagePath;
     std::wstring bannerImagePath;
+    // 구글 로그인 세션 (client/enterprise/auth.h 참고).
+    // authRefresh 는 DPAPI 로 봉해서 넣는다 - 이 파일은 %APPDATA% 의 평문이고,
+    // 리프레시 토큰은 폰 토큰과 달리 계정 자체를 여는 값이다.
+    std::wstring authRefresh;
+    std::wstring authUserId;
+    std::wstring authEmail;     // 누구로 로그인했는지 보여주기 위한 것뿐
     // Enterprise
     std::wstring orgId;
     std::wstring serverUrl;
