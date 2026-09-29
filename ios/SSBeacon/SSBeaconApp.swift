@@ -143,11 +143,23 @@ final class LinkManager: NSObject, ObservableObject,
 
         token = d
         UserDefaults.standard.set(d, forKey: kTokenDefaultsKey)
-        tokenText = d.prefix(4).map { String(format: "%02X", $0) }.joined()
 
+        // tokenText 는 여기서 건드리지 않는다. 화면의 값은 "폰이 실제로 내주는 값"
+        // 이어야 하고, 그건 add() 가 성공한 뒤 didAdd 에서만 알 수 있다. 먼저 써 두면
+        // 서비스를 다시 올리지 못한 폰이 새 토큰을 내준다고 거짓말을 하는데,
+        // 재설치 시험에서 폰 쪽에 보이는 값은 이것 하나뿐이다.
+        advText = "토큰 적용 중"
+        isAdvertising = false
+        identAdded = false
+
+        // 계정 등록은 블루투스를 쓰지 않으므로 라디오가 꺼진 채로 여기 올 수 있다.
+        // 값은 이미 저장했으니, 켜지면 didUpdateState 가 새 토큰으로 올려 준다.
+        guard peripheralMgr.state == .poweredOn else {
+            advText = "Bluetooth 를 켜면 새 토큰으로 광고합니다"
+            return
+        }
         if peripheralMgr.isAdvertising { peripheralMgr.stopAdvertising() }
         peripheralMgr.removeAllServices()
-        identAdded = false
         addIdentService()      // didAdd 콜백이 광고를 다시 시작한다
     }
 
@@ -174,7 +186,10 @@ final class LinkManager: NSObject, ObservableObject,
 
     func peripheralManager(_ p: CBPeripheralManager, didAdd service: CBService, error: Error?) {
         if let error = error {
+            // 광고는 신원 서비스가 올라간 뒤에만 시작하므로, 여기서 실패하면
+            // 폰은 아무것도 내주지 않는다. 등이 켜진 채로 두면 안 된다.
             advText = "신원 서비스 등록 실패: \(error.localizedDescription)"
+            isAdvertising = false
             return
         }
         guard service.uuid == kIdentUUID else { return }
