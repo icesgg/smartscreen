@@ -397,6 +397,51 @@ the seated run would not have locked — not a percentile. It defaults to the
 last session, which matters: both logs are appended to across runs, so the
 same clock time occurs in them many times over.
 
+### Measuring from inside the app
+
+The procedure above is what the app now runs for the user. Sixty seconds
+seated, then the phone is carried to the spot where the screen should go
+dark and left there, then forty-five seconds with the phone away. The
+person walks, not the instructions: telling someone to leave with the
+phone puts the remaining steps on a screen nobody is standing in front
+of. The walk is ended by a button rather than a timer, because how long
+it takes is a property of the desk.
+
+A phone resting on a surface reads stronger than one in a pocket. The
+threshold is taken from the seated floor, so that difference cannot
+loosen the result; it only makes the overlap check below stricter.
+
+Locking is suppressed while measuring — leaving the desk is step two, so
+without that the screen blanks halfway through every run.
+
+The wizard writes nothing it does not believe, and says which of three
+things went wrong:
+
+- **too few packets.** The phone app is not running, or the radio is not
+  hearing it. Registration is checked before any of this starts, because
+  an unregistered phone produces no matched packets at all and the
+  symptom would point at the radio instead.
+- **readings that never move.** Real RSSI wanders several dB in a minute
+  with nobody moving. A run that stays inside one or two dB is an adapter
+  reporting a number rather than measuring one — the same class of fault
+  as the BARROT dongles in the table above, which reported a capability
+  the driver could not deliver. Nothing short of measuring catches it,
+  which is why this check lives here and not in `BtCheck`.
+- **seated and away overlapping.** This desk cannot be told apart by
+  signal with the phone where it was put.
+
+Only the last of those is the user's to fix, so only that one suggests
+moving the phone; the middle one says to change the dongle.
+
+What it sets is the **base**, and the simple window's three distance steps
+are offsets from it. That indirection exists because the steps cannot be
+absolute: the same "normal" moves 10 to 20 dB between desks and adapters.
+A fresh measurement always lands on the middle step. Picking the step
+nearest the previous threshold looks reasonable and is not — the base has
+just changed, so the comparison means nothing, and measuring twice in a
+row was enough to land on the near step, which sits above the seated floor
+and blanks the screen in front of someone sitting still.
+
 The two paths track each other closely: matched within two seconds, the
 GATT reading is a median 2 dB stronger than the advertisement reading
 (p5 −4, p95 +8, n=245). Measuring one and borrowing the other is

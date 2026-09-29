@@ -2183,6 +2183,9 @@ static void SimpleRefresh() {
         wcscpy_s(buf, L"아직 등록하지 않았어요");
     }
     SetWindowTextW(g_hSimplePhone, buf);
+    // 등록하기 전에 "바꾸기" 라고 쓰여 있으면 무엇을 누르라는 건지 알 수 없다
+    HWND phoneBtn = GetDlgItem(g_hSimple, IDS_PHONE);
+    if (phoneBtn) SetWindowTextW(phoneBtn, c.phoneToken.empty() ? L"등록하기" : L"바꾸기");
 
     SendMessageW(g_hSimpleDist, TBM_SETPOS, TRUE, SimpleDistStep());
 
