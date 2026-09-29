@@ -96,6 +96,7 @@ bool LoadAppConfig(AppConfig& cfg) {
     if (m.count(L"unlockDelaySec")) cfg.unlockDelaySec = _wtoi(m[L"unlockDelaySec"].c_str());
     if (m.count(L"centerImagePath")) cfg.centerImagePath = m[L"centerImagePath"];
     if (m.count(L"bannerImagePath")) cfg.bannerImagePath = m[L"bannerImagePath"];
+    if (m.count(L"measuredBaseRssi")) cfg.measuredBaseRssi = _wtoi(m[L"measuredBaseRssi"].c_str());
     if (m.count(L"authRefresh")) cfg.authRefresh = m[L"authRefresh"];
     if (m.count(L"authUserId")) cfg.authUserId = m[L"authUserId"];
     if (m.count(L"authEmail")) cfg.authEmail = m[L"authEmail"];
@@ -158,6 +159,7 @@ void SaveAppConfig(const AppConfig& cfg) {
     swprintf_s(buf, L"%d", cfg.unlockDelaySec); m[L"unlockDelaySec"] = buf;
     m[L"centerImagePath"] = cfg.centerImagePath;
     m[L"bannerImagePath"] = cfg.bannerImagePath;
+    swprintf_s(buf, L"%d", cfg.measuredBaseRssi); m[L"measuredBaseRssi"] = buf;
     m[L"authRefresh"] = cfg.authRefresh;
     m[L"authUserId"] = cfg.authUserId;
     m[L"authEmail"] = cfg.authEmail;

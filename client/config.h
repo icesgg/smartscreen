@@ -34,6 +34,10 @@ struct AppConfig {
     int unlockDelaySec = 0;
     std::wstring centerImagePath;
     std::wstring bannerImagePath;
+    // 간단 화면의 거리 3단계가 기준으로 삼는 값. 재보기로 정해진다.
+    // 0 = 아직 안 재봤음 - 그러면 3단계는 근거 없는 대략값이라, 화면에서 그렇게 말해 준다.
+    // 같은 "보통"이 자리와 어댑터에 따라 10~20 dB 달라지므로 고정값으로 둘 수 없다.
+    int measuredBaseRssi = 0;
     // 구글 로그인 세션 (client/enterprise/auth.h 참고).
     // authRefresh 는 DPAPI 로 봉해서 넣는다 - 이 파일은 %APPDATA% 의 평문이고,
     // 리프레시 토큰은 폰 토큰과 달리 계정 자체를 여는 값이다.

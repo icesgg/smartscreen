@@ -48,6 +48,11 @@ static constexpr UINT WM_SCAN_RESULT = WM_USER + 100;
 // UI 스레드에서 부르면 그동안 창이 멎으므로 작업 스레드에서 돌리고 결과만 보낸다.
 static constexpr UINT WM_LOGIN_RESULT = WM_USER + 101;
 
+// 기본으로 열리는 간단 창. 만드는 곳과 창 프로시저는 아래 "간단 화면" 절에 있다.
+// 오버레이의 [설정] 이 이 창을 열기 때문에 여기서 미리 알려 둔다.
+HWND g_hSimple = nullptr;
+static void SimpleRefresh();
+
 // 제품이 쓰는 Supabase 프로젝트. config 에 값이 있으면 그쪽이 이긴다.
 // anon key 가 여기 박혀 있는 것은 설계대로다 - 공개되도록 만들어진 값이고,
 // device_tokens 를 지키는 것은 키가 아니라 RLS 다 (supabase/device_tokens.sql).
@@ -293,8 +298,12 @@ static LRESULT CALLBACK OverlayProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             }
             break;
         case ID_OVL_SETTINGS:
-            ShowWindow(g_hWnd, SW_SHOW);
-            SetForegroundWindow(g_hWnd);
+            // 간단 창이 사용자가 보는 창이다. 고급 창은 거기서 연다.
+            if (g_hSimple) {
+                ShowWindow(g_hSimple, SW_SHOW); SetForegroundWindow(g_hSimple); SimpleRefresh();
+            } else {
+                ShowWindow(g_hWnd, SW_SHOW); SetForegroundWindow(g_hWnd);
+            }
             break;
         }
         return 0;
@@ -2063,6 +2072,261 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 }
 
 // ---------------------------------------------------------------------------
+// 간단 화면
+// ---------------------------------------------------------------------------
+// 기본으로 열리는 창. 지금까지의 설정 창은 [고급 설정] 으로 물러난다.
+//
+// 그 창은 dBm 과 이벤트 표를 그대로 보여주는데, 그건 이 프로그램을 만든
+// 사람에게나 읽히는 화면이다. 쓰는 사람이 정해야 하는 것은 사실 셋뿐이다:
+// 내 폰이 무엇이고, 얼마나 멀어지면 가리고, 몇 초 뒤에 가리는가.
+//
+// 명령은 대부분 고급 창으로 넘긴다. 폰 등록이나 그림 고르기를 여기서 다시
+// 구현하면 두 벌이 되고, 한쪽만 고쳐지는 날이 온다.
+static constexpr int SW_W = 430, SW_H = 600;
+static constexpr int IDS_ADVANCED   = 601;
+static constexpr int IDS_PHONE      = 602;
+static constexpr int IDS_DIST       = 603;   // 트랙바
+static constexpr int IDS_MEASURE    = 604;
+static constexpr int IDS_IDLE_BASE  = 610;   // 610..613 = 바로/15초/30초/1분
+static constexpr int IDS_IMAGE      = 620;
+static constexpr int IDS_LOCKNOW    = 621;
+static constexpr int IDT_SIMPLE     = 30;
+
+static HWND g_hSimplePhone = nullptr, g_hSimpleDist = nullptr;
+static HWND g_hSimpleIdle[4] = {};
+static HWND g_hSimpleMeasure = nullptr;
+
+// 몇 초 뒤에 가릴지. 고급 창의 kIdleValues 와 같은 값이어야 한다.
+static const int kSimpleIdle[4] = { 0, 15, 30, 60 };
+static const wchar_t* kSimpleIdleLabel[4] = { L"바로", L"15초", L"30초", L"1분" };
+
+// 거리 3단계.
+//
+// 절대 dBm 으로 못 박을 수 없다. 같은 "보통"이 자리와 어댑터에 따라 10~20 dB
+// 씩 달라지기 때문이다 (docs/PROXIMITY.md). 그래서 재보기로 기준을 한 번
+// 잡고, 3단계는 그 기준에서의 오프셋으로 둔다. 재보기 전에는 대략값을 쓰되
+// 화면에서 재보기를 권한다.
+static const int kDistOffset[3] = { +6, 0, -6 };   // 가까이 / 보통 / 멀리
+static constexpr int kDistFallbackBase = -64;
+
+static int SimpleBaseRssi() {
+    AppConfig c;
+    LoadAppConfig(c);
+    return c.measuredBaseRssi != 0 ? c.measuredBaseRssi : kDistFallbackBase;
+}
+
+// 지금 임계값에 가장 가까운 단계를 고른다. 고급 창에서 dBm 을 직접 고쳤을 때도
+// 슬라이더가 엉뚱한 곳을 가리키지 않게 하려는 것이다.
+static int SimpleDistStep() {
+    int base = SimpleBaseRssi(), best = 1, bestD = 9999;
+    for (int i = 0; i < 3; i++) {
+        int d = abs((base + kDistOffset[i]) - g_nearRssiThreshold);
+        if (d < bestD) { bestD = d; best = i; }
+    }
+    return best;
+}
+
+static void SimpleApplyDist(int step) {
+    if (step < 0 || step > 2) return;
+    g_nearRssiThreshold = SimpleBaseRssi() + kDistOffset[step];
+    g_gattRssiThreshold = g_nearRssiThreshold;   // 두 경로를 따로 물어볼 화면이 아니다
+    AppConfig c; LoadAppConfig(c);
+    c.nearRssiThreshold = g_nearRssiThreshold;
+    c.gattRssiThreshold = g_gattRssiThreshold;
+    SaveAppConfig(c);
+    DbgEvent(L"간단 화면: 거리 %d단계 -> %d dBm", step + 1, g_nearRssiThreshold);
+}
+
+static void SimpleRefresh() {
+    if (!g_hSimple) return;
+
+    AppConfig c; LoadAppConfig(c);
+    wchar_t buf[192];
+    if (!c.phoneToken.empty()) {
+        std::wstring head = c.phoneToken.substr(0, (std::min)((size_t)8, c.phoneToken.size()));
+        if (!c.authEmail.empty())
+            swprintf_s(buf, L"%s 계정으로 등록됨", c.authEmail.c_str());
+        else
+            swprintf_s(buf, L"등록됨 (토큰 %s)", head.c_str());
+    } else {
+        wcscpy_s(buf, L"아직 등록하지 않았어요");
+    }
+    SetWindowTextW(g_hSimplePhone, buf);
+
+    SendMessageW(g_hSimpleDist, TBM_SETPOS, TRUE, SimpleDistStep());
+
+    // 재본 적이 없으면 그렇다고 말해 준다. 3단계가 근거 없는 값이라는 뜻이다.
+    SetWindowTextW(g_hSimpleMeasure,
+        c.measuredBaseRssi != 0 ? L"내 자리에 맞게 다시 재기" : L"내 자리에 맞게 재보기  (아직 안 했어요)");
+
+    for (int i = 0; i < 4; i++) {
+        bool on = (g_idleCountdownSec == kSimpleIdle[i]);
+        SendMessageW(g_hSimpleIdle[i], BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+    InvalidateRect(g_hSimple, nullptr, FALSE);
+}
+
+static LRESULT CALLBACK SimpleProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE: {
+        HINSTANCE hI = GetModuleHandle(nullptr);
+        int x = 22, w = SW_W - 62, y = 14;
+
+        CreateWindowExW(0, L"BUTTON", L"고급 설정",
+            WS_CHILD | WS_VISIBLE, SW_W - 130, y, 88, 26,
+            hWnd, (HMENU)(UINT_PTR)IDS_ADVANCED, hI, nullptr);
+
+        y = 62;   // 상태 카드는 WM_PAINT 가 그린다
+        y = 150;
+
+        CreateWindowExW(0, L"STATIC", L"내 폰", WS_CHILD | WS_VISIBLE,
+            x, y, 200, 18, hWnd, nullptr, hI, nullptr);
+        y += 22;
+        g_hSimplePhone = CreateWindowExW(0, L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_PATHELLIPSIS, x, y + 5, w - 96, 20,
+            hWnd, nullptr, hI, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"바꾸기", WS_CHILD | WS_VISIBLE,
+            x + w - 88, y, 88, 30, hWnd, (HMENU)(UINT_PTR)IDS_PHONE, hI, nullptr);
+
+        y += 48;
+        CreateWindowExW(0, L"STATIC", L"얼마나 멀어지면 가릴까요?", WS_CHILD | WS_VISIBLE,
+            x, y, 300, 18, hWnd, nullptr, hI, nullptr);
+        y += 22;
+        g_hSimpleDist = CreateWindowExW(0, TRACKBAR_CLASS, L"",
+            WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS, x, y, w, 30,
+            hWnd, (HMENU)(UINT_PTR)IDS_DIST, hI, nullptr);
+        SendMessageW(g_hSimpleDist, TBM_SETRANGE, TRUE, MAKELPARAM(0, 2));
+        SendMessageW(g_hSimpleDist, TBM_SETPAGESIZE, 0, 1);
+        y += 32;
+        CreateWindowExW(0, L"STATIC", L"가까이", WS_CHILD | WS_VISIBLE,
+            x, y, 60, 16, hWnd, nullptr, hI, nullptr);
+        CreateWindowExW(0, L"STATIC", L"보통", WS_CHILD | WS_VISIBLE | SS_CENTER,
+            x + w / 2 - 30, y, 60, 16, hWnd, nullptr, hI, nullptr);
+        CreateWindowExW(0, L"STATIC", L"멀리", WS_CHILD | WS_VISIBLE | SS_RIGHT,
+            x + w - 60, y, 60, 16, hWnd, nullptr, hI, nullptr);
+
+        y += 24;
+        g_hSimpleMeasure = CreateWindowExW(0, L"BUTTON", L"",
+            WS_CHILD | WS_VISIBLE, x, y, w, 32,
+            hWnd, (HMENU)(UINT_PTR)IDS_MEASURE, hI, nullptr);
+
+        y += 50;
+        CreateWindowExW(0, L"STATIC", L"자리를 뜨고 몇 초 뒤에 가릴까요?",
+            WS_CHILD | WS_VISIBLE, x, y, 320, 18, hWnd, nullptr, hI, nullptr);
+        y += 22;
+        for (int i = 0; i < 4; i++) {
+            g_hSimpleIdle[i] = CreateWindowExW(0, L"BUTTON", kSimpleIdleLabel[i],
+                WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | BS_PUSHLIKE | (i == 0 ? WS_GROUP : 0),
+                x + i * (w / 4), y, w / 4 - 6, 30,
+                hWnd, (HMENU)(UINT_PTR)(IDS_IDLE_BASE + i), hI, nullptr);
+        }
+
+        y += 50;
+        CreateWindowExW(0, L"STATIC", L"가릴 때 보여줄 그림", WS_CHILD | WS_VISIBLE,
+            x, y, 300, 18, hWnd, nullptr, hI, nullptr);
+        y += 22;
+        CreateWindowExW(0, L"BUTTON", L"그림 고르기", WS_CHILD | WS_VISIBLE,
+            x, y, 140, 30, hWnd, (HMENU)(UINT_PTR)IDS_IMAGE, hI, nullptr);
+
+        y += 52;
+        CreateWindowExW(0, L"BUTTON", L"지금 가리기", WS_CHILD | WS_VISIBLE,
+            x, y, w, 38, hWnd, (HMENU)(UINT_PTR)IDS_LOCKNOW, hI, nullptr);
+
+        EnumChildWindows(hWnd, [](HWND h, LPARAM f) -> BOOL {
+            SendMessage(h, WM_SETFONT, (WPARAM)f, TRUE); return TRUE;
+        }, (LPARAM)g_hFont);
+
+        SetTimer(hWnd, IDT_SIMPLE, 1000, nullptr);
+        return 0;
+    }
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC hdc = BeginPaint(hWnd, &ps);
+        RECT rc = { 22, 58, SW_W - 40, 136 };
+
+        COLORREF bg; const wchar_t* line1; const wchar_t* line2;
+        if (!g_monitoring) {
+            bg = RGB(120, 120, 120); line1 = L"꺼져 있어요";
+            line2 = L"[고급 설정] 에서 시작할 수 있어요";
+        } else if (g_bBlackActive) {
+            bg = RGB(200, 60, 60);  line1 = L"화면을 가리는 중";
+            line2 = g_bManualLock ? L"검은 화면의 [해제] 를 누르면 돌아와요"
+                                  : L"폰이 돌아오면 저절로 풀려요";
+        } else if (g_proxState == ProxState::Near) {
+            bg = RGB(46, 160, 67);  line1 = L"지키는 중";
+            line2 = L"자리를 비우면 화면을 가려요";
+        } else {
+            bg = RGB(230, 145, 40); line1 = L"폰이 안 보여요";
+            line2 = L"곧 화면을 가릴 거예요";
+        }
+
+        HBRUSH br = CreateSolidBrush(bg);
+        FillRect(hdc, &rc, br); DeleteObject(br);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, RGB(255, 255, 255));
+        RECT t1 = { rc.left + 18, rc.top + 14, rc.right - 18, rc.top + 48 };
+        HFONT of = (HFONT)SelectObject(hdc, g_hFontBig ? g_hFontBig : g_hFont);
+        DrawTextW(hdc, line1, -1, &t1, DT_LEFT | DT_SINGLELINE);
+        SelectObject(hdc, g_hFont);
+        RECT t2 = { rc.left + 18, rc.top + 48, rc.right - 18, rc.bottom - 8 };
+        DrawTextW(hdc, line2, -1, &t2, DT_LEFT | DT_WORDBREAK);
+        SelectObject(hdc, of);
+        EndPaint(hWnd, &ps); return 0;
+    }
+
+    case WM_CTLCOLORSTATIC: {
+        // 이걸 안 두면 DefWindowProc 이 COLOR_BTNFACE 를 돌려줘서, 흰 창 위에
+        // 라벨마다 회색 상자가 얹힌다.
+        SetBkMode((HDC)wParam, TRANSPARENT);
+        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+    }
+
+    case WM_HSCROLL:
+        if ((HWND)lParam == g_hSimpleDist) {
+            SimpleApplyDist((int)SendMessageW(g_hSimpleDist, TBM_GETPOS, 0, 0));
+        }
+        return 0;
+
+    case WM_TIMER:
+        if (wParam == IDT_SIMPLE) SimpleRefresh();
+        return 0;
+
+    case WM_COMMAND: {
+        int id = LOWORD(wParam);
+        if (id >= IDS_IDLE_BASE && id < IDS_IDLE_BASE + 4) {
+            g_idleCountdownSec = kSimpleIdle[id - IDS_IDLE_BASE];
+            g_nCountdown = g_idleCountdownSec;
+            AppConfig c; LoadAppConfig(c);
+            c.idleCountdownSec = g_idleCountdownSec; SaveAppConfig(c);
+            return 0;
+        }
+        switch (id) {
+        case IDS_ADVANCED:
+            ShowWindow(g_hWnd, SW_SHOW);
+            SetForegroundWindow(g_hWnd);
+            break;
+        // 아래 셋은 고급 창이 이미 하는 일이다. 여기서 다시 구현하면 두 벌이 된다.
+        case IDS_PHONE:   SendMessageW(g_hWnd, WM_COMMAND, ID_BTN_REGISTER_PHONE, 0); SimpleRefresh(); break;
+        case IDS_IMAGE:   SendMessageW(g_hWnd, WM_COMMAND, ID_BTN_CENTER_IMG, 0); break;
+        case IDS_LOCKNOW: SendMessageW(g_hWnd, WM_COMMAND, ID_BTN_BLACKNOW, 0); break;
+        case IDS_MEASURE: MessageBoxW(hWnd, L"재보기는 다음 단계에서 붙입니다.", L"SmartScreen", MB_OK); break;
+        }
+        return 0;
+    }
+
+    case WM_CLOSE:
+        ShowWindow(hWnd, SW_HIDE);   // 오버레이의 [설정] 로 다시 열 수 있다
+        return 0;
+
+    case WM_DESTROY:
+        KillTimer(hWnd, IDT_SIMPLE);
+        g_hSimple = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+// ---------------------------------------------------------------------------
 // WinMain
 // ---------------------------------------------------------------------------
 int WINAPI wWinMain(HINSTANCE hI, HINSTANCE, LPWSTR, int nS) {
@@ -2138,13 +2402,31 @@ int WINAPI wWinMain(HINSTANCE hI, HINSTANCE, LPWSTR, int nS) {
         }, (LPARAM)g_hFontOvlBtn);
     }
 
-    // Show settings if no config, hide if auto-starting.
+    // 간단 창. 고급 창(g_hWnd)은 만들어는 두되 숨겨 둔다 - 자동 시작이나
+    // 기업 콘텐츠 동기화 같은 일이 전부 그 창의 WM_CREATE 에 들어 있어서,
+    // 안 만들면 프로그램이 뜨지 않는 것과 같다.
+    {WNDCLASSEXW sc = {}; sc.cbSize = sizeof(sc); sc.style = CS_HREDRAW | CS_VREDRAW;
+     sc.lpfnWndProc = SimpleProc; sc.hInstance = hI;
+     sc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+     sc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+     sc.lpszClassName = L"SmartScreenSimple";
+     sc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+     RegisterClassExW(&sc);}
+    g_hSimple = CreateWindowExW(0, L"SmartScreenSimple", L"SmartScreen",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        (sx - SW_W) / 2, (sy - SW_H) / 2, SW_W, SW_H,
+        nullptr, nullptr, hI, nullptr);
+
+    // 설정이 없으면 창을 띄워 안내하고, 있으면 트레이에서 조용히 시작한다.
     // 등록된 폰을 쓰면 btAddress 는 0이므로 토큰 쪽도 같이 본다.
+    ShowWindow(g_hWnd, SW_HIDE);
     AppConfig chk;
-    if (LoadAppConfig(chk) && (chk.btAddress != 0 || !chk.phoneToken.empty())) {
-        ShowWindow(g_hWnd, SW_HIDE);
-    } else {
-        ShowWindow(g_hWnd, nS);
+    bool configured = LoadAppConfig(chk) && (chk.btAddress != 0 || !chk.phoneToken.empty());
+    if (g_hSimple) {
+        ShowWindow(g_hSimple, configured ? SW_HIDE : SW_SHOW);
+        SimpleRefresh();
+    } else if (!configured) {
+        ShowWindow(g_hWnd, nS);   // 간단 창이 안 만들어졌으면 예전대로
     }
     UpdateWindow(g_hWnd);
 
