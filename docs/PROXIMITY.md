@@ -558,6 +558,22 @@ Recorded because most were invisible without instrumentation.
 - `ConnectionStatus` and `GattSession` are not usable as a gate: a discovery
   that succeeded reported `Disconnected` and `Closed` throughout, because
   Windows connects only for the duration of the operation.
+- `SetIdentity` assigned the registered token to a `std::wstring` that the
+  advertisement callback and the prober thread read without a lock. Thirty-two
+  characters do not fit the small-string buffer, so the assignment frees the
+  buffer a reader may be holding. It was survivable only because the function
+  was called once, just before the scan started.
+- Registering by account does not require stopping the scan, and nothing told
+  the running scanner. The token reached `config.ini` and nowhere else: on a
+  PC registering for the first time the prober thread is created only when a
+  token already exists, so it did not exist, and the phone was never
+  identified — after a dialog saying it had been registered. Restarting the
+  app fixed it, which is why it was not noticed.
+- A verdict of “not our phone” is keyed by address and holds for ten minutes,
+  but it was reached against whichever token was registered at the time.
+  Changing the registration left those verdicts, and the current binding,
+  standing — so a freshly registered phone could be ignored for ten minutes,
+  and a phone that had just been replaced kept holding the screen open.
 
 Three of these were dormant until link encryption was turned off. Without
 it the companion app never connected, so the code that runs once it has —

@@ -88,7 +88,13 @@ struct BleRssiScanner::Impl {
     // ---- 연결로 확인하는 신원 (IRK 대체). 설계 배경은 ble_ident.h ----
     // 광고만으로는 잠긴 폰을 특정할 수 없어, 후보에 한 번 붙어 토큰을 읽고
     // 주소를 묶는다. 그 뒤로는 주소가 바뀔 때까지 주소로 추적한다.
-    std::wstring identToken;                    // 등록된 토큰(32 hex). 비면 이 경로 꺼짐
+    // 토큰은 등록할 때 UI 스레드가 갈아치우고, 광고 콜백 스레드와 프로버
+    // 스레드가 읽는다. 32자 문자열은 힙에 있어서 그냥 대입하면 읽는 쪽이
+    // 해제된 버퍼를 보게 된다. 그래서 문자열은 잠금으로 감싸고, 광고마다 도는
+    // 뜨거운 경로는 "켜졌는지"만 보므로 잠금 없이 읽는 사본을 따로 둔다.
+    std::mutex identMutex;
+    std::wstring identToken;                    // 등록된 토큰(32 hex). identMutex 로 보호
+    std::atomic<bool> identOn{ false };         // identToken 이 비어 있지 않은지 = 이 경로 켜짐
     std::atomic<int> identBit{ -1 };            // 학습된 overflow 비트 (-1 = 모름)
     std::atomic<int> identBitLearned{ -1 };     // 새로 배워서 저장해야 할 값
     std::atomic<int> probeFloor{ -75 };         // 이보다 약하면 탐색하지 않는다
@@ -279,7 +285,7 @@ struct BleRssiScanner::Impl {
         while (WaitForSingleObject(proberStop, 2000) == WAIT_TIMEOUT) {
             // 스캔이 꺼져 있으면 논다. 스레드를 Impl 수명 내내 살려 두는 이유는
             // 연결 한 번이 최악 10초라 Stop 에서 조인하면 UI 가 그만큼 멈추기 때문이다.
-            if (!running || identToken.empty()) continue;
+            if (!running || !identOn) continue;
             ULONGLONG now = GetTickCount64();
 
             // 묶인 주소가 아직 광고 중이면 할 일이 없다.
@@ -327,8 +333,12 @@ struct BleRssiScanner::Impl {
             std::wstring tok, why;
             DWORD took = 0;
             ProbeOutcome r = ReadPhoneToken(pick, pickRnd, tok, why, &took);
+            // 연결에 수 초가 걸리므로 등록된 값은 붙잡고 있지 않고 지금 다시 읽는다.
+            // 탐색 중에 등록이 바뀌었으면 새 값으로 판정하는 편이 맞다.
+            std::wstring want;
+            { std::lock_guard<std::mutex> lock(identMutex); want = identToken; }
             bool ours = (r == ProbeOutcome::Token) &&
-                        (_wcsicmp(tok.c_str(), identToken.c_str()) == 0);
+                        (_wcsicmp(tok.c_str(), want.c_str()) == 0);
             if (!ours) {
                 // 붙었는데 아닌 것으로 확인된 기기는 한동안 접어 둔다.
                 // 못 붙은 것은 일시적일 수 있으니 금방 다시 해 본다 -
@@ -455,7 +465,7 @@ bool BleRssiScanner::Start(const std::wstring& targetDeviceName, uint64_t target
             bool identMatch = (bound != 0 && addr == bound);
             if (identMatch) {
                 m_impl->boundSeenTick = GetTickCount64();
-            } else if (!m_impl->identToken.empty()) {
+            } else if (m_impl->identOn) {
                 // 아직 못 묶었으면 후보로만 쌓아 둔다. 붙는 일은 프로버 스레드가 한다.
                 int bit = Impl::SingleOverflowBit(args.Advertisement());
                 if (bit >= 0) {
@@ -473,7 +483,7 @@ bool BleRssiScanner::Start(const std::wstring& targetDeviceName, uint64_t target
                 || (m_impl->targetAddr != 0 && addr == m_impl->targetAddr)
                 // 서비스 UUID 는 앱 설치본마다 같으므로 폰을 특정하지 못한다.
                 // IRK 도 토큰도 없을 때의 임시방편일 뿐이다.
-                || (!m_impl->HasIrk() && m_impl->identToken.empty()
+                || (!m_impl->HasIrk() && !m_impl->identOn
                     && Impl::HasOurService(args.Advertisement()));
             int smoothedInt = -100;
 
@@ -530,7 +540,7 @@ bool BleRssiScanner::Start(const std::wstring& targetDeviceName, uint64_t target
         m_impl->available = true;
         m_impl->running = true;
 
-        if (!m_impl->proberThread && !m_impl->identToken.empty()) {
+        if (!m_impl->proberThread && m_impl->identOn) {
             m_impl->proberStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
             m_impl->proberThread = CreateThread(nullptr, 0, Impl::ProberThunk, m_impl, 0, nullptr);
         }
@@ -608,10 +618,43 @@ void BleRssiScanner::SetTimeoutSec(DWORD sec) {
     m_impl->timeoutMs = sec * 1000;
 }
 
+// 등록된 폰이 바뀌었을 수도 있다는 전제로 쓴다. 감시를 시작할 때만 불리는 게
+// 아니라 계정으로 등록을 마친 직후에도 불리므로, 스캔이 도는 중에 바뀔 수 있다.
 void BleRssiScanner::SetIdentity(const std::wstring& tokenHex, int ovfBit, int probeFloorRssi) {
-    m_impl->identToken = tokenHex;
+    bool changed;
+    {
+        std::lock_guard<std::mutex> lock(m_impl->identMutex);
+        changed = (_wcsicmp(m_impl->identToken.c_str(), tokenHex.c_str()) != 0);
+        m_impl->identToken = tokenHex;
+        m_impl->identOn = !tokenHex.empty();
+    }
     m_impl->identBit = ovfBit;
     m_impl->probeFloor = probeFloorRssi;
+
+    if (changed) {
+        // 지금까지의 판정은 모두 예전 토큰에 대한 것이다. "남의 기기" 라는
+        // 결론은 10분을 버티므로 그대로 두면 새로 등록한 폰을 그만큼 무시한다.
+        // 묶여 있던 주소도 더는 확인된 주소가 아니다 - 다른 폰을 등록했는데
+        // 예전 폰이 계속 묶여 있으면 그게 화면을 열어둔다.
+        size_t dropped;
+        {
+            std::lock_guard<std::mutex> lock(m_impl->candMutex);
+            dropped = m_impl->probedUntil.size();
+            m_impl->probedUntil.clear();
+            m_impl->boundAddr = 0;
+        }
+        // 등록을 바꾼 직후 폰을 못 알아보는 일이 로그에서 갈리도록 남긴다.
+        DbgEvent(L"ident: token %s, dropped %d past verdict(s) and the binding",
+                 m_impl->identOn ? L"set" : L"cleared", (int)dropped);
+    }
+
+    // 스캔이 이미 돌고 있으면 Start 를 다시 지나지 않는다. 여기서 띄우지 않으면
+    // 처음 등록한 경우 프로버 스레드가 아예 없어서, "등록했습니다" 라고 말한
+    // 뒤에도 폰을 끝까지 확인하지 못한다.
+    if (m_impl->running && m_impl->identOn && !m_impl->proberThread) {
+        m_impl->proberStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        m_impl->proberThread = CreateThread(nullptr, 0, Impl::ProberThunk, m_impl, 0, nullptr);
+    }
 }
 
 int BleRssiScanner::TakeLearnedOverflowBit() {

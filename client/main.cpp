@@ -1980,6 +1980,16 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         DbgEvent(L"google login: %s (phone token: %s)", r->email.c_str(),
                  r->phoneToken.empty() ? L"none yet" : L"received");
 
+        // 돌고 있는 스캐너에도 알려 준다. 계정 등록은 블루투스 등록과 달리
+        // 감시를 멈추지 않고 할 수 있어서 StartMon 을 다시 지나지 않는다 -
+        // 여기서 알리지 않으면 "등록했습니다" 라고 말한 뒤에도 config 에만
+        // 토큰이 있고, 스캐너는 끝까지 폰을 확인하지 못한다.
+        if (!r->phoneToken.empty()) {
+            g_hasToken = true;
+            g_bleScanner.SetIdentity(c.phoneToken, c.phoneOvfBit,
+                                     g_nearRssiThreshold - 10);
+        }
+
         if (!r->err.empty()) {
             // 로그인은 됐는데 토큰 조회가 실패했다. 다시 로그인시킬 일은 아니다.
             MessageBoxW(hWnd,
