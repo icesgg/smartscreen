@@ -613,3 +613,37 @@ bool FetchDeviceToken(const std::wstring& supabaseUrl, const std::wstring& anonK
         outTokenHex = Widen(tok);
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// claim_device_token 직접 호출 (진단용)
+// ---------------------------------------------------------------------------
+bool ClaimDeviceToken(const std::wstring& supabaseUrl, const std::wstring& anonKey,
+                      const AuthSession& session, const std::wstring& tokenHex,
+                      std::wstring& outTokenHex, std::wstring& outErr) {
+    outTokenHex.clear();
+    outErr.clear();
+    if (session.accessToken.empty()) { outErr = L"로그인하지 않았다"; return false; }
+
+    std::string body = "{\"p_token\":\"" + Narrow(tokenHex) + "\",\"p_platform\":\"ios\"}";
+    std::vector<std::wstring> headers = {
+        L"apikey: " + anonKey,
+        L"Authorization: Bearer " + session.accessToken,
+        L"Content-Type: application/json",
+    };
+    DWORD status = 0;
+    std::string resp;
+    if (!HttpRequest(L"POST", supabaseUrl + L"/rest/v1/rpc/claim_device_token",
+                     headers, body, status, resp)) {
+        outErr = L"요청이 실패했다";
+        return false;
+    }
+    if (status < 200 || status >= 300) {
+        outErr = PickError(resp, status) + L"  [본문] " + Widen(resp);
+        return false;
+    }
+    // text 를 돌려주므로 응답이 따옴표 붙은 문자열 하나다
+    std::string v = resp;
+    if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
+    outTokenHex = Widen(v);
+    return true;
+}

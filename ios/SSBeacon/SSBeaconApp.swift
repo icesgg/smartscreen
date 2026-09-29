@@ -414,19 +414,28 @@ final class AuthManager: NSObject, ObservableObject,
         }
     }
 
+    // 실패했을 때 상태코드와 본문을 같이 넘긴다. 폰은 Mac 없이 고칠 수 없으므로
+    // 화면에 뜬 문장만으로 원인이 갈려야 한다. "실패했습니다" 로는 아무것도 모른다.
     private func post(_ path: String, body: [String: Any], bearer: String?,
-                      done: @escaping (Any?) -> Void) {
+                      done: @escaping (Any?, Int, String) -> Void) {
         var req = URLRequest(url: URL(string: kSupabaseUrl + path)!)
         req.httpMethod = "POST"
         req.setValue(kSupabaseAnonKey, forHTTPHeaderField: "apikey")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let b = bearer { req.setValue("Bearer \(b)", forHTTPHeaderField: "Authorization") }
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        URLSession.shared.dataTask(with: req) { data, _, _ in
-            guard let d = data else { done(nil); return }
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+            if let e = err {
+                done(nil, code, e.localizedDescription)
+                return
+            }
+            guard let d = data else { done(nil, code, "응답 없음"); return }
+            let raw = String(data: d, encoding: .utf8) ?? ""
             // claim_device_token 은 text 를 주므로 응답이 JSON 문자열 하나다.
             // fragmentsAllowed 가 없으면 그것만 파싱에 실패한다.
-            done(try? JSONSerialization.jsonObject(with: d, options: [.fragmentsAllowed]))
+            done(try? JSONSerialization.jsonObject(with: d, options: [.fragmentsAllowed]),
+                 code, raw)
         }.resume()
     }
 
@@ -434,11 +443,11 @@ final class AuthManager: NSObject, ObservableObject,
                           completion: @escaping (String?) -> Void) {
         post("/auth/v1/token?grant_type=pkce",
              body: ["auth_code": code, "code_verifier": verifier],
-             bearer: nil) { [weak self] obj in
+             bearer: nil) { [weak self] obj, code, raw in
             guard let self = self else { return }
             guard let o = obj as? [String: Any],
                   let access = o["access_token"] as? String else {
-                self.finish(nil, "토큰 교환에 실패했습니다", completion)
+                self.finish(nil, "토큰 교환 실패 [\(code)] \(raw.prefix(160))", completion)
                 return
             }
             let mail = ((o["user"] as? [String: Any])?["email"] as? String) ?? ""
@@ -447,11 +456,11 @@ final class AuthManager: NSObject, ObservableObject,
             // 서버가 이 계정의 토큰을 확정한다. 이미 있으면 그 값이 돌아온다.
             self.post("/rest/v1/rpc/claim_device_token",
                       body: ["p_token": currentTokenHex, "p_platform": "ios"],
-                      bearer: access) { res in
+                      bearer: access) { res, code2, raw2 in
                 if let hex = res as? String, hex.count == 32 {
                     self.finish(hex, "연동되었습니다", completion)
                 } else {
-                    self.finish(nil, "토큰을 등록하지 못했습니다", completion)
+                    self.finish(nil, "등록 실패 [\(code2)] \(raw2.prefix(160))", completion)
                 }
             }
         }
@@ -511,7 +520,9 @@ struct ContentView: View {
                     .font(.footnote).foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
             } else {
-                Text("계정 \(auth.email)").font(.footnote)
+                Text("계정 \(auth.email)")
+                    .font(.footnote).bold()
+                    .textSelection(.enabled)
                 Text("PC 의 [폰 등록] 에서 구글 계정으로 등록을 선택하세요.")
                     .font(.footnote).foregroundColor(.secondary)
                     .multilineTextAlignment(.center)

@@ -94,3 +94,10 @@ bool RefreshSession(const std::wstring& supabaseUrl, const std::wstring& anonKey
 bool FetchDeviceToken(const std::wstring& supabaseUrl, const std::wstring& anonKey,
                       const AuthSession& session,
                       std::wstring& outTokenHex, std::wstring& outErr);
+
+// 폰이 하는 것과 같은 RPC. 서버에 이미 값이 있으면 그 값이 돌아온다.
+// PC 에서 등록하는 용도는 아니고, 폰 쪽이 실패할 때 원인을 가르는 데 쓴다
+// (서버가 거절하는지, 폰이 안 보내는지).
+bool ClaimDeviceToken(const std::wstring& supabaseUrl, const std::wstring& anonKey,
+                      const AuthSession& session, const std::wstring& tokenHex,
+                      std::wstring& outTokenHex, std::wstring& outErr);
