@@ -30,6 +30,46 @@ int main(int argc, char** argv) {
 
     bool serve = (argc > 1 && strcmp(argv[1], "--serve") == 0);
 
+    // --unclaim: 이 계정의 등록을 지운다. 지운 뒤 폰에서 로그인하면 폰이 INSERT
+    // 경로를 타므로, 그때 행이 생기는지로 폰 쪽 등록이 실제로 되는지 가려진다.
+    if (argc > 3 && strcmp(argv[1], "--unclaim") == 0) {
+        auto widen = [](const char* s) {
+            int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
+            std::wstring w(n, L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, s, -1, &w[0], n);
+            if (!w.empty() && w.back() == L'\0') w.pop_back();
+            return w;
+        };
+        std::wstring url = widen(argv[2]), key = widen(argv[3]);
+        printf("등록 해제\n");
+        AuthSession s;
+        std::wstring err;
+        if (!SignInWithGoogle(url, key, s, err)) {
+            printf("  [FAIL] 로그인: %ls\n", err.c_str());
+            return 1;
+        }
+        printf("  [OK] 로그인 %ls\n", s.email.c_str());
+
+        std::wstring before;
+        FetchDeviceToken(url, key, s, before, err);
+        printf("  지우기 전 : '%ls'\n", before.c_str());
+
+        if (!DeleteDeviceToken(url, key, s, err)) {
+            printf("  [FAIL] 삭제: %ls\n", err.c_str());
+            return 1;
+        }
+        std::wstring after;
+        if (!FetchDeviceToken(url, key, s, after, err)) {
+            printf("  [FAIL] 확인 조회: %ls\n", err.c_str());
+            return 1;
+        }
+        printf("  지운 뒤   : '%ls'\n", after.c_str());
+        printf("  [%s] %s\n", after.empty() ? "OK" : "FAIL",
+               after.empty() ? "행이 없다. 이제 폰에서 로그인하면 폰이 만든 것이 된다."
+                             : "아직 남아 있다!");
+        return after.empty() ? 0 : 1;
+    }
+
     // --claim: 폰이 하는 것과 똑같은 RPC 를 PC 에서 불러 본다.
     // 폰에서 등록이 안 될 때 SQL 쪽 문제인지 Swift 쪽 문제인지 가르는 용도다.
     if (argc > 4 && strcmp(argv[1], "--claim") == 0) {

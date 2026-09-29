@@ -101,3 +101,9 @@ bool FetchDeviceToken(const std::wstring& supabaseUrl, const std::wstring& anonK
 bool ClaimDeviceToken(const std::wstring& supabaseUrl, const std::wstring& anonKey,
                       const AuthSession& session, const std::wstring& tokenHex,
                       std::wstring& outTokenHex, std::wstring& outErr);
+
+// 이 계정의 행을 지운다. 등록을 해제하는 것이고, 폰 자체의 토큰은 그대로다.
+// 지운 뒤 폰에서 다시 로그인하면 폰이 INSERT 경로를 타므로, 폰 쪽 등록이
+// 실제로 되는지를 이것 없이는 확인할 수 없다 (PC 가 넣어 둔 행과 구분이 안 된다).
+bool DeleteDeviceToken(const std::wstring& supabaseUrl, const std::wstring& anonKey,
+                       const AuthSession& session, std::wstring& outErr);

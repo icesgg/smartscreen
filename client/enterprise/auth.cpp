@@ -647,3 +647,33 @@ bool ClaimDeviceToken(const std::wstring& supabaseUrl, const std::wstring& anonK
     outTokenHex = Widen(v);
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// 등록 해제 (진단/복구용)
+// ---------------------------------------------------------------------------
+bool DeleteDeviceToken(const std::wstring& supabaseUrl, const std::wstring& anonKey,
+                       const AuthSession& session, std::wstring& outErr) {
+    outErr.clear();
+    if (session.accessToken.empty()) { outErr = L"로그인하지 않았다"; return false; }
+    if (session.userId.empty())      { outErr = L"user id 를 모른다"; return false; }
+
+    // RLS 가 자기 행만 허용하지만, 필터 없이 DELETE 를 보내면 PostgREST 가
+    // 통째 삭제로 보고 거절한다. 그래서 user_id 를 명시한다.
+    std::vector<std::wstring> headers = {
+        L"apikey: " + anonKey,
+        L"Authorization: Bearer " + session.accessToken,
+    };
+    DWORD status = 0;
+    std::string resp;
+    if (!HttpRequest(L"DELETE",
+                     supabaseUrl + L"/rest/v1/device_tokens?user_id=eq." + session.userId,
+                     headers, std::string(), status, resp)) {
+        outErr = L"요청이 실패했다";
+        return false;
+    }
+    if (status < 200 || status >= 300) {
+        outErr = PickError(resp, status) + L"  [본문] " + Widen(resp);
+        return false;
+    }
+    return true;
+}
