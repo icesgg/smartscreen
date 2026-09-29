@@ -2211,9 +2211,13 @@ static constexpr int WZ_W = 440, WZ_H = 330;
 static constexpr int IDW_NEXT = 701, IDW_CANCEL = 702;
 static constexpr int IDT_WIZ = 31;
 
-// 걸어나가는 20초는 어느 쪽에도 넣지 않는다. 그 동안은 아직 신호가 세서
-// 섞으면 두 구간이 겹쳐 보인다 (dist/README.txt 4장과 같은 이유).
-static constexpr int kWzSeated = 60, kWzWalk = 20, kWzAway = 45;
+// 폰을 들고 나가게 하면 2·3단계 안내를 읽을 사람이 화면 앞에 없다. 그래서
+// 폰만 두고 돌아오게 하고, 다 왔는지는 버튼으로 받는다 - 걸어갔다 오는 시간을
+// 초로 못박으면 자리가 먼 사람에게는 모자라고 가까운 사람은 기다리기만 한다.
+//
+// 놓아둔 폰은 몸에 지닌 폰보다 세게 잡힌다. 그래도 임계값은 착석 구간의
+// 최저값으로 정해지므로 값이 헐거워지지는 않고, 겹침 판정만 엄해진다.
+static constexpr int kWzSeated = 60, kWzAway = 45;
 
 static HWND g_hWiz = nullptr, g_hWizProg = nullptr, g_hWizNext = nullptr;
 static int  g_wzPhase = 0;      // 0 안내 / 1 착석 / 2 이동 / 3 비움 / 4 결과
@@ -2282,8 +2286,8 @@ static void WzJudge() {
         g_wzTitle = L"앉아 있을 때와 비울 때가 구분되지 않아요";
         swprintf_s(buf,
             L"앉아 있을 때 %d~%d, 비웠을 때 %d~%d 로 겹칩니다.\n\n"
-            L"폰을 몸에 지니고 계셨다면 책상 위에 두고, 자리를 비울 때 더 멀리 "
-            L"가서 다시 해 보세요.", sLo, sHi, aLo, aHi);
+            L"폰을 둔 곳이 책상과 너무 가까웠어요. 더 멀리 두고 다시 해 보세요.",
+            sLo, sHi, aLo, aHi);
         g_wzBody = buf;
         DbgEvent(L"재보기: 구간이 겹친다 (착석 %d..%d, 비움 %d..%d)", sLo, sHi, aLo, aHi);
         return;
@@ -2307,21 +2311,26 @@ static void WzJudge() {
 
 static void WzSetPhase(int ph) {
     g_wzPhase = ph;
-    g_wzLastTick = 0;
+    // 스캐너에 남아 있던 직전 패킷을 새 구간의 첫 표본으로 세지 않는다.
+    g_wzLastTick = g_bleGatt.IsHealthy() ? g_bleGatt.LastReportTick()
+                                         : g_bleScanner.LastReceivedTick();
     switch (ph) {
     case 1: g_wzLeft = kWzSeated; break;
-    case 2: g_wzLeft = kWzWalk;   break;
     case 3: g_wzLeft = kWzAway;   break;
     case 4: WzJudge();            break;
     }
     if (g_hWizProg) {
-        SendMessageW(g_hWizProg, PBM_SETRANGE32, 0, (ph == 1 ? kWzSeated : ph == 2 ? kWzWalk : kWzAway));
+        SendMessageW(g_hWizProg, PBM_SETRANGE32, 0, (ph == 1 ? kWzSeated : kWzAway));
         SendMessageW(g_hWizProg, PBM_SETPOS, 0, 0);
-        ShowWindow(g_hWizProg, (ph >= 1 && ph <= 3) ? SW_SHOW : SW_HIDE);
+        ShowWindow(g_hWizProg, (ph == 1 || ph == 3) ? SW_SHOW : SW_HIDE);
     }
-    if (g_hWizNext)
-        SetWindowTextW(g_hWizNext, ph == 0 ? L"시작하기" : ph == 4 ? (g_wzOk ? L"이대로 쓰기" : L"닫기") : L"");
-    if (g_hWizNext) ShowWindow(g_hWizNext, (ph == 0 || ph == 4) ? SW_SHOW : SW_HIDE);
+    if (g_hWizNext) {
+        const wchar_t* lbl = ph == 0 ? L"시작하기"
+                           : ph == 2 ? L"폰을 두고 왔어요"
+                           : ph == 4 ? (g_wzOk ? L"이대로 쓰기" : L"닫기") : L"";
+        SetWindowTextW(g_hWizNext, lbl);
+        ShowWindow(g_hWizNext, (ph == 0 || ph == 2 || ph == 4) ? SW_SHOW : SW_HIDE);
+    }
     if (g_hWiz) InvalidateRect(g_hWiz, nullptr, TRUE);
 }
 
@@ -2362,22 +2371,26 @@ static LRESULT CALLBACK WizProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         switch (g_wzPhase) {
         case 0:
             title = L"내 자리에 맞게 재보기";
-            body  = L"2분쯤 걸려요. 폰은 평소 두는 자리에 그대로 두세요.\n"
-                    L"주머니에 넣고 다닌다면 주머니에 넣은 채로 하세요.";
+            body  = L"2분쯤 걸려요. 순서는 이렇습니다.\n\n"
+                    L"1.  폰을 평소 두는 자리에 두고 1분 동안 앉아 있기\n"
+                    L"2.  폰만 \"화면이 꺼지길 원하는 곳\" 에 두고 오기\n"
+                    L"3.  자리에 앉아서 45초 기다리기";
             break;
         case 1:
             title = L"1/3  자리에 앉아 계세요";
-            body  = L"컴퓨터를 건드리지 말고 그냥 앉아 계시면 돼요.";
+            body  = L"폰은 평소 두는 자리에 그대로 두세요.\n"
+                    L"컴퓨터는 건드리지 않아도 돼요.";
             swprintf_s(live, L"%d초 남음   ·   %d번 받음", g_wzLeft, (int)g_wzSeated.size());
             break;
         case 2:
-            title = L"2/3  이제 자리를 비워 주세요";
-            body  = L"화면이 안 보이는 곳까지 걸어가세요.\n걸어가는 동안은 재지 않아요.";
-            swprintf_s(live, L"%d초 남음", g_wzLeft);
+            title = L"2/3  폰을 두고 오세요";
+            body  = L"화면이 꺼지길 원하는 곳에 폰을 두고,\n"
+                    L"자리로 돌아와서 아래 버튼을 눌러 주세요.\n\n"
+                    L"폰은 가져오지 마세요. 재는 동안 거기 있어야 해요.";
             break;
         case 3:
-            title = L"3/3  그대로 계세요";
-            body  = L"곧 끝나요. 자리로 돌아오지 마세요.";
+            title = L"3/3  거의 다 됐어요";
+            body  = L"그대로 기다려 주세요.\n폰을 가지러 가지 마세요.";
             swprintf_s(live, L"%d초 남음   ·   %d번 받음", g_wzLeft, (int)g_wzAway.size());
             break;
         default:
@@ -2424,20 +2437,20 @@ static LRESULT CALLBACK WizProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (wParam != IDT_WIZ) break;
         if (g_wzPhase == 1) WzCollect(&g_wzSeated);
         else if (g_wzPhase == 3) WzCollect(&g_wzAway);
-        else if (g_wzPhase == 2) WzCollect(nullptr);   // 걸어가는 중: 버린다
+        else if (g_wzPhase == 2) WzCollect(nullptr);   // 옮기는 중: 버린다
 
-        if (g_wzPhase >= 1 && g_wzPhase <= 3) {
+        if (g_wzPhase == 1 || g_wzPhase == 3) {
             static int half = 0;
             if (++half >= 2) {   // 타이머는 0.5초, 카운트다운은 1초
                 half = 0;
                 if (--g_wzLeft <= 0) WzSetPhase(g_wzPhase + 1);
                 else {
-                    int total = (g_wzPhase == 1 ? kWzSeated : g_wzPhase == 2 ? kWzWalk : kWzAway);
+                    int total = (g_wzPhase == 1 ? kWzSeated : kWzAway);
                     SendMessageW(g_hWizProg, PBM_SETPOS, total - g_wzLeft, 0);
                 }
             }
-            InvalidateRect(hWnd, nullptr, TRUE);
         }
+        InvalidateRect(hWnd, nullptr, TRUE);
         return 0;
     }
 
@@ -2447,6 +2460,8 @@ static LRESULT CALLBACK WizProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (g_wzPhase == 0) {
                 g_wzSeated.clear(); g_wzAway.clear();
                 WzSetPhase(1);
+            } else if (g_wzPhase == 2) {
+                WzSetPhase(3);
             } else if (g_wzPhase == 4) {
                 if (g_wzOk) {
                     AppConfig c; LoadAppConfig(c);
@@ -2474,6 +2489,21 @@ static LRESULT CALLBACK WizProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 static void OpenWizard(HWND parent) {
     if (g_hWiz) { SetForegroundWindow(g_hWiz); return; }
+    // 폰을 모르면 잴 것이 없다. 스캐너가 어느 광고가 내 폰인지 가려내지
+    // 못하면 표본이 하나도 안 쌓이고, 마법사는 "신호를 거의 못 받았어요" 로
+    // 끝난다 - 원인이 등록인데 엉뚱한 곳을 보게 된다.
+    {
+        AppConfig pc; LoadAppConfig(pc);
+        if (pc.phoneToken.empty()) {
+            if (MessageBoxW(parent,
+                    L"먼저 폰을 등록해야 해요.\n\n"
+                    L"어느 신호가 내 폰인지 알아야 거리를 잴 수 있어요.\n"
+                    L"지금 등록할까요?",
+                    L"내 자리에 맞게 재보기", MB_OKCANCEL | MB_ICONINFORMATION) == IDOK)
+                SendMessageW(parent, WM_COMMAND, IDS_PHONE, 0);
+            return;
+        }
+    }
     if (!g_monitoring) {
         MessageBoxW(parent,
             L"먼저 보호를 켜야 신호를 받을 수 있어요.\n[고급 설정] 에서 시작을 눌러 주세요.",
