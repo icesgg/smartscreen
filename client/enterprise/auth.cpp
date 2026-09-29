@@ -5,14 +5,20 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <winhttp.h>
+#include <shellapi.h>
 #include <bcrypt.h>
 #include <wincrypt.h>
 #include <vector>
 #include <string>
+#include <ctime>
+#include <cstdlib>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "shell32.lib")
 
 // ---------------------------------------------------------------------------
 // base64
@@ -296,5 +302,314 @@ bool UnprotectSecret(const std::wstring& b64, std::wstring& outPlain) {
     }
     outPlain.assign((wchar_t*)out.pbData, out.cbData / sizeof(wchar_t));
     LocalFree(out.pbData);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP (WinHTTP)
+// ---------------------------------------------------------------------------
+// supabase.cpp 에도 GET 이 있지만 static 이고 본문을 보내지 못한다.
+// 토큰 교환은 POST + JSON 본문이라 여기에 따로 둔다.
+static bool HttpRequest(const wchar_t* verb, const std::wstring& url,
+                        const std::vector<std::wstring>& headers,
+                        const std::string& body,
+                        DWORD& outStatus, std::string& outBody) {
+    outStatus = 0;
+    outBody.clear();
+
+    URL_COMPONENTS uc{};
+    uc.dwStructSize = sizeof(uc);
+    wchar_t host[256] = {}, path[2048] = {};
+    uc.lpszHostName = host;      uc.dwHostNameLength = _countof(host);
+    uc.lpszUrlPath = path;       uc.dwUrlPathLength = _countof(path);
+    // 질의 문자열은 lpszUrlPath 뒤에 이어 붙는다 (ExtraInfo 를 따로 안 받으면)
+    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) return false;
+
+    HINTERNET hSession = WinHttpOpen(L"SmartScreen/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return false;
+
+    HINTERNET hConnect = WinHttpConnect(hSession, host, uc.nPort, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
+
+    DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET hReq = WinHttpOpenRequest(hConnect, verb, path, nullptr,
+                                        WINHTTP_NO_REFERER,
+                                        WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!hReq) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
+
+    for (const auto& h : headers)
+        WinHttpAddRequestHeaders(hReq, h.c_str(), (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+
+    bool ok = false;
+    if (WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                           body.empty() ? WINHTTP_NO_REQUEST_DATA : (LPVOID)body.data(),
+                           (DWORD)body.size(), (DWORD)body.size(), 0) &&
+        WinHttpReceiveResponse(hReq, nullptr)) {
+
+        DWORD code = 0, sz = sizeof(code);
+        WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &code, &sz, WINHTTP_NO_HEADER_INDEX);
+        outStatus = code;
+
+        char buf[4096];
+        DWORD n = 0;
+        while (WinHttpReadData(hReq, buf, sizeof(buf), &n) && n > 0)
+            outBody.append(buf, n);
+        ok = true;
+    }
+
+    WinHttpCloseHandle(hReq);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// 아주 작은 JSON 읽기
+// ---------------------------------------------------------------------------
+// 응답 모양이 고정이라 파서를 들이지 않는다. 다만 "찾은 첫 문자열"을 쓰면
+// 엉뚱한 값을 집으므로 "키":  꼴을 정확히 맞춘다.
+static bool JsonFindString(const std::string& body, const std::string& key,
+                           std::string& out) {
+    out.clear();
+    std::string pat = "\"" + key + "\"";
+    size_t p = 0;
+    while ((p = body.find(pat, p)) != std::string::npos) {
+        size_t c = body.find(':', p + pat.size());
+        if (c == std::string::npos) return false;
+        size_t q = body.find_first_not_of(" \t\r\n", c + 1);
+        if (q == std::string::npos) return false;
+        if (body[q] != '"') { p = q; continue; }   // 문자열이 아닌 값
+        ++q;
+        std::string v;
+        while (q < body.size() && body[q] != '"') {
+            if (body[q] == '\\' && q + 1 < body.size()) {
+                ++q;
+                switch (body[q]) {
+                    case 'n': v += '\n'; break;
+                    case 't': v += '\t'; break;
+                    case 'r': v += '\r'; break;
+                    default:  v += body[q]; break;
+                }
+            } else {
+                v += body[q];
+            }
+            ++q;
+        }
+        out = v;
+        return true;
+    }
+    return false;
+}
+
+static bool JsonFindNumber(const std::string& body, const std::string& key, long long& out) {
+    std::string pat = "\"" + key + "\"";
+    size_t p = body.find(pat);
+    if (p == std::string::npos) return false;
+    size_t c = body.find(':', p + pat.size());
+    if (c == std::string::npos) return false;
+    size_t q = body.find_first_not_of(" \t\r\n", c + 1);
+    if (q == std::string::npos) return false;
+    out = _atoi64(body.c_str() + q);
+    return true;
+}
+
+static std::wstring Widen(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring w(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+    return w;
+}
+
+static std::string Narrow(const std::wstring& w) {
+    if (w.empty()) return std::string();
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+// 질의 문자열에 실을 값 인코딩
+static std::wstring UrlEncode(const std::wstring& in) {
+    std::string utf8 = Narrow(in);
+    std::wstring out;
+    wchar_t hex[4];
+    for (unsigned char c : utf8) {
+        bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                          (c >= '0' && c <= '9') || c == '-' || c == '.' ||
+                          c == '_' || c == '~';
+        if (unreserved) { out += (wchar_t)c; continue; }
+        swprintf_s(hex, L"%%%02X", c);
+        out += hex;
+    }
+    return out;
+}
+
+// 오류 본문에서 사람이 읽을 문장을 고른다. Supabase 는 키 이름이 일정하지 않다.
+static std::wstring PickError(const std::string& body, DWORD status) {
+    for (const char* k : { "error_description", "msg", "message", "error" }) {
+        std::string v;
+        if (JsonFindString(body, k, v) && !v.empty()) return Widen(v);
+    }
+    wchar_t buf[64];
+    swprintf_s(buf, L"HTTP %lu", status);
+    return buf;
+}
+
+// ---------------------------------------------------------------------------
+// 응답 -> 세션
+// ---------------------------------------------------------------------------
+static bool ParseSession(const std::string& body, AuthSession& s) {
+    std::string at, rt;
+    if (!JsonFindString(body, "access_token", at) || at.empty()) return false;
+    if (!JsonFindString(body, "refresh_token", rt) || rt.empty()) return false;
+    s.accessToken = Widen(at);
+    s.refreshToken = Widen(rt);
+
+    long long expiresIn = 3600;
+    JsonFindNumber(body, "expires_in", expiresIn);
+    s.expiresAtUnix = (ULONGLONG)(_time64(nullptr) + expiresIn);
+
+    // user 객체 안의 id/email. 최상위에 같은 이름이 없어 첫 등장으로 충분하다.
+    std::string id, em;
+    if (JsonFindString(body, "id", id)) s.userId = Widen(id);
+    if (JsonFindString(body, "email", em)) s.email = Widen(em);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// 구글 로그인
+// ---------------------------------------------------------------------------
+bool SignInWithGoogle(const std::wstring& supabaseUrl, const std::wstring& anonKey,
+                      AuthSession& outSession, std::wstring& outErr,
+                      unsigned timeoutSec) {
+    outErr.clear();
+    if (supabaseUrl.empty() || anonKey.empty()) {
+        outErr = L"서버 주소나 키가 비어 있다";
+        return false;
+    }
+
+    std::string verifier = MakeCodeVerifier();
+    std::string challenge;
+    if (verifier.empty() || !MakeCodeChallengeS256(verifier, challenge)) {
+        outErr = L"PKCE 값을 만들지 못했다";
+        return false;
+    }
+
+    LoopbackListener listener;
+    unsigned short port = listener.Start();
+    if (port == 0) {
+        outErr = L"127.0.0.1 에 리스너를 못 띄웠다";
+        return false;
+    }
+
+    wchar_t redirect[64];
+    swprintf_s(redirect, L"http://127.0.0.1:%u", port);
+
+    std::wstring url = supabaseUrl + L"/auth/v1/authorize?provider=google"
+                     + L"&redirect_to=" + UrlEncode(redirect)
+                     + L"&code_challenge=" + UrlEncode(Widen(challenge))
+                     + L"&code_challenge_method=s256";
+
+    // 시스템 브라우저로 연다. 임베디드 웹뷰는 구글이 거부한다.
+    HINSTANCE r = ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    if ((INT_PTR)r <= 32) {
+        outErr = L"브라우저를 열지 못했다";
+        return false;
+    }
+
+    std::string code, err;
+    if (!listener.WaitForCode(timeoutSec * 1000, code, err)) {
+        outErr = err.empty() ? L"로그인이 시간 안에 끝나지 않았다" : Widen(err);
+        return false;
+    }
+
+    // 코드 -> 토큰. verifier 는 여기서 처음 밖으로 나간다.
+    std::string body = "{\"auth_code\":\"" + code + "\",\"code_verifier\":\"" + verifier + "\"}";
+    std::vector<std::wstring> headers = {
+        L"apikey: " + anonKey,
+        L"Content-Type: application/json",
+    };
+    DWORD status = 0;
+    std::string resp;
+    if (!HttpRequest(L"POST", supabaseUrl + L"/auth/v1/token?grant_type=pkce",
+                     headers, body, status, resp)) {
+        outErr = L"토큰 교환 요청이 실패했다";
+        return false;
+    }
+    if (status < 200 || status >= 300) {
+        outErr = PickError(resp, status);
+        return false;
+    }
+    if (!ParseSession(resp, outSession)) {
+        outErr = L"토큰 응답을 읽지 못했다";
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// 세션 갱신
+// ---------------------------------------------------------------------------
+bool RefreshSession(const std::wstring& supabaseUrl, const std::wstring& anonKey,
+                    const std::wstring& refreshToken,
+                    AuthSession& outSession, std::wstring& outErr) {
+    outErr.clear();
+    if (refreshToken.empty()) { outErr = L"저장된 세션이 없다"; return false; }
+
+    std::string body = "{\"refresh_token\":\"" + Narrow(refreshToken) + "\"}";
+    std::vector<std::wstring> headers = {
+        L"apikey: " + anonKey,
+        L"Content-Type: application/json",
+    };
+    DWORD status = 0;
+    std::string resp;
+    if (!HttpRequest(L"POST", supabaseUrl + L"/auth/v1/token?grant_type=refresh_token",
+                     headers, body, status, resp)) {
+        outErr = L"갱신 요청이 실패했다";
+        return false;
+    }
+    if (status < 200 || status >= 300) {
+        outErr = PickError(resp, status);
+        return false;
+    }
+    if (!ParseSession(resp, outSession)) {
+        outErr = L"갱신 응답을 읽지 못했다";
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// 계정에 묶인 폰 토큰 가져오기
+// ---------------------------------------------------------------------------
+bool FetchDeviceToken(const std::wstring& supabaseUrl, const std::wstring& anonKey,
+                      const AuthSession& session,
+                      std::wstring& outTokenHex, std::wstring& outErr) {
+    outTokenHex.clear();
+    outErr.clear();
+    if (session.accessToken.empty()) { outErr = L"로그인하지 않았다"; return false; }
+
+    std::vector<std::wstring> headers = {
+        L"apikey: " + anonKey,
+        L"Authorization: Bearer " + session.accessToken,
+    };
+    DWORD status = 0;
+    std::string resp;
+    if (!HttpRequest(L"GET", supabaseUrl + L"/rest/v1/device_tokens?select=token",
+                     headers, std::string(), status, resp)) {
+        outErr = L"조회 요청이 실패했다";
+        return false;
+    }
+    if (status < 200 || status >= 300) {
+        outErr = PickError(resp, status);
+        return false;
+    }
+    // 행이 없으면 "[]" 다. 이건 오류가 아니라 "폰에서 아직 로그인 안 함" 이다.
+    std::string tok;
+    if (JsonFindString(resp, "token", tok) && !tok.empty())
+        outTokenHex = Widen(tok);
     return true;
 }

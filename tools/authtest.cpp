@@ -7,6 +7,9 @@
 //
 //   AuthTest.exe          자체 점검만
 //   AuthTest.exe --serve  루프백 리스너를 띄우고 브라우저로 직접 확인
+//   AuthTest.exe --login <url> <anonkey>
+//                         실제 구글 로그인 왕복. 브라우저가 열린다.
+//                         SmartScreen.exe 를 건드리지 않고 시험할 수 있다.
 #include "../client/enterprise/auth.h"
 
 #include <winsock2.h>
@@ -26,6 +29,55 @@ int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
 
     bool serve = (argc > 1 && strcmp(argv[1], "--serve") == 0);
+
+    if (argc > 3 && strcmp(argv[1], "--login") == 0) {
+        auto widen = [](const char* s) {
+            int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
+            std::wstring w(n, L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, s, -1, &w[0], n);
+            if (!w.empty() && w.back() == L'\0') w.pop_back();
+            return w;
+        };
+        std::wstring url = widen(argv[2]), key = widen(argv[3]);
+
+        printf("구글 로그인\n");
+        printf("  브라우저가 열린다. 구글 계정으로 로그인하고 돌아와라.\n");
+        AuthSession s;
+        std::wstring err;
+        if (!SignInWithGoogle(url, key, s, err)) {
+            printf("  [FAIL] 로그인: %ls\n", err.c_str());
+            return 1;
+        }
+        printf("  [OK] 로그인  user=%ls  email=%ls\n", s.userId.c_str(), s.email.c_str());
+        printf("       access_token %zu자, refresh_token %zu자\n",
+               s.accessToken.size(), s.refreshToken.size());
+
+        // 갱신이 되는지까지 봐야 다음에 앱을 켤 때 다시 로그인시키지 않는다.
+        AuthSession s2;
+        if (!RefreshSession(url, key, s.refreshToken, s2, err))
+            printf("  [FAIL] 세션 갱신: %ls\n", err.c_str());
+        else
+            printf("  [OK] 세션 갱신 (access_token 이 %s)\n",
+                   s2.accessToken == s.accessToken ? "그대로" : "새로 나왔다");
+
+        std::wstring tok;
+        if (!FetchDeviceToken(url, key, s, tok, err)) {
+            printf("  [FAIL] 토큰 조회: %ls\n", err.c_str());
+        } else if (tok.empty()) {
+            printf("  [OK] 조회 성공, 아직 등록된 폰 없음 (폰에서 로그인하면 생긴다)\n");
+        } else {
+            printf("  [OK] 폰 토큰 %ls\n", tok.c_str());
+        }
+
+        // 봉해서 넣었다 꺼내는 것까지가 한 바퀴다
+        std::wstring sealed, opened;
+        if (ProtectSecret(s.refreshToken, sealed) &&
+            UnprotectSecret(sealed, opened) && opened == s.refreshToken)
+            printf("  [OK] refresh token DPAPI 왕복 (%zu자로 봉인)\n", sealed.size());
+        else
+            printf("  [FAIL] refresh token DPAPI 왕복\n");
+        return 0;
+    }
 
     printf("PKCE (RFC 7636)\n");
     {

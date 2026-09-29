@@ -62,3 +62,35 @@ bool UnprotectSecret(const std::wstring& b64, std::wstring& outPlain);
 // 표준 base64 (DPAPI 산출물 보관용). base64url 과 다르다.
 std::string Base64Encode(const unsigned char* data, size_t len);
 bool        Base64Decode(const std::string& in, std::string& out);
+
+// ---------------------------------------------------------------------------
+// Supabase Auth
+// ---------------------------------------------------------------------------
+struct AuthSession {
+    std::wstring accessToken;    // 수명 1시간짜리. 요청에 싣는 값
+    std::wstring refreshToken;   // 보관용. config 에는 DPAPI 로 봉해서 넣는다
+    std::wstring userId;
+    std::wstring email;
+    // 이 헤더는 <string> 말고는 아무것도 요구하지 않는다. windows.h 를 끌어오면
+    // 이걸 포함하는 쪽의 헤더 순서 문제가 된다 (config.h 가 winsock2 로 겪은 일).
+    unsigned long long expiresAtUnix = 0;
+};
+
+// 브라우저를 열어 구글 로그인을 받고, 돌아온 코드를 세션으로 바꾼다.
+// 사용자가 브라우저에서 시간을 쓰므로 timeoutSec 은 넉넉해야 한다(기본 3분).
+// 호출하는 쪽이 UI 스레드를 막지 않도록 별도 스레드에서 부를 것.
+bool SignInWithGoogle(const std::wstring& supabaseUrl, const std::wstring& anonKey,
+                      AuthSession& outSession, std::wstring& outErr,
+                      unsigned timeoutSec = 180);
+
+// 저장해 둔 refresh token 으로 세션을 되살린다. 앱을 켤 때마다 부른다.
+bool RefreshSession(const std::wstring& supabaseUrl, const std::wstring& anonKey,
+                    const std::wstring& refreshToken,
+                    AuthSession& outSession, std::wstring& outErr);
+
+// 로그인한 계정에 묶인 폰 토큰을 가져온다.
+// 아직 폰에서 로그인한 적이 없으면 행이 없다 - 그때는 true 를 주고 토큰은 빈 값이다.
+// (없는 것과 못 가져온 것은 사용자에게 다른 말을 해 줘야 한다)
+bool FetchDeviceToken(const std::wstring& supabaseUrl, const std::wstring& anonKey,
+                      const AuthSession& session,
+                      std::wstring& outTokenHex, std::wstring& outErr);
