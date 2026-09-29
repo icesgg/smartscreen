@@ -721,7 +721,10 @@ static void StartMon() {
     g_monStartTick = GetTickCount64();
     g_lastInputTick = GetTickCount64();
     if (cfg.bleGattServer) {
-        bool ok = g_bleGatt.Start(!cfg.bleGattEncrypt, GetConfigDir() + L"\\gatt_rssi_log.csv");
+        // 진단 로그는 bleDebugLog 를 따른다. 예전에는 경로를 조건 없이 넘겨서
+        // 광고 로그만 꺼지고 이쪽은 계속 자랐다 - 끈 줄 알고 둔 채로.
+        bool ok = g_bleGatt.Start(!cfg.bleGattEncrypt,
+            cfg.bleDebugLog ? GetConfigDir() + L"\\gatt_rssi_log.csv" : L"");
         DbgEvent(L"GATT server start: %s (encrypt=%d, thr=%d dBm)",
             ok ? L"OK" : L"FAILED", cfg.bleGattEncrypt ? 1 : 0, g_gattRssiThreshold);
     } else {
