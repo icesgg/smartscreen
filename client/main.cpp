@@ -2109,6 +2109,38 @@ static const wchar_t* kSimpleIdleLabel[4] = { L"바로", L"15초", L"30초", L"1
 static const int kDistOffset[3] = { +6, 0, -6 };   // 가까이 / 보통 / 멀리
 static constexpr int kDistFallbackBase = -64;
 
+// 윈도우 11 빠른 설정 패널의 생김새를 따른다. 기본 Win32 버튼은 회색 입체
+// 테두리라 옆에 두면 20년쯤 낡아 보인다. 둥근 사각형에 평면 색으로 직접 그린다.
+static constexpr COLORREF kPanelBg   = RGB(0xF3, 0xF3, 0xF3);
+static constexpr COLORREF kTileBg    = RGB(0xFB, 0xFB, 0xFB);
+static constexpr COLORREF kTileEdge  = RGB(0xE1, 0xE1, 0xE1);
+static constexpr COLORREF kTilePress = RGB(0xEA, 0xEA, 0xEA);
+static constexpr COLORREF kAccent    = RGB(0x00, 0x67, 0xC0);
+static constexpr COLORREF kAccentDn  = RGB(0x00, 0x55, 0x9E);
+static constexpr COLORREF kInk       = RGB(0x1A, 0x1A, 0x1A);
+static constexpr COLORREF kInkSoft   = RGB(0x5D, 0x5D, 0x5D);
+static HBRUSH g_hPanelBrush = nullptr;
+
+// 둥근 타일 하나. 테두리 없이 칠하면 흰 타일이 흰 배경에 묻히므로 항상 그린다.
+static void DrawTile(HDC hdc, RECT rc, COLORREF fill, COLORREF edge,
+                     COLORREF ink, const wchar_t* text, HFONT font, int radius = 14) {
+    HBRUSH br = CreateSolidBrush(fill);
+    HPEN   pn = CreatePen(PS_SOLID, 1, edge);
+    HBRUSH ob = (HBRUSH)SelectObject(hdc, br);
+    HPEN   op = (HPEN)SelectObject(hdc, pn);
+    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+    SelectObject(hdc, ob); SelectObject(hdc, op);
+    DeleteObject(br); DeleteObject(pn);
+
+    if (text && *text) {
+        HFONT of = (HFONT)SelectObject(hdc, font ? font : g_hFont);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, ink);
+        DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        SelectObject(hdc, of);
+    }
+}
+
 static int SimpleBaseRssi() {
     AppConfig c;
     LoadAppConfig(c);
@@ -2159,10 +2191,8 @@ static void SimpleRefresh() {
     SetWindowTextW(g_hSimpleMeasure,
         c.measuredBaseRssi != 0 ? L"내 자리에 맞게 다시 재기" : L"내 자리에 맞게 재보기  (아직 안 했어요)");
 
-    for (int i = 0; i < 4; i++) {
-        bool on = (g_idleCountdownSec == kSimpleIdle[i]);
-        SendMessageW(g_hSimpleIdle[i], BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
-    }
+    for (int i = 0; i < 4; i++)
+        if (g_hSimpleIdle[i]) InvalidateRect(g_hSimpleIdle[i], nullptr, TRUE);
     InvalidateRect(g_hSimple, nullptr, FALSE);
 }
 
@@ -2173,7 +2203,7 @@ static LRESULT CALLBACK SimpleProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
         int x = 22, w = SW_W - 62, y = 14;
 
         CreateWindowExW(0, L"BUTTON", L"고급 설정",
-            WS_CHILD | WS_VISIBLE, SW_W - 130, y, 88, 26,
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, SW_W - 132, y, 92, 28,
             hWnd, (HMENU)(UINT_PTR)IDS_ADVANCED, hI, nullptr);
 
         y = 62;   // 상태 카드는 WM_PAINT 가 그린다
@@ -2185,16 +2215,16 @@ static LRESULT CALLBACK SimpleProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
         g_hSimplePhone = CreateWindowExW(0, L"STATIC", L"",
             WS_CHILD | WS_VISIBLE | SS_PATHELLIPSIS, x, y + 5, w - 96, 20,
             hWnd, nullptr, hI, nullptr);
-        CreateWindowExW(0, L"BUTTON", L"바꾸기", WS_CHILD | WS_VISIBLE,
-            x + w - 88, y, 88, 30, hWnd, (HMENU)(UINT_PTR)IDS_PHONE, hI, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"바꾸기", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            x + w - 88, y, 88, 32, hWnd, (HMENU)(UINT_PTR)IDS_PHONE, hI, nullptr);
 
         y += 48;
         CreateWindowExW(0, L"STATIC", L"얼마나 멀어지면 가릴까요?", WS_CHILD | WS_VISIBLE,
             x, y, 300, 18, hWnd, nullptr, hI, nullptr);
         y += 22;
         g_hSimpleDist = CreateWindowExW(0, TRACKBAR_CLASS, L"",
-            WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS, x, y, w, 30,
-            hWnd, (HMENU)(UINT_PTR)IDS_DIST, hI, nullptr);
+            WS_CHILD | WS_VISIBLE | TBS_NOTICKS | TBS_TRANSPARENTBKGND,
+            x, y, w, 32, hWnd, (HMENU)(UINT_PTR)IDS_DIST, hI, nullptr);
         SendMessageW(g_hSimpleDist, TBM_SETRANGE, TRUE, MAKELPARAM(0, 2));
         SendMessageW(g_hSimpleDist, TBM_SETPAGESIZE, 0, 1);
         y += 32;
@@ -2207,7 +2237,7 @@ static LRESULT CALLBACK SimpleProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
 
         y += 24;
         g_hSimpleMeasure = CreateWindowExW(0, L"BUTTON", L"",
-            WS_CHILD | WS_VISIBLE, x, y, w, 32,
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, x, y, w, 36,
             hWnd, (HMENU)(UINT_PTR)IDS_MEASURE, hI, nullptr);
 
         y += 50;
@@ -2216,8 +2246,8 @@ static LRESULT CALLBACK SimpleProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
         y += 22;
         for (int i = 0; i < 4; i++) {
             g_hSimpleIdle[i] = CreateWindowExW(0, L"BUTTON", kSimpleIdleLabel[i],
-                WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | BS_PUSHLIKE | (i == 0 ? WS_GROUP : 0),
-                x + i * (w / 4), y, w / 4 - 6, 30,
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                x + i * (w / 4), y, w / 4 - 8, 38,
                 hWnd, (HMENU)(UINT_PTR)(IDS_IDLE_BASE + i), hI, nullptr);
         }
 
@@ -2225,12 +2255,12 @@ static LRESULT CALLBACK SimpleProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
         CreateWindowExW(0, L"STATIC", L"가릴 때 보여줄 그림", WS_CHILD | WS_VISIBLE,
             x, y, 300, 18, hWnd, nullptr, hI, nullptr);
         y += 22;
-        CreateWindowExW(0, L"BUTTON", L"그림 고르기", WS_CHILD | WS_VISIBLE,
-            x, y, 140, 30, hWnd, (HMENU)(UINT_PTR)IDS_IMAGE, hI, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"그림 고르기", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            x, y, 150, 36, hWnd, (HMENU)(UINT_PTR)IDS_IMAGE, hI, nullptr);
 
         y += 52;
-        CreateWindowExW(0, L"BUTTON", L"지금 가리기", WS_CHILD | WS_VISIBLE,
-            x, y, w, 38, hWnd, (HMENU)(UINT_PTR)IDS_LOCKNOW, hI, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"지금 가리기", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            x, y, w, 42, hWnd, (HMENU)(UINT_PTR)IDS_LOCKNOW, hI, nullptr);
 
         EnumChildWindows(hWnd, [](HWND h, LPARAM f) -> BOOL {
             SendMessage(h, WM_SETFONT, (WPARAM)f, TRUE); return TRUE;
@@ -2261,7 +2291,12 @@ static LRESULT CALLBACK SimpleProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
         }
 
         HBRUSH br = CreateSolidBrush(bg);
-        FillRect(hdc, &rc, br); DeleteObject(br);
+        HPEN pn = CreatePen(PS_SOLID, 1, bg);
+        HBRUSH ob = (HBRUSH)SelectObject(hdc, br);
+        HPEN op = (HPEN)SelectObject(hdc, pn);
+        RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 16, 16);
+        SelectObject(hdc, ob); SelectObject(hdc, op);
+        DeleteObject(br); DeleteObject(pn);
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, RGB(255, 255, 255));
         RECT t1 = { rc.left + 18, rc.top + 14, rc.right - 18, rc.top + 48 };
@@ -2274,11 +2309,84 @@ static LRESULT CALLBACK SimpleProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
         EndPaint(hWnd, &ps); return 0;
     }
 
+    case WM_ERASEBKGND: {
+        RECT rc; GetClientRect(hWnd, &rc);
+        if (!g_hPanelBrush) g_hPanelBrush = CreateSolidBrush(kPanelBg);
+        FillRect((HDC)wParam, &rc, g_hPanelBrush);
+        return 1;
+    }
+
     case WM_CTLCOLORSTATIC: {
-        // 이걸 안 두면 DefWindowProc 이 COLOR_BTNFACE 를 돌려줘서, 흰 창 위에
+        // 이걸 안 두면 DefWindowProc 이 COLOR_BTNFACE 를 돌려줘서, 패널 위에
         // 라벨마다 회색 상자가 얹힌다.
         SetBkMode((HDC)wParam, TRANSPARENT);
-        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+        SetTextColor((HDC)wParam, kInkSoft);
+        if (!g_hPanelBrush) g_hPanelBrush = CreateSolidBrush(kPanelBg);
+        return (LRESULT)g_hPanelBrush;
+    }
+
+    case WM_NOTIFY: {
+        // 기본 트랙바는 가는 홈에 각진 손잡이라, 옆의 둥근 타일과 안 어울린다.
+        // 굵은 막대와 동그란 손잡이로 직접 그린다.
+        auto* nh = (NMHDR*)lParam;
+        if (nh->code != NM_CUSTOMDRAW || nh->hwndFrom != g_hSimpleDist) break;
+        auto* cd = (NMCUSTOMDRAW*)lParam;
+        if (cd->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+        if (cd->dwDrawStage != CDDS_ITEMPREPAINT) return CDRF_DODEFAULT;
+
+        if (cd->dwItemSpec == TBCD_TICS) return CDRF_SKIPDEFAULT;
+
+        if (cd->dwItemSpec == TBCD_CHANNEL) {
+            RECT tr{}; SendMessageW(g_hSimpleDist, TBM_GETTHUMBRECT, 0, (LPARAM)&tr);
+            int mid = (cd->rc.top + cd->rc.bottom) / 2;
+            RECT rest = { cd->rc.left, mid - 2, cd->rc.right, mid + 2 };
+            HBRUSH b1 = CreateSolidBrush(RGB(0xC4, 0xC4, 0xC4));
+            FillRect(cd->hdc, &rest, b1); DeleteObject(b1);
+            // 손잡이까지는 강조색으로 채운다 - 어디까지 왔는지가 보인다
+            RECT done = { cd->rc.left, mid - 2, (tr.left + tr.right) / 2, mid + 2 };
+            HBRUSH b2 = CreateSolidBrush(kAccent);
+            FillRect(cd->hdc, &done, b2); DeleteObject(b2);
+            return CDRF_SKIPDEFAULT;
+        }
+
+        if (cd->dwItemSpec == TBCD_THUMB) {
+            int cx = (cd->rc.left + cd->rc.right) / 2;
+            int cy = (cd->rc.top + cd->rc.bottom) / 2;
+            HBRUSH br = CreateSolidBrush(kAccent);
+            HPEN   pn = CreatePen(PS_SOLID, 3, RGB(0xFF, 0xFF, 0xFF));
+            HBRUSH ob = (HBRUSH)SelectObject(cd->hdc, br);
+            HPEN   op = (HPEN)SelectObject(cd->hdc, pn);
+            Ellipse(cd->hdc, cx - 9, cy - 9, cx + 9, cy + 9);
+            SelectObject(cd->hdc, ob); SelectObject(cd->hdc, op);
+            DeleteObject(br); DeleteObject(pn);
+            return CDRF_SKIPDEFAULT;
+        }
+        return CDRF_DODEFAULT;
+    }
+
+    case WM_DRAWITEM: {
+        auto* di = (DRAWITEMSTRUCT*)lParam;
+        if (di->CtlType != ODT_BUTTON) break;
+        bool down = (di->itemState & ODS_SELECTED) != 0;
+        int  id = (int)di->CtlID;
+
+        wchar_t label[192] = L"";
+        GetWindowTextW(di->hwndItem, label, _countof(label));
+
+        // 파란 타일은 둘뿐이다: 지금 고른 시간과, 이 화면의 주 동작.
+        // 전부 파랗게 하면 무엇이 켜져 있는지가 안 보인다.
+        bool accent = (id == IDS_LOCKNOW) ||
+                      (id >= IDS_IDLE_BASE && id < IDS_IDLE_BASE + 4 &&
+                       g_idleCountdownSec == kSimpleIdle[id - IDS_IDLE_BASE]);
+        bool ghost = (id == IDS_ADVANCED);
+
+        COLORREF fill, edge, ink;
+        if (accent)     { fill = down ? kAccentDn : kAccent; edge = fill;      ink = RGB(255,255,255); }
+        else if (ghost) { fill = down ? kTilePress : kPanelBg; edge = kTileEdge; ink = kInkSoft; }
+        else            { fill = down ? kTilePress : kTileBg;  edge = kTileEdge; ink = kInk; }
+
+        DrawTile(di->hDC, di->rcItem, fill, edge, ink, label, g_hFont, ghost ? 10 : 14);
+        return TRUE;
     }
 
     case WM_HSCROLL:
