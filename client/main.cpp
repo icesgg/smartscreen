@@ -2467,7 +2467,12 @@ static LRESULT CALLBACK WizProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                     AppConfig c; LoadAppConfig(c);
                     c.measuredBaseRssi = g_wzBase;
                     SaveAppConfig(c);
-                    SimpleApplyDist(SimpleDistStep());   // 새 기준으로 다시 계산
+                    // 방금 잰 값이 "보통" 이다. 여기서 SimpleDistStep() 을 쓰면
+                    // 안 된다 - 그건 예전 절대 임계값에 가장 가까운 단계를 찾는데,
+                    // 기준이 방금 바뀌었으니 그 비교는 뜻이 없다. 실제로 연달아
+                    // 재면 "가까이" 가 잡혔고, 그 값은 착석 최저값보다 위여서
+                    // 앉아 있는 사람 앞에서 화면이 꺼진다.
+                    SimpleApplyDist(1);
                     SimpleRefresh();
                 }
                 DestroyWindow(hWnd);
