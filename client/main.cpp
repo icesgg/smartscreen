@@ -679,9 +679,10 @@ static void StartMon() {
     // latency fallback용 (호환성)
     g_nearLatencyMs = 200;
 
-    int awayIdx = (int)SendMessageW(g_hComboAway, CB_GETCURSEL, 0, 0);
+    // 콤보를 없앴으므로 config 값을 그대로 쓴다 (기본 5초)
+    int awayIdx = g_hComboAway ? (int)SendMessageW(g_hComboAway, CB_GETCURSEL, 0, 0) : -1;
     if (awayIdx < 0) awayIdx = 0;
-    g_keepAliveSec = kAwayValues[awayIdx];
+    if (awayIdx >= 0 && awayIdx < 3) g_keepAliveSec = kAwayValues[awayIdx];
 
     // Interval is hardcoded to 2s
     g_scanIntervalSec = 2;
@@ -779,7 +780,7 @@ static void StartMon() {
 
     EnableWindow(g_hBtnStart, FALSE); EnableWindow(g_hBtnStop, TRUE);
     EnableWindow(g_hCombo, FALSE);
-    EnableWindow(g_hEditLatency, FALSE); EnableWindow(g_hComboAway, FALSE);
+    EnableWindow(g_hEditLatency, FALSE); if (g_hComboAway) EnableWindow(g_hComboAway, FALSE);
     EnableWindow(g_hComboIdle, FALSE); EnableWindow(g_hComboDelay, FALSE);
 }
 
@@ -799,7 +800,7 @@ static void StopMon() {
     if (g_bBlackActive) DeactivateBlackScreen();
     EnableWindow(g_hBtnStart, TRUE); EnableWindow(g_hBtnStop, FALSE);
     EnableWindow(g_hCombo, TRUE);
-    EnableWindow(g_hEditLatency, TRUE); EnableWindow(g_hComboAway, TRUE);
+    EnableWindow(g_hEditLatency, TRUE); if (g_hComboAway) EnableWindow(g_hComboAway, TRUE);
     EnableWindow(g_hComboIdle, TRUE); EnableWindow(g_hComboDelay, TRUE);
     SetWindowTextW(g_hStateLabel, L"  \xC815\xC9C0\xB428");  // 정지됨
 }
@@ -1098,16 +1099,12 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             WS_CHILD | WS_VISIBLE | SS_LEFT,
             160, row1Y + 3, 55, 20, hWnd, nullptr, hInst, nullptr);
 
-        CreateWindowExW(0, L"STATIC",
-            L"\xC790\xB9AC\xBE44\xC6C0 \xAC10\xC9C0:",  // 자리비움 감지:
-            WS_CHILD | WS_VISIBLE | SS_RIGHT,
-            300, row1Y + 3, labelW + 10, 20, hWnd, nullptr, hInst, nullptr);
-        g_hComboAway = CreateWindowExW(0, L"COMBOBOX", L"",
-            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
-            420, row1Y, comboW, 120, hWnd, (HMENU)(UINT_PTR)ID_COMBO_AWAY, hInst, nullptr);
-        for (int i = 0; i < 3; i++)
-            SendMessageW(g_hComboAway, CB_ADDSTRING, 0, (LPARAM)kAwayLabels[i]);
-        SendMessageW(g_hComboAway, CB_SETCURSEL, 0, 0);  // default: 빠름
+        // "자리비움 감지" 는 여기 있었다. 없앴다: keepAliveSec 에 물려 있는데
+        // 그 값은 latency 경로에서만 쓰이고, 컴패니언 앱으로 도는 정상 구성은
+        // 그 경로를 타지 않는다. 조작해도 아무 일이 안 일어나는 설정을 보여
+        // 주는 것은, 없는 것보다 나쁘다 - 안 되는 이유를 여기서 찾게 된다.
+        // 값과 코드는 남겨 둔다. 앱 없이 쓰는 구성에서는 실제로 쓰인다.
+        // 창에 보이지 않으므로 콤보는 만들지 않는다 (g_hComboAway 는 계속 nullptr).
 
         // Row 2: Unlock Delay + Idle Time
         CreateWindowExW(0, L"STATIC",
@@ -1284,8 +1281,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             // Map loaded values to combo selections
             // RSSI 임계값 표시 (dBm)
             { wchar_t lb[16]; swprintf_s(lb, L"%d", g_nearRssiThreshold); SetWindowTextW(g_hEditLatency, lb); }
-            SendMessageW(g_hComboAway, CB_SETCURSEL,
-                ComboFindValue(kAwayValues, 3, (int)g_keepAliveSec), 0);
+            if (g_hComboAway)
+                SendMessageW(g_hComboAway, CB_SETCURSEL,
+                    ComboFindValue(kAwayValues, 3, (int)g_keepAliveSec), 0);
             SendMessageW(g_hComboDelay, CB_SETCURSEL,
                 ComboFindValue(kDelayValues, 4, g_unlockDelaySec), 0);
             SendMessageW(g_hComboIdle, CB_SETCURSEL,
@@ -2082,7 +2080,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 //
 // 명령은 대부분 고급 창으로 넘긴다. 폰 등록이나 그림 고르기를 여기서 다시
 // 구현하면 두 벌이 되고, 한쪽만 고쳐지는 날이 온다.
-static constexpr int SW_W = 430, SW_H = 600;
+static constexpr int SW_W = 430, SW_H = 654;
 static constexpr int IDS_ADVANCED   = 601;
 static constexpr int IDS_PHONE      = 602;
 static constexpr int IDS_DIST       = 603;   // 트랙바
@@ -2090,6 +2088,7 @@ static constexpr int IDS_MEASURE    = 604;
 static constexpr int IDS_IDLE_BASE  = 610;   // 610..613 = 바로/15초/30초/1분
 static constexpr int IDS_IMAGE      = 620;
 static constexpr int IDS_LOCKNOW    = 621;
+static constexpr int IDS_GUARD      = 622;
 static constexpr int IDT_SIMPLE     = 30;
 
 static HWND g_hSimplePhone = nullptr, g_hSimpleDist = nullptr;
@@ -2191,6 +2190,8 @@ static void SimpleRefresh() {
     SetWindowTextW(g_hSimpleMeasure,
         c.measuredBaseRssi != 0 ? L"내 자리에 맞게 다시 재기" : L"내 자리에 맞게 재보기  (아직 안 했어요)");
 
+    HWND guard = GetDlgItem(g_hSimple, IDS_GUARD);
+    if (guard) InvalidateRect(guard, nullptr, TRUE);
     for (int i = 0; i < 4; i++)
         if (g_hSimpleIdle[i]) InvalidateRect(g_hSimpleIdle[i], nullptr, TRUE);
     InvalidateRect(g_hSimple, nullptr, FALSE);
@@ -2547,9 +2548,13 @@ static LRESULT CALLBACK SimpleProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, SW_W - 132, y, 92, 28,
             hWnd, (HMENU)(UINT_PTR)IDS_ADVANCED, hI, nullptr);
 
-        y = 62;   // 상태 카드는 WM_PAINT 가 그린다
+        // 상태 카드는 WM_PAINT 가 그린다
         y = 150;
+        // 윈도우 11 의 wifi·블루투스 타일과 같은 규칙: 켜져 있으면 파랗다.
+        CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            x, y, w, 44, hWnd, (HMENU)(UINT_PTR)IDS_GUARD, hI, nullptr);
 
+        y += 58;
         CreateWindowExW(0, L"STATIC", L"내 폰", WS_CHILD | WS_VISIBLE,
             x, y, 200, 18, hWnd, nullptr, hI, nullptr);
         y += 22;
@@ -2618,7 +2623,7 @@ static LRESULT CALLBACK SimpleProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
         COLORREF bg; const wchar_t* line1; const wchar_t* line2;
         if (!g_monitoring) {
             bg = RGB(120, 120, 120); line1 = L"꺼져 있어요";
-            line2 = L"[고급 설정] 에서 시작할 수 있어요";
+            line2 = L"아래 [보호 꺼짐] 을 누르면 시작해요";
         } else if (g_bBlackActive) {
             bg = RGB(200, 60, 60);  line1 = L"화면을 가리는 중";
             line2 = g_bManualLock ? L"검은 화면의 [해제] 를 누르면 돌아와요"
@@ -2716,7 +2721,10 @@ static LRESULT CALLBACK SimpleProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
 
         // 파란 타일은 둘뿐이다: 지금 고른 시간과, 이 화면의 주 동작.
         // 전부 파랗게 하면 무엇이 켜져 있는지가 안 보인다.
-        bool accent = (id == IDS_LOCKNOW) ||
+        if (id == IDS_GUARD)
+            wcscpy_s(label, g_monitoring ? L"보호 켜짐" : L"보호 꺼짐");
+
+        bool accent = (id == IDS_GUARD && g_monitoring) ||
                       (id >= IDS_IDLE_BASE && id < IDS_IDLE_BASE + 4 &&
                        g_idleCountdownSec == kSimpleIdle[id - IDS_IDLE_BASE]);
         bool ghost = (id == IDS_ADVANCED);
@@ -2758,6 +2766,10 @@ static LRESULT CALLBACK SimpleProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
         case IDS_PHONE:   SendMessageW(g_hWnd, WM_COMMAND, ID_BTN_REGISTER_PHONE, 0); SimpleRefresh(); break;
         case IDS_IMAGE:   SendMessageW(g_hWnd, WM_COMMAND, ID_BTN_CENTER_IMG, 0); break;
         case IDS_LOCKNOW: SendMessageW(g_hWnd, WM_COMMAND, ID_BTN_BLACKNOW, 0); break;
+        case IDS_GUARD:
+            SendMessageW(g_hWnd, WM_COMMAND, g_monitoring ? ID_STOP : ID_START, 0);
+            SimpleRefresh();
+            break;
         case IDS_MEASURE: OpenWizard(hWnd); break;
         }
         return 0;
