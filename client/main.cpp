@@ -1293,13 +1293,23 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         PopulateCombo();
 
         // Enterprise: auto-sync content at startup
+        //
+        // 결과를 기록한다. 예전에는 조용히 실패했고, 서버가 몇 달간 닿지 않는
+        // 동안에도 로그에 아무 흔적이 없었다 - 고장을 알 방법이 없었다.
         if (cfg.enterpriseRegistered && !cfg.orgId.empty() && !cfg.serverUrl.empty() && !cfg.anonKey.empty()) {
-            if (SyncEnterpriseContent(cfg.serverUrl, cfg.anonKey, cfg.orgId)) {
+            bool synced = SyncEnterpriseContent(cfg.serverUrl, cfg.anonKey, cfg.orgId);
+            if (synced) {
                 auto cp = GetEnterpriseCenterPath();
                 auto bp = GetEnterpriseBannerPath();
                 if (!cp.empty() && g_centerImagePath.empty()) g_centerImagePath = cp;
                 if (!bp.empty() && g_bannerImagePath.empty()) g_bannerImagePath = bp;
+                DbgEvent(L"enterprise sync: OK (center=%d banner=%d)",
+                         cp.empty() ? 0 : 1, bp.empty() ? 0 : 1);
+            } else {
+                DbgEvent(L"enterprise sync: FAILED (org=%s)", cfg.orgId.c_str());
             }
+        } else if (cfg.enterpriseRegistered) {
+            DbgEvent(L"enterprise sync: skipped - 설정이 비어 있다");
         }
 
         // Auto-start if config exists.
