@@ -53,6 +53,11 @@ std::string MakeCodeVerifier();
 // code_challenge = BASE64URL(SHA256(ASCII(verifier)))
 bool MakeCodeChallengeS256(const std::string& verifier, std::string& outChallenge);
 
+// SHA-256 을 소문자 hex 64자로. 업데이트 파일의 해시 대조에 쓴다 (client/update.cpp,
+// tools/publish.cpp). 같은 bcrypt 배관이라 여기 둔다.
+bool Sha256Bytes(const void* data, size_t len, std::string& outHex);
+bool Sha256File(const std::wstring& path, std::string& outHex, unsigned long long& outSize);
+
 // ---------------------------------------------------------------------------
 // 루프백 리다이렉트 수신
 // ---------------------------------------------------------------------------

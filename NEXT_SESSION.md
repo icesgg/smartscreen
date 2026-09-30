@@ -1,7 +1,7 @@
 SmartScreen 프로젝트를 이어서 개발한다. 저장소: C:\work\smartscreen (main 브랜치, 최신 푸시됨)
 
 설계 배경은 docs/PROXIMITY.md, 식별 구조는 docs/IDENTIFICATION.md,
-클립보드 공유는 docs/CLIPBOARD.md 에 있다. 먼저 읽어라.
+클립보드 공유는 docs/CLIPBOARD.md, 자동 업데이트는 docs/UPDATE.md 에 있다. 먼저 읽어라.
 
 ## 지금 상태
 
@@ -12,7 +12,58 @@ BLE 신호 세기(RSSI)로 거리를 판단한다.
 주고받는다. 폰도 블루투스도 안 쓰고 자리비움 감지와 아무 상관이 없다 - 계정
 로그인과 Supabase 배관이 이미 여기 있어서 같은 앱에 들어왔다.
 
-## 직전 세션: PC 사이 클립보드 공유 (새 기능)
+## 직전 세션: 프로그램 자동 업데이트 (새 기능)
+
+새 버전을 서버에 올리면 모든 PC 가 스스로 알아채서 받아 간다. 개인 PC 는 간단
+창의 띠에서 [업데이트] 를 눌러야 바뀌고, 기업 PC 는 관리자가 대시보드에서 승인한
+버전을 묻지 않고 받는다. 설계와 정한 이유는 **docs/UPDATE.md** 에 있다.
+
+**서버에 1.1.0 과 1.1.1 이 올라가 있다** (2026-09-30 저녁). 1.1.0 은 실수로 올라간
+것이다 - 앱이 떠 있어 `do_build.bat` 가 링크에서 실패했는데 그대로 `publish.bat` 를
+돌려 낡은 1.1.0 빌드가 1.1.0 으로 다시 올라갔다. 해는 없지만(PC 는 자기 버전으로 본다)
+그래서 `Publish.exe` 가 이제 **저장소의 `client/version.h` 와 자기 빌드 버전이 다르면
+거절한다.** 1.1.1 은 제대로 올라갔고, 노트북의 1.1.0 이 첫 확인에서 `1.1.1 exists but
+not approved for org` 를 기록했다. 그 뒤 **두 PC 모두 1.1.1 로 실제로 올라갔다**
+(2026-09-30 저녁): 노트북은 승인 → 자동 적용, 데스크톱은 zip(1.1.0) 을 깔고 켠 뒤
+올라갔다. 이 기능은 이제 실서버에서 끝까지 한 번 돈 것이다.
+서버 없이 되는 것은 확인했다: 빌드, `Publish.exe --selftest`, `--apply-update` 의
+파일 바꾸기·해시 대조·실패 기록.
+
+**첫 판을 독립 검토(5 차원 → 반박 3표)로 훑었고 16건이 확정됐다.** 전부 고쳤다.
+목록과 각각을 어떻게 고쳤는지는 docs/UPDATE.md 의 "검토에서 나온 것". 셋이
+컸다: 기업 PC 무한 재시작 루프(실패를 기억하는 곳이 없었다), 긴 배포 메모로
+`swprintf_s` 가 프로세스를 죽임, updater 를 못 띄우면 Ready 에 갇힘. **적용
+경로에서 관리자 권한(UAC) 승격은 뺐다** - 기다리는 동안 화면을 아무도 안 지킨다.
+고친 것을 다시 검토해 13건 수정을 확정하고 회귀 7가지를 더 고쳤다 (같은 절).
+`--apply-update` 는 이제 **무엇을 하든 원래 프로세스가 끝난 뒤에** 한다.
+
+- 버전: `client/version.h` 세 숫자. 이 커밋이 **1.1.0** - 업데이트 기능이 든 첫
+  버전이라 지금 돌고 있는 PC 들에는 이번 한 번 zip 으로 깔아야 한다
+- 서버: `supabase/releases.sql`. `releases`(버전·경로·**SHA-256**·메모) /
+  `release_admins` / `org_release_approvals` + Storage `releases` 버킷. **읽기는
+  anon 에 열고 쓰기만 지킨다** - device_tokens 와 정반대인데, 개인 PC 는 로그인이
+  없고 그 PC 도 받아야 하기 때문이다. 믿는 것은 행의 해시 하나다
+- 클라이언트: `client/update.cpp`. 켤 때 + 한 시간마다 확인. 받은 파일의 해시가
+  행과 다르면 버린다. 자기 exe 를 `%APPDATA%\SmartScreen\update\updater.exe` 로
+  복사해 `--apply-update` 로 띄우고 정상 종료한다 (별도 updater 를 만들면 그것도
+  배포할 파일이 된다). 예전 exe 는 `.bak` 으로 남기고 새 exe 가 무사히 뜨면 지운다
+- **화면을 가리는 중에는 다시 시작하지 않는다.** 다시 시작하는 사이에 검은 화면이
+  사라진다. `main.cpp` 의 `UpdateTick` 이 1분마다 다시 본다
+- 간단 창: 머리에 `버전 x.y.z · 업데이트 확인` 단추가 늘 있고, 새 버전이 있을 때만
+  아래 띠가 나타나며 **그때만 창이 100 자란다** (750 -> 850). 상시로 늘릴 자리가
+  없어서 이렇게 했다 - 그 전 세션이 남긴 "다음에 늘릴 일이 생기면 접기나 스크롤"
+  의 답이다. 개인 PC 에 새 버전이 오면(또는 지난번 적용이 실패했으면) 숨어 있던
+  창을 한 번 띄운다 - 숨은 창의 띠는 아무도 못 본다
+- 올리는 도구: `tools/publish.cpp` -> `Publish.exe`, `publish.bat` 이 `.env` 를 읽어
+  부른다. 로그인 -> 해시 -> 업로드 -> **anon 으로 다시 내려받아 대조** -> 행 upsert.
+  같은 버전에 다른 파일은 거절한다 (`--force` 로만). 배포 묶음에는 넣지 않는다
+- 대시보드(`docs/dashboard.html`): "프로그램 업데이트" 칸. admin 만 [승인]/[승인됨]
+  을 누를 수 있고, "이 조직의 PC 들이 받을 버전" 을 보여 준다. `web/` 의 사본은
+  4월 것이라 낡았다 - 배포되는 것은 `docs/` (GitHub Pages)
+- config: `updateCheck`(기본 1), `updateChannel`(stable|beta). beta 는 내 PC 에서 먼저
+  돌려 보는 용도
+
+## 그 앞 세션: PC 사이 클립보드 공유
 
 A 에서 스크린캡처하면 B 에서 Ctrl+V 로 붙는다. 연결고리는 같은 구글 계정 하나뿐
 (같은 네트워크일 필요 없음). 설계와 정한 이유는 **docs/CLIPBOARD.md** 에 있다.
@@ -152,7 +203,19 @@ BLE 핸드셰이크 대신 폰과 PC 가 같은 구글 계정으로 로그인해
 
 ## 남은 작업
 
-### 1. iOS 재설치 시험 (여전히 우선)
+### 1. 자동 업데이트 - 끝까지 한 번 돌았다. 다음 배포부터는 이 순서
+
+1. `client/version.h` 의 숫자를 올린다
+2. **앱을 끄고** `cmd.exe /c do_build.bat` (떠 있으면 링크가 실패하고, 그러면
+   `Publish.exe` 가 낡은 빌드라고 거절한다)
+3. `publish.bat --notes "무엇이 바뀌었나"` (cmd 에서. Git Bash 에서는 따옴표가 깨진다)
+4. 기업 PC 는 대시보드 > 프로그램 업데이트 > [승인] (푸시된 `docs/dashboard.html`)
+
+안 해 본 것: Program Files 에 둔 exe, 화면이 가려진 채로 Ready 가 됐을 때 풀리면
+적용되는지, 실패 기록 뒤 [다시 시도], 세 대 이상. 대시보드 승인 칸도 이번엔 SQL 로
+대신했으므로 화면 자체는 아직 안 눌러 봤다.
+
+### 2. iOS 재설치 시험
 
 `adoptToken` 의 몸통은 **아직 한 번도 실행된 적이 없다.** 직전 세션에서 읽고
 고쳤지만 읽는 것으로는 모른다 - 이 저장소가 반복해서 배운 게 "쓰인 적 없는 코드는
@@ -183,17 +246,26 @@ BLE 핸드셰이크 대신 폰과 PC 가 같은 구글 계정으로 로그인해
 
 폰이 T1 을 내주는지 PC 없이 직접 보려면 `ProbeScan.exe` 를 쓴다.
 
-### 2. App Store 심사 4.8
+### 3. App Store 심사 4.8
 
 구글 로그인만 넣고 제출하면 Sign in with Apple 도 요구될 수 있다. Supabase 가 Apple
 provider 를 지원한다. 사내 배포(TestFlight 내부)면 해당 없다.
 
-### 3. 검토해 볼 것
+### 4. 검토해 볼 것
 
-- `contents` 테이블이 **로그인 없이 읽힌다.** 지금 기업 기능이 anon key 로만
-  접근하는 구조라 그렇다. 조직이 하나뿐이라 실질 노출은 자기 콘텐츠지만, 조직이
-  둘 이상이 되면 exe 에 박힌 공개 키만으로 남의 조직 콘텐츠가 읽힌다.
-  이제 앱에 구글 로그인이 있으니 `device_tokens` 처럼 조일 수 있다
+- **`contents` 가 로그인 없이 읽히는 것을 실제로 확인했다 (2026-09-30).** anon key
+  만으로 `contents` 전 행(전 org)이 나오고, `content` 버킷의 **파일 바이트도 나오고
+  목록도 열린다** (HTTP 206 / list 200). 버킷이 public 이어서가 아니라
+  `storage.objects` 의 anon 정책 때문이다 (`/object/public/` 은 400). 대조군
+  `device_tokens`·`clip_items`·`orgs`·`org_members`·`clip` 버킷은 전부 막혀 있다.
+  그 anon key 는 배포 zip 의 exe 에 박혀 있다.
+  **그리고 `supabase/schema.sql` 이 라이브와 어긋나 있다**: 라이브에는 `active` 열과
+  anon 정책이 있고 schema.sql 에는 둘 다 없다. schema.sql 로 새 프로젝트를 세우면
+  `FetchManifest` 의 `active=eq.true` 가 400 을 받아 기업 동기화가 아예 안 된다.
+  조이려면 기업 PC 마다 구글 로그인이 필요해진다 (`org_release_approvals` 도 같은
+  이유로 anon 읽기다) - 그 대가를 받아들일지는 정해지지 않았다.
+  anon 이 `contents` 에 **쓸** 수 있는지는 확인 못 했다 (쓰기 시험은 하지 않았다).
+  쓸 수 있다면 잠금 화면에 아무 그림이나 밀어 넣을 수 있으므로 먼저 볼 것
 - 영상을 양쪽 모니터에 띄우려면 `client/video/player.cpp` 가 플레이어를 여러 개
   지원해야 한다 (지금 `s_player` 가 하나뿐)
 - 간단 창이 430x**750** 이다. 클립보드 칸 하나에 96 을 썼고 아래 여유가 17 px 다.
@@ -220,6 +292,15 @@ provider 를 지원한다. 사내 배포(TestFlight 내부)면 해당 없다.
   gatt_rssi_log.csv (뒤 둘은 `bleDebugLog=1` 일 때만)
 - 임계값 분석: `tools\rssi-threshold.ps1` (앱 켜둔 채 돌려도 된다)
 - 구글 로그인 점검: `build\AuthTest.exe` (인자 없으면 자체 점검만)
+- 업데이트 올리기: `publish.bat [--notes "..."] [--channel beta] [--force]`,
+  `publish.bat --list`, `publish.bat --deactivate 1.2.3`. `.env` 를 읽는다.
+  `build\Publish.exe --selftest` 는 서버 없이 해시·버전 비교를 점검한다
+- 업데이트 적용 경로 시험: `SmartScreen.exe --apply-update 0 <src> <dst> --sha <hex>
+  --ver 9.9.9 --no-relaunch` (pid 0 = 기다리지 않음). src 는 `%APPDATA%\SmartScreen\update\`
+  안에, dst 이름은 `SmartScreen.exe` 여야 받는다. 성공·해시 불일치·이름·위치·해시 없음
+  다섯 경우가 스크립트로 확인됐다 (실패 기록 failed-<버전>.txt 까지)
+- Git Bash 에서 `cmd.exe /c x.bat` 은 `/c` 가 `C:/` 로 바뀌어 **배너만 찍고 끝난다.**
+  `MSYS_NO_PATHCONV=1 cmd.exe /c ...` 또는 PowerShell 에서 부를 것 (이번에 밟았다)
 - 클립보드 점검: `SmartScreen.exe --clip-test` (**앱이 떠 있어도 된다** - 뮤텍스
   보다 먼저 처리한다). 올리기·조회·내려받기·바이트 비교·덮어쓰기·PNG 풀기를
   이 PC 한 대에서 돌려 본다. 결과는 창과 `%APPDATA%\SmartScreen\clip-test.txt`
@@ -255,6 +336,13 @@ python 으로 일괄 치환하면 파일 전체가 뒤집힌다. **수정 전후
 - **`.ps1` 에 한글을 쓰면 UTF-8 BOM 이 필요하다.** BOM 없이 저장하면 PowerShell 5.1
   이 CP949 로 읽어 한글이 깨진 채 파싱 에러가 난다 (이번에 밟았다)
 - `.cpp` 는 UTF-8 (BOM 없음), CMake 가 `/utf-8` 을 준다
+
+### swprintf_s 는 잘라 쓰지 않는다
+
+넘치면 CRT 의 invalid-parameter 핸들러가 프로세스를 끝낸다 (릴리스 빌드). 서버에서
+오는 문자열(배포 메모, 오류 문구)을 고정 버퍼에 쓸 때는 `_snwprintf_s(buf,
+_countof(buf), _TRUNCATE, ...)` 를 쓰고 길이도 잘라라. 검토에서 잡혔다 - 관리자가
+370자 메모를 올리면 그 채널의 모든 PC 가 1초마다 죽는 모양이었다.
 
 ### bash heredoc 이 백슬래시를 먹는다
 

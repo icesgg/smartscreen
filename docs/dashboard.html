@@ -377,6 +377,36 @@
       color: #fff;
     }
 
+    .section-note {
+      color: var(--text-dim);
+      font-size: 13px;
+      margin: -6px 0 14px;
+    }
+
+    .badge-approved {
+      background: rgba(52, 211, 153, 0.15);
+      color: var(--success);
+      cursor: pointer;
+    }
+
+    .badge-approved:hover {
+      background: rgba(52, 211, 153, 0.28);
+    }
+
+    .badge-notyet {
+      background: var(--surface2);
+      color: var(--text-dim);
+      cursor: pointer;
+    }
+
+    .badge-notyet:hover {
+      color: var(--text);
+    }
+
+    .badge-readonly {
+      cursor: default !important;
+    }
+
     .empty-msg {
       padding: 40px;
       text-align: center;
@@ -520,6 +550,15 @@
         <h3>콘텐츠 목록</h3>
         <div id="content-list"></div>
       </div>
+
+      <!-- 프로그램 업데이트 승인 (docs/UPDATE.md) -->
+      <!-- 이 조직의 PC 들은 여기서 승인된 버전 중 가장 높은 것만 받는다.
+           승인이 없으면 PC 화면에 "관리자 승인을 기다려요" 로 보이기만 한다. -->
+      <div class="content-section">
+        <h3>프로그램 업데이트</h3>
+        <p class="section-note" id="release-note">불러오는 중...</p>
+        <div id="release-list"></div>
+      </div>
     </div>
   </div>
 
@@ -540,6 +579,7 @@
     const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
     let currentOrg = null;
+    let currentRole = 'member';   // 'admin' 만 업데이트를 승인할 수 있다
 
     // ── 유틸리티 ──
     function toast(msg) {
@@ -686,6 +726,7 @@
       }
 
       currentOrg = membership.orgs;
+      currentRole = membership.role || 'member';
 
       document.getElementById('auth-screen').style.display = 'none';
       document.getElementById('dashboard').style.display = 'block';
@@ -696,6 +737,120 @@
       document.getElementById('user-email').textContent = user.email;
 
       await loadContents();
+      await loadReleases();
+    }
+
+    // ── 프로그램 업데이트 승인 ──
+    // releases(누구나 읽음) 와 이 조직의 org_release_approvals 를 붙여 보여 준다.
+    // 승인/취소는 admin 만 (RLS 가 한 번 더 막는다). 버전 비교는 세 숫자를 숫자로 -
+    // 클라이언트(client/relver.h)와 같은 규칙이어야 "PC 들이 받을 버전" 이 맞는다.
+    function parseVer(v) {
+      const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(v || '');
+      return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+    }
+    function cmpVer(a, b) {
+      for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+      return 0;
+    }
+
+    async function loadReleases() {
+      if (!currentOrg) return;
+      const note = document.getElementById('release-note');
+      const container = document.getElementById('release-list');
+
+      const { data: rels, error: relErr } = await supabase
+        .from('releases')
+        .select('version, channel, size, notes, active, published_at')
+        .eq('active', true)
+        .order('published_at', { ascending: false });
+
+      if (relErr) {
+        // 표가 아직 없으면 여기로 온다 (supabase/releases.sql 을 안 돌렸다)
+        note.textContent = '업데이트 표를 읽지 못했습니다: ' + relErr.message;
+        container.innerHTML = '';
+        return;
+      }
+
+      const { data: apps, error: appErr } = await supabase
+        .from('org_release_approvals')
+        .select('version, approved_at')
+        .eq('org_id', currentOrg.id);
+      if (appErr) {
+        note.textContent = '승인 목록을 읽지 못했습니다: ' + appErr.message;
+        container.innerHTML = '';
+        return;
+      }
+      const approved = new Map((apps || []).map(a => [a.version, a.approved_at]));
+
+      // PC 들이 실제로 받을 것 = 승인된 것 중 가장 높은 버전 (채널별)
+      const target = {};
+      for (const r of rels || []) {
+        if (!approved.has(r.version)) continue;
+        const v = parseVer(r.version);
+        if (!v) continue;
+        if (!target[r.channel] || cmpVer(v, parseVer(target[r.channel])) > 0) target[r.channel] = r.version;
+      }
+      const parts = [];
+      if (target.stable) parts.push(`이 조직의 PC 들이 받을 버전: <b>${target.stable}</b>`);
+      else parts.push('승인된 버전이 없습니다. PC 들은 지금 버전을 그대로 씁니다.');
+      if (target.beta) parts.push(`beta 채널: <b>${target.beta}</b>`);
+      if (currentRole !== 'admin') parts.push('(승인은 관리자만 할 수 있습니다)');
+      note.innerHTML = parts.join(' &nbsp;·&nbsp; ');
+
+      if (!rels || rels.length === 0) {
+        container.innerHTML = '<div class="empty-msg">올라온 버전이 없습니다.</div>';
+        return;
+      }
+
+      let html = `<table><thead><tr>
+    <th>버전</th><th>채널</th><th>크기</th><th>올린 날</th><th>메모</th><th>이 조직</th>
+  </tr></thead><tbody>`;
+      for (const r of rels) {
+        const isApproved = approved.has(r.version);
+        const ro = currentRole === 'admin' ? '' : ' badge-readonly';
+        const badge = isApproved
+          ? `<span class="badge badge-approved${ro}" data-ver="${escapeHtml(r.version)}" data-approved="true" title="${escapeHtml(formatDate(approved.get(r.version)))} 승인">승인됨</span>`
+          : `<span class="badge badge-notyet${ro}" data-ver="${escapeHtml(r.version)}" data-approved="false">승인</span>`;
+        const firstLine = (r.notes || '').split(/\r?\n/)[0];
+        html += `<tr>
+      <td><b>${escapeHtml(r.version)}</b></td>
+      <td>${escapeHtml(r.channel)}</td>
+      <td>${formatSize(r.size)}</td>
+      <td>${formatDate(r.published_at)}</td>
+      <td title="${escapeHtml(r.notes || '')}">${escapeHtml(firstLine)}</td>
+      <td>${badge}</td>
+    </tr>`;
+      }
+      html += '</tbody></table>';
+      container.innerHTML = html;
+
+      if (currentRole === 'admin') {
+        container.querySelectorAll('[data-ver]').forEach(b => {
+          b.addEventListener('click', () => handleApprove(b.dataset.ver, b.dataset.approved === 'true'));
+        });
+      }
+    }
+
+    async function handleApprove(version, currentlyApproved) {
+      if (!currentOrg) return;
+      try {
+        if (currentlyApproved) {
+          if (!confirm(`${version} 승인을 취소할까요?\n이미 받은 PC 는 그대로이고, 아직 안 받은 PC 만 멈춥니다.`)) return;
+          const { error } = await supabase.from('org_release_approvals')
+            .delete().eq('org_id', currentOrg.id).eq('version', version);
+          if (error) throw error;
+          toast(`${version} 승인을 취소했습니다.`);
+        } else {
+          if (!confirm(`${version} 을 승인할까요?\n이 조직의 모든 PC 가 한 시간 안에 묻지 않고 이 버전으로 바뀝니다.`)) return;
+          const { error } = await supabase.from('org_release_approvals')
+            .insert({ org_id: currentOrg.id, version });
+          if (error) throw error;
+          toast(`${version} 을 승인했습니다.`);
+        }
+        await loadReleases();
+      } catch (e) {
+        toast('실패: ' + e.message);
+      }
     }
 
     // ── 콘텐츠 목록 로드 ──

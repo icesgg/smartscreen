@@ -22,6 +22,8 @@
 #include "enterprise/auth.h"
 #include "enterprise/session.h"
 #include "clipsync.h"
+#include "update.h"
+#include "version.h"
 #include <mutex>
 
 // ---------------------------------------------------------------------------
@@ -53,11 +55,18 @@ static constexpr UINT WM_LOGIN_RESULT = WM_USER + 101;
 // 세션이 갱신되면서 refresh 토큰이 바뀌었다. WPARAM/LPARAM 대신 전역에 두고
 // 부르는 이유는 아래 OnSessionRotated 주석 참고.
 static constexpr UINT WM_SESSION_ROTATED = WM_USER + 102;
+// 업데이트 작업 스레드가 상태를 바꿨다 (client/update.h). 확인·내려받기가
+// 끝났을 때 오고, 받는 쪽(UpdateTick)이 적용 여부를 정한다.
+static constexpr UINT WM_UPDATE_STATE = WM_USER + 103;
 
 // 기본으로 열리는 간단 창. 만드는 곳과 창 프로시저는 아래 "간단 화면" 절에 있다.
 // 오버레이의 [설정] 이 이 창을 열기 때문에 여기서 미리 알려 둔다.
 HWND g_hSimple = nullptr;
 static void SimpleRefresh();
+// 업데이트 상태를 보고 할 일을 한다: 주기 확인, 준비된 것 적용. UI 스레드.
+static void UpdateTick(bool fromNotify);
+static ULONGLONG g_updLastCheck = 0;
+static constexpr ULONGLONG kUpdateEveryMs = 60ULL * 60 * 1000;   // 한 시간
 
 // 제품이 쓰는 Supabase 프로젝트. config 에 값이 있으면 그쪽이 이긴다.
 // anon key 가 여기 박혀 있는 것은 설계대로다 - 공개되도록 만들어진 값이고,
@@ -113,6 +122,7 @@ static constexpr int OVL_W = 280;
 static constexpr int OVL_H = 100;
 
 static constexpr int IDT_COUNTDOWN   = 10;
+static constexpr int IDT_UPDATE      = 11;   // 1분마다 UpdateTick
 static constexpr int WINDOW_W = 820;
 static constexpr int WINDOW_H = 780;
 static constexpr int CHART_H_UI = CHART_HEIGHT;
@@ -1376,6 +1386,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_TIMER:
+        if (wParam == IDT_UPDATE) { UpdateTick(false); break; }
         if (wParam == IDT_COUNTDOWN && g_monitoring) {
             // 프로버가 잠긴 폰을 찾아내면서 overflow 비트를 새로 배웠으면 저장한다.
             // 다음 실행 때 후보를 훨씬 빨리 좁힌다 (없어도 동작은 한다).
@@ -1985,6 +1996,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         auto*r=(ProbeResult*)lParam;OnResult(r);
         InvalidateRect(g_hStateLabel,nullptr,TRUE);delete r;break;
     }
+    case WM_UPDATE_STATE:
+        UpdateTick(true);
+        break;
+
     case WM_SESSION_ROTATED: {
         // 설정 쓰기는 이 스레드에서만 한다 (OnSessionRotated 주석 참고).
         std::wstring sealed;
@@ -2141,6 +2156,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 // 왔고, 다음에 또 늘릴 일이 생기면 그때는 접기나 스크롤을 넣어야 한다 -
 // 1200 짜리 화면에서도 작업 표시줄까지 치면 여유가 얼마 남지 않았다.
 static constexpr int SW_W = 430, SW_H = 750;
+// 업데이트 띠. 보일 때만 창이 이만큼 자란다 - 상시로 늘릴 자리가 없다 (위 주석).
+static constexpr int SW_UPD_H = 100;
 static constexpr int IDS_ADVANCED   = 601;
 static constexpr int IDS_PHONE      = 602;
 static constexpr int IDS_DIST       = 603;   // 트랙바
@@ -2150,12 +2167,16 @@ static constexpr int IDS_IMAGE      = 620;
 static constexpr int IDS_LOCKNOW    = 621;
 static constexpr int IDS_GUARD      = 622;
 static constexpr int IDS_CLIP       = 623;   // 클립보드 공유 켜기/끄기
+static constexpr int IDS_UPD_CHECK  = 624;   // 머리의 "버전 x.y.z · 업데이트 확인"
+static constexpr int IDS_UPD_APPLY  = 625;   // 띠의 [업데이트] / [다시 시도]
+static constexpr int IDS_UPD_LATER  = 626;   // 띠의 [나중에]
 static constexpr int IDT_SIMPLE     = 30;
 
 static HWND g_hSimplePhone = nullptr, g_hSimpleDist = nullptr;
 static HWND g_hSimpleIdle[4] = {};
 static HWND g_hSimpleMeasure = nullptr;
 static HWND g_hSimpleClipMsg = nullptr;
+static HWND g_hSimpleUpdMsg = nullptr;
 
 // 몇 초 뒤에 가릴지. 고급 창의 kIdleValues 와 같은 값이어야 한다.
 static const int kSimpleIdle[4] = { 0, 15, 30, 60 };
@@ -2230,6 +2251,49 @@ static void SimpleApplyDist(int step) {
     DbgEvent(L"간단 화면: 거리 %d단계 -> %d dBm", step + 1, g_nearRssiThreshold);
 }
 
+// 업데이트 상태를 보고 할 일을 한다 (UI 스레드). 1분 타이머와 WM_UPDATE_STATE 가
+// 부른다. 준비된 것이 있어도 화면을 가리는 중이면 적용하지 않는다 - 다시 시작하는
+// 사이에 검은 화면이 사라지기 때문이다 (update.h 머리말).
+static void UpdateTick(bool fromNotify) {
+    ULONGLONG now = GetTickCount64();
+    if (!fromNotify && g_updLastCheck && now - g_updLastCheck >= kUpdateEveryMs && !UpdateBusy()) {
+        g_updLastCheck = now;
+        UpdateCheckAsync(false);
+    }
+    UpdateStatus us = UpdateGetStatus();
+    // 개인 PC: 설정이 끝난 PC 에서 간단 창은 숨겨져 있다. 띠가 거기에만 뜨면 아무도
+    // 못 본다. 새 버전마다 한 번, 초점을 빼앗지 않고 창을 띄운다. 기업 PC 는 묻지
+    // 않고 적용하므로 띄울 이유가 없다.
+    // 지난번 적용 실패(failed-<버전>.txt)도 마찬가지다 - 그 기록은 대화상자를 대신하는
+    // 것이라, 숨은 창에만 쓰면 아무도 못 본다. 이건 기업 PC 도 봐야 한다.
+    static std::wstring shownFor;
+    bool wantShow = (us.phase == UpdatePhase::Available && !us.autoApply) ||
+                    (us.phase == UpdatePhase::Failed && us.fromMarker);
+    std::wstring showKey = us.version + (us.phase == UpdatePhase::Failed ? L"|F" : L"|A");
+    if (wantShow && !us.dismissed && g_hSimple && shownFor != showKey &&
+        !g_bBlackActive && !g_measuring) {
+        shownFor = showKey;
+        // 최소화된 창도 '보이는' 창이다 - 복원까지 해야 한다 (SW_SHOWNOACTIVATE 가 복원한다)
+        if (!IsWindowVisible(g_hSimple) || IsIconic(g_hSimple)) ShowWindow(g_hSimple, SW_SHOWNOACTIVATE);
+    }
+    if (us.phase == UpdatePhase::Ready) {
+        if (g_bBlackActive || g_measuring || g_loginBusy) {
+            // 나중에 다시 - 타이머가 1분마다 여기로 온다
+        } else {
+            std::wstring err;
+            if (UpdateLaunchApplier(err)) {
+                DbgEvent(L"update: exiting to apply %s", us.version.c_str());
+                // 오버레이의 [종료] 와 같은 길로 나간다 - 그게 유일한 정상 종료 경로다.
+                if (g_hOverlay) SendMessageW(g_hOverlay, WM_COMMAND, ID_OVL_EXIT, 0);
+                else { if (g_monitoring) StopMon(); DestroyWindow(g_hWnd); }
+                return;
+            }
+            DbgEvent(L"update: could not launch applier - %s", err.c_str());
+        }
+    }
+    SimpleRefresh();
+}
+
 static void SimpleRefresh() {
     if (!g_hSimple) return;
 
@@ -2271,6 +2335,95 @@ static void SimpleRefresh() {
                        cs.sent, cs.received);
         }
         SetWindowTextW(g_hSimpleClipMsg, cb);
+    }
+
+    // 프로그램 업데이트 (client/update.h). 머리의 버전 단추와, 필요할 때만 나타나는
+    // 아래 띠. 창은 띠가 보일 때만 SW_UPD_H 만큼 자란다.
+    {
+        UpdateStatus us = UpdateGetStatus();
+        // swprintf_s 는 넘치면 잘라 쓰지 않고 프로세스를 끝낸다. 메모와 오류 문구는
+        // 서버에서 오는 값이라 길이를 믿을 수 없다 - 여기 전부 _TRUNCATE 로 쓴다.
+        wchar_t ub[384];
+        ULONGLONG now = GetTickCount64();
+        if (!UpdateEnabled())
+            wcscpy_s(ub, L"버전 " SS_VERSION_STR L" · 자동 업데이트 꺼짐");
+        else if (us.phase == UpdatePhase::Checking)
+            wcscpy_s(ub, L"업데이트 확인 중…");
+        else if (us.phase == UpdatePhase::UpToDate && now - us.checkedTick < 6000)
+            wcscpy_s(ub, L"최신 버전이에요 · " SS_VERSION_STR);
+        else
+            wcscpy_s(ub, L"버전 " SS_VERSION_STR L" · 업데이트 확인");
+        if (HWND h = GetDlgItem(g_hSimple, IDS_UPD_CHECK)) {
+            wchar_t cur[384] = L""; GetWindowTextW(h, cur, _countof(cur));
+            if (wcscmp(cur, ub) != 0) { SetWindowTextW(h, ub); InvalidateRect(h, nullptr, TRUE); }
+        }
+
+        bool show = false, showApply = false, showLater = false;
+        const wchar_t* applyLabel = L"업데이트";
+        std::wstring note = us.notes.substr(0, us.notes.find_first_of(L"\r\n"));
+        // 글 칸이 세 줄(한글 약 78자)이다. 그 안에 들어갈 만큼만 - 넘치면 잘려 보이지도 않는다.
+        // 메모는 첫 줄("새 버전 …") 뒤 두 줄. 기록에서 온 문구는 우리 것이라(영문이 섞여 짧게
+        // 그려진다) 조금 길어도 되고, 서버 오류 문구는 앞에 "업데이트 실패: " 가 붙는다.
+        if (note.size() > 48) note = note.substr(0, 48) + L"…";
+        std::wstring msg = us.msg;
+        size_t cap = us.fromMarker ? 96 : 68;
+        if (msg.size() > cap) msg = msg.substr(0, cap) + L"…";
+        switch (us.phase) {
+        case UpdatePhase::Available:
+            show = !us.dismissed;
+            if (us.autoApply) _snwprintf_s(ub, _countof(ub), _TRUNCATE, L"관리자가 승인한 %s 를 받아요", us.version.c_str());
+            else {
+                _snwprintf_s(ub, _countof(ub), _TRUNCATE, L"새 버전 %s 이 있어요%s%s", us.version.c_str(),
+                             note.empty() ? L"" : L"\n", note.c_str());
+                showApply = showLater = true;
+            }
+            break;
+        case UpdatePhase::Pending:
+            show = !us.dismissed; showLater = true;
+            _snwprintf_s(ub, _countof(ub), _TRUNCATE, L"새 버전 %s 이 있어요 · 관리자 승인을 기다려요", us.version.c_str());
+            break;
+        case UpdatePhase::Downloading:
+            show = true;
+            _snwprintf_s(ub, _countof(ub), _TRUNCATE, L"%s 내려받는 중 · %d%%", us.version.c_str(), us.progressPct);
+            break;
+        case UpdatePhase::Ready:
+            show = true;
+            _snwprintf_s(ub, _countof(ub), _TRUNCATE,
+                         (g_bBlackActive || g_measuring || g_loginBusy) ? L"%s 준비됨 · 화면이 풀리면 적용해요"
+                                                                        : L"%s 준비됨 · 곧 다시 시작해요",
+                         us.version.c_str());
+            break;
+        case UpdatePhase::Applying:
+            show = true; wcscpy_s(ub, L"다시 시작하는 중…");
+            break;
+        case UpdatePhase::Failed:
+            show = !us.dismissed; showApply = showLater = true; applyLabel = L"다시 시도";
+            // 기록에서 온 문구는 이미 "지난번 적용 실패: " 로 시작한다
+            _snwprintf_s(ub, _countof(ub), _TRUNCATE, us.fromMarker ? L"%s" : L"업데이트 실패: %s", msg.c_str());
+            break;
+        default: break;
+        }
+        if (g_hSimpleUpdMsg) {
+            wchar_t cur[384] = L""; GetWindowTextW(g_hSimpleUpdMsg, cur, _countof(cur));
+            if (wcscmp(cur, show ? ub : L"") != 0) SetWindowTextW(g_hSimpleUpdMsg, show ? ub : L"");
+            ShowWindow(g_hSimpleUpdMsg, show ? SW_SHOW : SW_HIDE);
+        }
+        if (HWND ha = GetDlgItem(g_hSimple, IDS_UPD_APPLY)) {
+            wchar_t cur[64] = L""; GetWindowTextW(ha, cur, _countof(cur));
+            if (wcscmp(cur, applyLabel) != 0) SetWindowTextW(ha, applyLabel);   // 매초 다시 그리지 않게
+            ShowWindow(ha, (show && showApply) ? SW_SHOW : SW_HIDE);
+        }
+        if (HWND hl = GetDlgItem(g_hSimple, IDS_UPD_LATER))
+            ShowWindow(hl, (show && showLater) ? SW_SHOW : SW_HIDE);
+
+        // 최소화된 창의 크기는 만지지 않는다 - 복원될 때 이상한 크기가 된다.
+        if (!IsIconic(g_hSimple)) {
+            RECT wr; GetWindowRect(g_hSimple, &wr);
+            int wantH = SW_H + (show ? SW_UPD_H : 0);
+            if (wr.bottom - wr.top != wantH)
+                SetWindowPos(g_hSimple, nullptr, 0, 0, SW_W, wantH,
+                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
     }
 
     HWND guard = GetDlgItem(g_hSimple, IDS_GUARD);
@@ -2709,6 +2862,23 @@ static LRESULT CALLBACK SimpleProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
             WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS, x, y, w, 18,
             hWnd, nullptr, hI, nullptr);
 
+        // ---- 프로그램 업데이트 (client/update.h) ----
+        // 머리의 버전 단추는 늘 있다 - 어느 PC 가 어느 버전인지가 이걸로 보인다.
+        // 아래 띠는 새 버전이 있을 때만 나타나고, 그때만 창이 SW_UPD_H 만큼 자란다
+        // (SimpleRefresh). 만들 때는 숨겨 둔다.
+        CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            x, 14, 210, 28, hWnd, (HMENU)(UINT_PTR)IDS_UPD_CHECK, hI, nullptr);
+        y += 24;
+        // 글은 폭 전체를 쓴다 (세 줄까지). 실패 이유가 여기 뜨는데, 단추 옆 좁은 칸에서는
+        // 뒷부분 - 대개 "어떻게 하라" 는 부분 - 이 잘려 나갔다. 단추는 그 아래 줄.
+        // SS_NOPREFIX: 서버에서 온 글의 '&' 를 단축키 표시로 먹지 않게
+        g_hSimpleUpdMsg = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | SS_LEFT | SS_NOPREFIX,
+            x, y + 4, w, 54, hWnd, nullptr, hI, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | BS_OWNERDRAW,
+            x + w - 176, y + 62, 84, 30, hWnd, (HMENU)(UINT_PTR)IDS_UPD_APPLY, hI, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"나중에", WS_CHILD | BS_OWNERDRAW,
+            x + w - 84, y + 62, 84, 30, hWnd, (HMENU)(UINT_PTR)IDS_UPD_LATER, hI, nullptr);
+
         EnumChildWindows(hWnd, [](HWND h, LPARAM f) -> BOOL {
             SendMessage(h, WM_SETFONT, (WPARAM)f, TRUE); return TRUE;
         }, (LPARAM)g_hFont);
@@ -2829,9 +2999,10 @@ static LRESULT CALLBACK SimpleProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
 
         bool accent = (id == IDS_GUARD && g_monitoring) ||
                       (id == IDS_CLIP && ClipSyncRunning()) ||
+                      (id == IDS_UPD_APPLY) ||
                       (id >= IDS_IDLE_BASE && id < IDS_IDLE_BASE + 4 &&
                        g_idleCountdownSec == kSimpleIdle[id - IDS_IDLE_BASE]);
-        bool ghost = (id == IDS_ADVANCED);
+        bool ghost = (id == IDS_ADVANCED || id == IDS_UPD_CHECK || id == IDS_UPD_LATER);
 
         COLORREF fill, edge, ink;
         if (accent)     { fill = down ? kAccentDn : kAccent; edge = fill;      ink = RGB(255,255,255); }
@@ -2875,6 +3046,23 @@ static LRESULT CALLBACK SimpleProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
             SimpleRefresh();
             break;
         case IDS_MEASURE: OpenWizard(hWnd); break;
+        case IDS_UPD_CHECK:
+            if (UpdateEnabled()) UpdateCheckAsync(true);   // 꺼져 있으면 단추 글이 이미 그렇게 말한다
+            SimpleRefresh();
+            break;
+        case IDS_UPD_APPLY: {
+            // 실패한 뒤 후보(버전·경로·해시)가 없으면 다시 묻는 것부터. 있으면 다시 받는다.
+            // version 만 보고 가르면 안 된다 - Pending 은 version 은 있고 후보는 없다.
+            UpdateStatus us = UpdateGetStatus();
+            if (us.phase == UpdatePhase::Failed && !UpdateHasCandidate()) UpdateCheckAsync(true);
+            else UpdateDownloadAsync();
+            SimpleRefresh();
+            break;
+        }
+        case IDS_UPD_LATER:
+            UpdateDismiss();
+            SimpleRefresh();
+            break;
         case IDS_CLIP: {
             AppConfig c; LoadAppConfig(c);
             if (ClipSyncRunning()) {
@@ -2941,6 +3129,10 @@ int WINAPI wWinMain(HINSTANCE hI, HINSTANCE, LPWSTR, int nS) {
                 // 관리자 권한으로 실행됨: SYSTEM 작업을 돌려 config에 저장
                 std::wstring m;
                 rc = ImportIrkElevated(argv[2], m) ? 0 : 1;
+            } else if (argc >= 5 && wcscmp(argv[1], L"--apply-update") == 0) {
+                // 업데이트 적용 (update.h). 복사본 exe 로 실행되며, 원래 프로세스가
+                // 아직 살아 있을 때 시작되므로 뮤텍스보다 먼저여야 한다.
+                rc = UpdateApplyMain(argc, argv);
             } else if (argc >= 2 && wcscmp(argv[1], L"--clip-test") == 0) {
                 // 클립보드 왕복 진단 (clipsync.h). 여기 있는 이유는 위와 같다 -
                 // 앱이 떠 있는 채로 돌려 봐야 쓸모가 있다. 그래서 winsock 과
@@ -2981,8 +3173,14 @@ int WINAPI wWinMain(HINSTANCE hI, HINSTANCE, LPWSTR, int nS) {
 
     HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"SmartScreen_Mutex_v1");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        MessageBoxW(nullptr, L"SmartScreen is already running.", L"SmartScreen", MB_OK|MB_ICONINFORMATION);
-        return 0;
+        // 업데이트 직후다: updater 가 예전 프로세스의 종료를 기다렸다 해도 뮤텍스가
+        // 풀리는 데 잠깐 걸릴 수 있다. 바로 "이미 실행 중" 으로 끝내면 새 버전이
+        // 아무 말 없이 안 뜬 것처럼 보인다. 몇 초는 기다려 준다.
+        DWORD w = WaitForSingleObject(hMutex, 10000);
+        if (w != WAIT_OBJECT_0 && w != WAIT_ABANDONED) {
+            MessageBoxW(nullptr, L"SmartScreen is already running.", L"SmartScreen", MB_OK|MB_ICONINFORMATION);
+            return 0;
+        }
     }
 
     WSADATA wd; WSAStartup(MAKEWORD(2, 2), &wd);
@@ -3041,7 +3239,7 @@ int WINAPI wWinMain(HINSTANCE hI, HINSTANCE, LPWSTR, int nS) {
      sc.lpszClassName = L"SmartScreenSimple";
      sc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
      RegisterClassExW(&sc);}
-    g_hSimple = CreateWindowExW(0, L"SmartScreenSimple", L"SmartScreen",
+    g_hSimple = CreateWindowExW(0, L"SmartScreenSimple", L"SmartScreen " SS_VERSION_STR,
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         (sx - SW_W) / 2, (sy - SW_H) / 2, SW_W, SW_H,
         nullptr, nullptr, hI, nullptr);
@@ -3073,6 +3271,23 @@ int WINAPI wWinMain(HINSTANCE hI, HINSTANCE, LPWSTR, int nS) {
             DbgEvent(L"session: no account yet");
         }
     }
+
+    // ---- 프로그램 업데이트 (client/update.h) --------------------------------
+    // 확인은 작업 스레드에서 돌고 결과는 WM_UPDATE_STATE 로 온다. 기업 등록 PC 는
+    // 조직 id 를 넘겨 승인된 버전만 받게 한다.
+    DbgEvent(L"start: SmartScreen %s", SS_VERSION_STR);
+    UpdateCleanupAfterStart();
+    if (chk.updateCheck) {
+        std::wstring surl = chk.serverUrl.empty() ? kDefaultSupabaseUrl : chk.serverUrl;
+        std::wstring skey = chk.anonKey.empty()   ? kDefaultAnonKey     : chk.anonKey;
+        UpdateInit(surl, skey, chk.enterpriseRegistered ? chk.orgId : L"",
+                   chk.updateChannel, g_hWnd, WM_UPDATE_STATE);
+        g_updLastCheck = GetTickCount64();
+        UpdateCheckAsync(false);
+        SetTimer(g_hWnd, IDT_UPDATE, 60 * 1000, nullptr);
+    } else {
+        DbgEvent(L"update: checks disabled (updateCheck=0)");
+    }
     if (g_hSimple) {
         ShowWindow(g_hSimple, configured ? SW_HIDE : SW_SHOW);
         SimpleRefresh();
@@ -3087,6 +3302,7 @@ int WINAPI wWinMain(HINSTANCE hI, HINSTANCE, LPWSTR, int nS) {
     // GdiplusShutdown 보다 먼저. 클립보드 스레드가 PNG 를 굽는 중이면
     // 셧다운 뒤의 GDI+ 호출이 된다.
     ClipSyncStop();
+    UpdateShutdown();
     FreeBlackScreenImages();
     if (gdipToken) Gdiplus::GdiplusShutdown(gdipToken);
     WSACleanup();

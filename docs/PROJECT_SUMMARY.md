@@ -33,6 +33,13 @@ see `docs/PROXIMITY.md` for the design and the measurements behind it.
 See `docs/PROXIMITY.md` for the design, the measurements and the adapter
 compatibility results.
 
+### 1b. Self-update
+- The app checks a `releases` table on startup and hourly, verifies the
+  downloaded exe against the SHA-256 stored in that row, and replaces itself
+  through a copy of its own exe (`--apply-update`). Personal PCs confirm in
+  the settings window; enterprise PCs apply whatever version the org admin
+  approved on the dashboard. See `docs/UPDATE.md`.
+
 ### 2. Screen Saver (Black Screen)
 - **Activation**: Triggers immediately when device transitions to FAR
 - **Deactivation**:

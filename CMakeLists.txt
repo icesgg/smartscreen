@@ -18,6 +18,7 @@ add_executable(SmartScreen WIN32
     client/ble_ident.cpp
     client/irk.cpp
     client/clipsync.cpp
+    client/update.cpp
     client/enterprise/supabase.cpp
     client/enterprise/auth.cpp
     client/enterprise/session.cpp
@@ -63,8 +64,11 @@ add_executable(AdvScan tools/advscan.cpp)
 add_executable(ProbeScan tools/probescan.cpp)
 # 구글 로그인 부품(PKCE/루프백/DPAPI) 자체 점검. Supabase 없이 돌아간다.
 add_executable(AuthTest tools/authtest.cpp client/enterprise/auth.cpp)
+# 새 버전을 서버에 올린다. 관리자용이라 배포 묶음(make_dist.bat)에 넣지 않는다.
+# 버전은 client/version.h 에서 오므로 SmartScreen 과 같은 빌드에서 나와야 한다.
+add_executable(Publish tools/publish.cpp client/enterprise/auth.cpp)
 
-foreach(t BtCheck AdvScan ProbeScan AuthTest)
+foreach(t BtCheck AdvScan ProbeScan AuthTest Publish)
     target_link_libraries(${t} PRIVATE windowsapp ole32)
     target_compile_definitions(${t} PRIVATE UNICODE _UNICODE)
     target_compile_options(${t} PRIVATE /utf-8)

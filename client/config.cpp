@@ -106,6 +106,11 @@ bool LoadAppConfig(AppConfig& cfg) {
     if (m.count(L"serverUrl")) cfg.serverUrl = m[L"serverUrl"];
     if (m.count(L"anonKey")) cfg.anonKey = m[L"anonKey"];
     if (m.count(L"enterpriseRegistered")) cfg.enterpriseRegistered = (_wtoi(m[L"enterpriseRegistered"].c_str()) != 0);
+    if (m.count(L"updateCheck")) cfg.updateCheck = (_wtoi(m[L"updateCheck"].c_str()) != 0);
+    if (m.count(L"updateChannel")) {
+        // 모르는 값이면 stable. 오타 하나로 업데이트가 조용히 멎으면 안 된다.
+        cfg.updateChannel = (m[L"updateChannel"] == L"beta") ? L"beta" : L"stable";
+    }
 
     // "읽을 설정이 있었는가". 예전에는 btAddress != 0 을 돌려줬는데,
     // 등록된 폰을 쓰면 Classic 주소가 없어 0이라 그때 설정 전체가 무시됐다.
@@ -171,5 +176,7 @@ void SaveAppConfig(const AppConfig& cfg) {
     m[L"serverUrl"] = cfg.serverUrl;
     m[L"anonKey"] = cfg.anonKey;
     m[L"enterpriseRegistered"] = cfg.enterpriseRegistered ? L"1" : L"0";
+    m[L"updateCheck"] = cfg.updateCheck ? L"1" : L"0";
+    m[L"updateChannel"] = cfg.updateChannel;
     WriteIni(GetConfigPath(), m);
 }

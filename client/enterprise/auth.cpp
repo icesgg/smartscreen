@@ -110,6 +110,52 @@ bool MakeCodeChallengeS256(const std::string& verifier, std::string& outChalleng
     return true;
 }
 
+static std::string HexLower(const unsigned char* d, size_t n) {
+    static const char* hx = "0123456789abcdef";
+    std::string s; s.reserve(n * 2);
+    for (size_t i = 0; i < n; ++i) { s += hx[d[i] >> 4]; s += hx[d[i] & 15]; }
+    return s;
+}
+
+bool Sha256Bytes(const void* data, size_t len, std::string& outHex) {
+    outHex.clear();
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0)))
+        return false;
+    unsigned char hash[32];
+    NTSTATUS st = BCryptHash(alg, nullptr, 0, (PUCHAR)data, (ULONG)len, hash, sizeof(hash));
+    BCryptCloseAlgorithmProvider(alg, 0);
+    if (!BCRYPT_SUCCESS(st)) return false;
+    outHex = HexLower(hash, sizeof(hash));
+    return true;
+}
+
+bool Sha256File(const std::wstring& path, std::string& outHex, unsigned long long& outSize) {
+    outHex.clear(); outSize = 0;
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) return false;
+
+    BCRYPT_ALG_HANDLE alg = nullptr; BCRYPT_HASH_HANDLE h = nullptr;
+    bool ok = BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0)) &&
+              BCRYPT_SUCCESS(BCryptCreateHash(alg, &h, nullptr, 0, nullptr, 0, 0));
+    if (ok) {
+        std::vector<unsigned char> buf(64 * 1024);
+        size_t n;
+        while ((n = fread(buf.data(), 1, buf.size(), f)) > 0) {
+            if (!BCRYPT_SUCCESS(BCryptHashData(h, buf.data(), (ULONG)n, 0))) { ok = false; break; }
+            outSize += n;
+        }
+        if (ok && ferror(f)) ok = false;
+        unsigned char hash[32];
+        if (ok) ok = BCRYPT_SUCCESS(BCryptFinishHash(h, hash, sizeof(hash), 0));
+        if (ok) outHex = HexLower(hash, sizeof(hash));
+    }
+    if (h) BCryptDestroyHash(h);
+    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    fclose(f);
+    return ok;
+}
+
 // ---------------------------------------------------------------------------
 // 루프백 리스너
 // ---------------------------------------------------------------------------

@@ -56,6 +56,11 @@ struct AppConfig {
     std::wstring serverUrl;
     std::wstring anonKey;
     bool enterpriseRegistered = false;
+    // 프로그램 자동 업데이트 (client/update.h). 켤 때와 한 시간마다 서버에 묻는다.
+    // 끄면 묻지 않는다 - 서버가 없는 곳에 두는 경우.
+    bool updateCheck = true;
+    // stable 이 기본. beta 는 내 PC 에서 먼저 돌려 보는 용도다 (docs/UPDATE.md).
+    std::wstring updateChannel = L"stable";
 };
 
 std::wstring GetConfigDir();
