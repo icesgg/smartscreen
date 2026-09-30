@@ -310,10 +310,12 @@ bool UnprotectSecret(const std::wstring& b64, std::wstring& outPlain) {
 // ---------------------------------------------------------------------------
 // supabase.cpp 에도 GET 이 있지만 static 이고 본문을 보내지 못한다.
 // 토큰 교환은 POST + JSON 본문이라 여기에 따로 둔다.
-static bool HttpRequest(const wchar_t* verb, const std::wstring& url,
+//
+// clipsync.cpp 도 이걸 쓴다 (선언은 auth.h). 그래서 static 이 아니다.
+bool SupabaseHttp(const wchar_t* verb, const std::wstring& url,
                         const std::vector<std::wstring>& headers,
                         const std::string& body,
-                        DWORD& outStatus, std::string& outBody) {
+                        unsigned long& outStatus, std::string& outBody) {
     outStatus = 0;
     outBody.clear();
 
@@ -328,6 +330,12 @@ static bool HttpRequest(const wchar_t* verb, const std::wstring& url,
     HINTERNET hSession = WinHttpOpen(L"SmartScreen/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return false;
+
+    // 요청 하나가 무한정 매달리지 않게 한다. 예전에는 부르는 쪽이 로그인 한
+    // 번이었으므로 기본값으로 충분했는데, 지금은 클립보드 일꾼이 이걸 계속
+    // 부르고 종료할 때 그 스레드를 기다린다 - 한 번의 요청이 종료를 기다릴 수
+    // 있는 시간보다 길면 안 된다 (clipsync.cpp 의 ClipSyncStop).
+    WinHttpSetTimeouts(hSession, 10000, 10000, 15000, 15000);
 
     HINTERNET hConnect = WinHttpConnect(hSession, host, uc.nPort, 0);
     if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
@@ -370,6 +378,42 @@ static bool HttpRequest(const wchar_t* verb, const std::wstring& url,
 // ---------------------------------------------------------------------------
 // 응답 모양이 고정이라 파서를 들이지 않는다. 다만 "찾은 첫 문자열"을 쓰면
 // 엉뚱한 값을 집으므로 "키":  꼴을 정확히 맞춘다.
+// "\uXXXX" 의 네 자리를 읽는다. 넷이 다 16진수가 아니면 실패로 두고 부르는 쪽이
+// 원문을 그대로 남기게 한다 - 조용히 0 으로 읽으면 글자가 사라진다.
+static bool ReadHex4(const std::string& s, size_t at, unsigned& out) {
+    if (at + 4 > s.size()) return false;
+    unsigned v = 0;
+    for (int i = 0; i < 4; i++) {
+        char c = s[at + i];
+        int d;
+        if      (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else return false;
+        v = (v << 4) | (unsigned)d;
+    }
+    out = v;
+    return true;
+}
+
+static void AppendUtf8(std::string& out, unsigned cp) {
+    if (cp < 0x80) {
+        out += (char)cp;
+    } else if (cp < 0x800) {
+        out += (char)(0xC0 | (cp >> 6));
+        out += (char)(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        out += (char)(0xE0 | (cp >> 12));
+        out += (char)(0x80 | ((cp >> 6) & 0x3F));
+        out += (char)(0x80 | (cp & 0x3F));
+    } else {
+        out += (char)(0xF0 | (cp >> 18));
+        out += (char)(0x80 | ((cp >> 12) & 0x3F));
+        out += (char)(0x80 | ((cp >> 6) & 0x3F));
+        out += (char)(0x80 | (cp & 0x3F));
+    }
+}
+
 static bool JsonFindString(const std::string& body, const std::string& key,
                            std::string& out) {
     out.clear();
@@ -390,6 +434,27 @@ static bool JsonFindString(const std::string& body, const std::string& key,
                     case 'n': v += '\n'; break;
                     case 't': v += '\t'; break;
                     case 'r': v += '\r'; break;
+                    // \uXXXX. 이게 없으면 'u' 와 숫자 넷이 그대로 본문에 남는다.
+                    // 응답이 토큰과 이메일뿐일 때는 만난 적이 없었지만, 이제
+                    // 클립보드 텍스트가 이 파서를 지나간다 - 사람이 복사한
+                    // 아무 문자열이므로 제어문자가 섞여 들어올 수 있다.
+                    case 'u': {
+                        unsigned cp = 0;
+                        if (!ReadHex4(body, q + 1, cp)) { v += 'u'; break; }
+                        q += 4;
+                        // 서러게이트 쌍은 둘을 합쳐야 한 글자가 된다.
+                        // 앞짝만 UTF-8 로 적으면 깨진 바이트가 된다.
+                        if (cp >= 0xD800 && cp <= 0xDBFF &&
+                            q + 6 < body.size() && body[q + 1] == '\\' && body[q + 2] == 'u') {
+                            unsigned lo = 0;
+                            if (ReadHex4(body, q + 3, lo) && lo >= 0xDC00 && lo <= 0xDFFF) {
+                                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                q += 6;
+                            }
+                        }
+                        AppendUtf8(v, cp);
+                        break;
+                    }
                     default:  v += body[q]; break;
                 }
             } else {
@@ -534,7 +599,7 @@ bool SignInWithGoogle(const std::wstring& supabaseUrl, const std::wstring& anonK
     };
     DWORD status = 0;
     std::string resp;
-    if (!HttpRequest(L"POST", supabaseUrl + L"/auth/v1/token?grant_type=pkce",
+    if (!SupabaseHttp(L"POST", supabaseUrl + L"/auth/v1/token?grant_type=pkce",
                      headers, body, status, resp)) {
         outErr = L"토큰 교환 요청이 실패했다";
         return false;
@@ -566,7 +631,7 @@ bool RefreshSession(const std::wstring& supabaseUrl, const std::wstring& anonKey
     };
     DWORD status = 0;
     std::string resp;
-    if (!HttpRequest(L"POST", supabaseUrl + L"/auth/v1/token?grant_type=refresh_token",
+    if (!SupabaseHttp(L"POST", supabaseUrl + L"/auth/v1/token?grant_type=refresh_token",
                      headers, body, status, resp)) {
         outErr = L"갱신 요청이 실패했다";
         return false;
@@ -598,7 +663,7 @@ bool FetchDeviceToken(const std::wstring& supabaseUrl, const std::wstring& anonK
     };
     DWORD status = 0;
     std::string resp;
-    if (!HttpRequest(L"GET", supabaseUrl + L"/rest/v1/device_tokens?select=token",
+    if (!SupabaseHttp(L"GET", supabaseUrl + L"/rest/v1/device_tokens?select=token",
                      headers, std::string(), status, resp)) {
         outErr = L"조회 요청이 실패했다";
         return false;
@@ -632,7 +697,7 @@ bool ClaimDeviceToken(const std::wstring& supabaseUrl, const std::wstring& anonK
     };
     DWORD status = 0;
     std::string resp;
-    if (!HttpRequest(L"POST", supabaseUrl + L"/rest/v1/rpc/claim_device_token",
+    if (!SupabaseHttp(L"POST", supabaseUrl + L"/rest/v1/rpc/claim_device_token",
                      headers, body, status, resp)) {
         outErr = L"요청이 실패했다";
         return false;
@@ -665,7 +730,7 @@ bool DeleteDeviceToken(const std::wstring& supabaseUrl, const std::wstring& anon
     };
     DWORD status = 0;
     std::string resp;
-    if (!HttpRequest(L"DELETE",
+    if (!SupabaseHttp(L"DELETE",
                      supabaseUrl + L"/rest/v1/device_tokens?user_id=eq." + session.userId,
                      headers, std::string(), status, resp)) {
         outErr = L"요청이 실패했다";
@@ -676,4 +741,21 @@ bool DeleteDeviceToken(const std::wstring& supabaseUrl, const std::wstring& anon
         return false;
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// 다른 번역 단위에 내주는 얇은 껍데기 (선언은 auth.h)
+// ---------------------------------------------------------------------------
+// 이름만 바꿔 내준다. 안쪽 이름을 그대로 노출하지 않는 이유는 Widen/Narrow 가
+// 이 파일 여러 곳에서 불리고 있어서, 파일 밖에서 쓸 이름과 한꺼번에 바꾸면
+// 진짜 변경과 이름 바꾸기가 같은 diff 에 섞이기 때문이다.
+std::wstring Utf8ToWide(const std::string& s) { return Widen(s); }
+std::string  WideToUtf8(const std::wstring& w) { return Narrow(w); }
+
+bool JsonGetString(const std::string& body, const std::string& key, std::string& out) {
+    return JsonFindString(body, key, out);
+}
+
+bool JsonGetNumber(const std::string& body, const std::string& key, long long& out) {
+    return JsonFindNumber(body, key, out);
 }

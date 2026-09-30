@@ -11,6 +11,37 @@
 // 읽을 수 있다. 이건 취향이 아니라 이 구조에서 유일하게 동작하는 선택이다.
 #pragma once
 #include <string>
+#include <vector>
+
+// ---------------------------------------------------------------------------
+// HTTP 한 번 왕복 (WinHTTP)
+// ---------------------------------------------------------------------------
+// auth.cpp 안에만 static 으로 있던 것을 꺼냈다. 클립보드 동기화가 똑같은 것을
+// 필요로 하는데(clipsync.cpp), 한 벌 더 만들면 두 벌이 된다. supabase.cpp 의
+// GET 은 본문을 보내지 못해서 쓸 수 없다.
+//
+// body 와 outBody 는 바이너리도 담는다 - std::string 은 여기서 문자열이 아니라
+// 바이트 통이다. PNG 를 그대로 싣고 그대로 받는다.
+//
+// 이 헤더는 <string>/<vector> 말고는 아무것도 요구하지 않는다. windows.h 를
+// 끌어오면 이걸 포함하는 쪽의 헤더 순서 문제가 된다(config.h 가 winsock2 로
+// 겪은 일). 그래서 상태 코드가 DWORD 가 아니라 unsigned long 이다 - 윈도에서
+// 같은 타입이므로 DWORD 변수를 그대로 넘겨도 된다.
+bool SupabaseHttp(const wchar_t* verb, const std::wstring& url,
+                  const std::vector<std::wstring>& headers,
+                  const std::string& body,
+                  unsigned long& outStatus, std::string& outBody);
+
+// UTF-8 <-> UTF-16. 같은 이유로 여기 있다.
+std::wstring Utf8ToWide(const std::string& s);
+std::string  WideToUtf8(const std::wstring& w);
+
+// 응답 본문에서 "key": "value" 를 꺼낸다. 응답 모양이 고정이라 파서를 들이지
+// 않는다. 첫 번째로 나오는 것을 준다 - 배열을 읽을 때는 PostgREST 에
+// 단일 객체를 달라고 해서(Accept: application/vnd.pgrst.object+json) 배열을
+// 아예 만들지 않는 편이 맞다.
+bool JsonGetString(const std::string& body, const std::string& key, std::string& out);
+bool JsonGetNumber(const std::string& body, const std::string& key, long long& out);
 
 // ---------------------------------------------------------------------------
 // PKCE (RFC 7636)
