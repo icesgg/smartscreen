@@ -10,7 +10,7 @@
 
 #define SS_VERSION_MAJOR 1
 #define SS_VERSION_MINOR 1
-#define SS_VERSION_PATCH 6
+#define SS_VERSION_PATCH 7
 
 // 아래는 위 세 숫자를 "1.1.0" 과 L"1.1.0" 으로 만드는 매크로 배관이다.
 // 두 단계로 나눈 이유: # 와 ## 의 인자는 먹기 전에 펼쳐지지 않는다.
