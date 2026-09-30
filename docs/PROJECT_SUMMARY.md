@@ -132,8 +132,8 @@ ones with no UI. Thresholds must be measured per adapter and per desk -
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `nearRssiThreshold` | -65 dBm | Advertisement path threshold. The "신호 강도" box |
-| `gattRssiThreshold` | -55 dBm | GATT path threshold (phone-measured, different scale) |
+| `nearRssiThreshold` | -65 dBm | The threshold, both paths. The "신호 강도" box |
+| `gattRssiThreshold` | (= above) | Kept equal to `nearRssiThreshold` since 1.1.6; earlier builds used it as a separate GATT-path value |
 | `bleLostMeansFar` | 1 | Signal lost = user away. Turn off only when running without the app |
 | `bleTimeoutSec` | 90 | Silence this long counts as lost |
 | `bleIrk` | (none) | Phone's identity key. Belongs to the phone, copyable between PCs |

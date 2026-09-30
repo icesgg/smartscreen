@@ -794,6 +794,12 @@ static void StartMon() {
     if (latVal > -30) latVal = -30;
     if (latVal < -100) latVal = -100;
     g_nearRssiThreshold = latVal;
+    // 연결(GATT) 경로도 같은 값이다. 처음에는 "폰이 잰 값이라 눈금이 다르다" 고 따로
+    // 뒀지만, 실측에서 두 경로는 2dB 안에서 같이 움직였고(PROXIMITY.md) 간단 창의
+    // 슬라이더는 이미 둘을 같이 바꾼다. 이 칸만 광고 쪽을 바꾸게 두면 폰 앱이 붙어
+    // 있는 PC 는 화면에 보이는 것과 다른 값으로 판정한다 - 실제로 광고 -67 / 연결 -61
+    // 로 갈라진 채 앉은 자리에서 잠겼다 (2026-10-01).
+    g_gattRssiThreshold = latVal;
     swprintf_s(latBuf, L"%d", latVal); SetWindowTextW(g_hEditLatency, latBuf);
     // latency fallback용 (호환성)
     g_nearLatencyMs = 200;
@@ -848,7 +854,8 @@ static void StartMon() {
     DbgEvent(L"ident: token=%d ovfBit=%d",
         cfg.phoneToken.empty() ? 0 : 1, cfg.phoneOvfBit);
     // v2: GATT 서버를 먼저 시작 (폰 앱이 연결해 오면 1Hz RSSI 보고를 받음. 실패해도 v1/latency로 동작)
-    g_gattRssiThreshold = cfg.gattRssiThreshold;
+    // g_gattRssiThreshold 는 위에서 "신호 강도" 칸의 값으로 맞췄다. config 의
+    // gattRssiThreshold 는 그 값의 사본일 뿐이라 여기서 다시 읽지 않는다.
     g_gattSeen = cfg.gattSeen;
     g_gattGraceSec = cfg.gattGraceSec;
     g_monStartTick = GetTickCount64();
@@ -882,6 +889,7 @@ static void StartMon() {
     cfg.btAddress = g_targetAddr;
     cfg.nearLatencyMs = g_nearLatencyMs;
     cfg.nearRssiThreshold = g_nearRssiThreshold;
+    cfg.gattRssiThreshold = g_gattRssiThreshold;   // 같은 값 (위 주석)
     cfg.gattSeen = g_gattSeen;
     cfg.keepAliveSec = g_keepAliveSec;
     cfg.scanIntervalSec = g_scanIntervalSec;

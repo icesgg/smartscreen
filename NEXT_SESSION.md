@@ -497,6 +497,11 @@ Disconnected / Closed 로 보고됐다. `GattDeviceService` 는 반드시 `Close
 - 노트북(LG gram 14Z990, Intel 내장): **1.1.5**, 기업 등록(`enterpriseRegistered=1`,
   orgId `0dca070f-…`), `measuredBaseRssi=-61`, `nearRssiThreshold=-67` (거리 3단계의
   [멀리]), `gattRssiThreshold=-61`, `bleDebugLog=0`. IRK 와 폰 토큰 둘 다 설정돼 있다.
+  **두 임계값이 6dB 갈라져 있어서** 폰 앱이 붙어 있으면(GATT linked) -61 로 판정했고
+  앉은 자리(-60~-66)에서 잠겼다 (2026-10-01 07:25~07:31). 고급 창의 "신호 강도" 가
+  광고 임계값만 바꾸고 있었기 때문이다 - 이제 [시작] 때 둘을 같은 값으로 맞춘다
+  (커밋됨, 1.1.6 으로 나가야 한다). 그 전까지는 간단 창의 슬라이더를 한 번 움직이면
+  둘 다 -67 이 된다.
   **`centerImagePath` 는 개인 그림(`Pictures\대시보드.jpg`), `clipSync=0`** (2026-10-01
   에 config.ini 를 직접 봤다). 앱은 `C:\work\smartscreen\build\SmartScreen.exe` 로 돌고
   있다 (release.bat 이 그걸 닫았다 다시 띄웠다; `dist\` 의 exe 와 같은 파일이다)
