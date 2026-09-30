@@ -11,6 +11,7 @@
 //   Publish.exe --deactivate <url> <anonkey> <version>
 //                         행을 끄는 것뿐이다. 이미 받은 PC 는 그대로다
 //   Publish.exe --selftest
+//   Publish.exe --version   이 exe 가 컴파일된 버전 (release.ps1 이 빌드가 새것인지 확인하는 데 쓴다)
 //
 // 버전은 이 exe 가 컴파일될 때의 client/version.h 다. 올리는 SmartScreen.exe 도
 // 같은 빌드에서 나와야 한다 - 그래서 publish.bat 가 build\ 의 둘을 짝지어 부른다.
@@ -229,6 +230,7 @@ int wmain(int argc, wchar_t** argv) {
     // (줄바꿈까지)를 버린다 - 오류 문구가 "[FAIL] " 로 끝나 보인다.
     setlocale(LC_ALL, ".UTF8");
 
+    if (argc > 1 && wcscmp(argv[1], L"--version") == 0)  { printf("%s\n", SS_VERSION_STR_A); return 0; }
     if (argc > 1 && wcscmp(argv[1], L"--selftest") == 0) return SelfTest();
     if (argc > 3 && wcscmp(argv[1], L"--list") == 0)     return List(argv[2], argv[3]);
     if (argc > 4 && wcscmp(argv[1], L"--deactivate") == 0) return Deactivate(argv[2], argv[3], argv[4]);

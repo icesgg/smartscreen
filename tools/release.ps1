@@ -14,10 +14,14 @@
 # 닫았던 앱은 다시 띄운다 - 화면을 지키는 프로그램이 배포 스크립트 때문에 꺼져 있으면
 # 안 된다.
 #
-# PowerShell 5.1 함정 둘: (1) $null 을 string 매개변수에 넘기면 "" 가 된다 - FindWindow
+# PowerShell 5.1 함정 셋: (1) $null 을 string 매개변수에 넘기면 "" 가 된다 - FindWindow
 # 의 제목 인자는 IntPtr 로 받는다. (2) 네이티브 명령의 stderr 는 오류 레코드가 되고,
 # ErrorActionPreference=Stop 이면 vcvarsall 의 잡음 한 줄("vswhere 없음")에도 스크립트가
-# 죽는다 - 그래서 Continue 로 두고 종료 코드를 직접 본다.
+# 죽는다 - 그래서 Continue 로 두고 종료 코드를 직접 본다. (3) 인자 안의 따옴표는 \" 로
+# 바뀌어 cmd 에 간다 - `cmd /c "call ""x.bat"" > ""log""` 는 아무것도 못 하고 끝난다.
+# 실제로 그랬고, 스크립트는 지난번 로그를 읽어 "빌드 성공" 이라고 했다. 그래서 빌드는
+# PowerShell 이 직접 실행해 출력을 받고, 옛 로그는 먼저 지우고, 끝난 뒤 exe 가 정말
+# 새로 생겼는지와 Publish.exe --version 이 새 번호인지를 따로 본다. 보고를 믿지 않는다.
 #
 # 한글이 있으므로 이 파일은 UTF-8 BOM 으로 저장돼 있어야 한다 (NEXT_SESSION.md 함정).
 param(
@@ -27,7 +31,8 @@ param(
     [switch]$DryRun
 )
 $ErrorActionPreference = 'Continue'
-[Console]::OutputEncoding = [Text.Encoding]::UTF8
+# 콘솔 인코딩은 건드리지 않는다. 한글 콘솔(CP949)은 한글을 그대로 보여 주고, UTF-8 로
+# 바꾸면 cl.exe 의 CP949 출력이 깨져 로그에 섞인다.
 
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $root
@@ -82,13 +87,19 @@ try {
         $nums.PATCH += 1
     }
     $script:newVer = "$($nums.MAJOR).$($nums.MINOR).$($nums.PATCH)"
-    if ($script:newVer -eq $script:oldVer) { Fail "지금 버전과 같다: $script:oldVer" }
-    $script:origVersionText = $vhText
-    $vhText = $vhText -replace '#define SS_VERSION_MAJOR \d+', "#define SS_VERSION_MAJOR $($nums.MAJOR)"
-    $vhText = $vhText -replace '#define SS_VERSION_MINOR \d+', "#define SS_VERSION_MINOR $($nums.MINOR)"
-    $vhText = $vhText -replace '#define SS_VERSION_PATCH \d+', "#define SS_VERSION_PATCH $($nums.PATCH)"
-    [IO.File]::WriteAllText($vhPath, $vhText, $utf8)
-    Ok "$script:oldVer -> $script:newVer"
+    if ($script:newVer -eq $script:oldVer) {
+        # 번호를 명시했는데 지금과 같다 = 게시가 실패한 뒤 같은 번호로 다시 올리는 경우.
+        # 파일은 손대지 않는다 (되돌릴 것도 없다).
+        if (-not $Version) { Fail "지금 버전과 같다: $script:oldVer" }
+        Ok "$script:newVer (version.h 그대로)"
+    } else {
+        $script:origVersionText = $vhText
+        $vhText = $vhText -replace '#define SS_VERSION_MAJOR \d+', "#define SS_VERSION_MAJOR $($nums.MAJOR)"
+        $vhText = $vhText -replace '#define SS_VERSION_MINOR \d+', "#define SS_VERSION_MINOR $($nums.MINOR)"
+        $vhText = $vhText -replace '#define SS_VERSION_PATCH \d+', "#define SS_VERSION_PATCH $($nums.PATCH)"
+        [IO.File]::WriteAllText($vhPath, $vhText, $utf8)
+        Ok "$script:oldVer -> $script:newVer"
+    }
 
     # ------------------------------------------------------------ 메모
     if (!$DryRun -and !$Notes) {
@@ -133,14 +144,28 @@ try {
     # ------------------------------------------------------------ 빌드
     Step "빌드 (do_build.bat)"
     $buildLog = Join-Path $env:TEMP 'smartscreen-release-build.log'
-    # 리다이렉션은 cmd 가 한다. PowerShell 이 하면 stderr 줄마다 오류 레코드가 된다.
-    cmd /c "call ""$root\do_build.bat"" > ""$buildLog"" 2>&1"
-    $log = if (Test-Path $buildLog) { Get-Content $buildLog -Raw } else { "" }
-    if ($log -notmatch 'BUILD_SUCCESS') {
+    if (Test-Path $buildLog) { Remove-Item $buildLog -Force }      # 지난번 로그를 증거로 삼지 않는다
+    # PowerShell 이 직접 실행한다 (머리말 함정 3). stderr 줄은 오류 레코드로 섞여 들어오지만
+    # Continue 라 멈추지 않고, 로그에 같이 남는다.
+    $log = (& "$root\do_build.bat" 2>&1 | Out-String)
+    $buildRc = $LASTEXITCODE
+    [IO.File]::WriteAllText($buildLog, $log, $utf8)
+    if ($buildRc -ne 0 -or $log -notmatch 'BUILD_SUCCESS') {
         Write-Host (($log -split "`n") | Select-Object -Last 25) -Separator "`n"
-        Fail "빌드 실패. 위가 로그의 끝이다 (전체: $buildLog)"
+        Fail "빌드 실패 (exit $buildRc). 위가 로그의 끝이다 (전체: $buildLog)"
     }
-    Ok "SmartScreen.exe / Publish.exe $script:newVer"
+    # 보고가 아니라 결과를 본다: exe 두 개가 version.h 보다 낡지 않았나 (낡았다 = 링크가
+    # 안 된 것), 그리고 그 안의 번호가 맞나. "이번 실행에 새로 생겼나" 로 보면 안 된다 -
+    # 같은 번호로 다시 돌릴 때 nmake 는 이미 맞는 exe 를 다시 링크하지 않는다.
+    $vhTime = (Get-Item $vhPath).LastWriteTime
+    foreach ($exe in 'SmartScreen.exe', 'Publish.exe') {
+        $f = Get-Item "$root\build\$exe" -ErrorAction SilentlyContinue
+        if (-not $f) { Fail "build\$exe 가 없다 (로그: $buildLog)" }
+        if ($f.LastWriteTime -lt $vhTime) { Fail "build\$exe 가 version.h 보다 낡았다 - 링크가 안 됐다 (로그: $buildLog)" }
+    }
+    $built = (& "$root\build\Publish.exe" --version 2>&1 | Out-String).Trim()
+    if ($built -ne $script:newVer) { Fail "새 Publish.exe 가 '$built' 이라고 한다 ($script:newVer 이어야 한다)" }
+    Ok "SmartScreen.exe / Publish.exe $built (새로 생김)"
     & "$root\build\Publish.exe" --selftest | Out-Null
     if ($LASTEXITCODE -ne 0) { & "$root\build\Publish.exe" --selftest; Fail "Publish.exe --selftest 실패" }
 
@@ -159,7 +184,8 @@ try {
 
         # -------------------------------------------------------- dist + zip (새로 까는 PC 용)
         Step "dist\ 와 SmartScreen-desktop.zip"
-        cmd /c "call ""$root\make_dist.bat"" > nul 2>&1"
+        & "$root\make_dist.bat" 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { Fail "make_dist.bat 실패" }
         if (Test-Path "$root\SmartScreen-desktop.zip") { Remove-Item "$root\SmartScreen-desktop.zip" -Force }
         Compress-Archive -Path "$root\dist\*" -DestinationPath "$root\SmartScreen-desktop.zip" -Force
         Ok "갱신됨"

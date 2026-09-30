@@ -337,6 +337,24 @@ python 으로 일괄 치환하면 파일 전체가 뒤집힌다. **수정 전후
   이 CP949 로 읽어 한글이 깨진 채 파싱 에러가 난다 (이번에 밟았다)
 - `.cpp` 는 UTF-8 (BOM 없음), CMake 가 `/utf-8` 을 준다
 
+### 헤더만 바꾸면 다시 빌드되지 않을 수 있다 (do_build.bat 의 VSLANG)
+
+CMake 의 NMake 생성기는 cl.exe 의 `/showIncludes` 출력에서 헤더 의존성을 읽는데, 그
+접두어("참고: 포함 파일:")를 **글자로** 맞춘다. 콘솔 코드페이지가 처음 설정할 때와
+다르면(예: PowerShell 에서 UTF-8 로 바꾸고 빌드) 접두어가 안 맞아 `.obj.d` 가 0 바이트로
+남고, 그 뒤로는 `version.h` 만 바꿔서는 아무것도 다시 컴파일되지 않는다 - 빌드는
+"성공" 하고 exe 는 낡은 채다. 실제로 그렇게 1.1.0 이 다시 올라갔고, `release.bat` 이
+1.1.2 를 1.1.3 이라고 믿었다. `do_build.bat` 이 `VSLANG=1033` 으로 영어 접두어를
+강제한다. 의심되면 `build\CMakeFiles\SmartScreen.dir\client\main.cpp.obj.d` 가 비어
+있는지 보고, 비어 있으면 `build\CMakeCache.txt` 와 `build\CMakeFiles` 를 지우고 다시.
+
+### 인라인 파이썬에 윈도 경로를 넣지 말 것
+
+`python - <<'PY'` 안의 문자열에 `\build`, `\vcvarsall` 이 들어가면 `\b`(백스페이스),
+`\v`(세로 탭)로 바뀌어 앵커가 조용히 안 맞는다 (bash heredoc 은 안 건드리지만 파이썬이
+건드린다). 이번에 두 번 밟았다. Write 로 스크립트 파일을 만들고 raw 문자열(r'...')을
+쓸 것. 같은 이유로 `re.sub` 의 치환 문자열에 `\n` 을 넣으면 줄바꿈이 된다.
+
 ### swprintf_s 는 잘라 쓰지 않는다
 
 넘치면 CRT 의 invalid-parameter 핸들러가 프로세스를 끝낸다 (릴리스 빌드). 서버에서
