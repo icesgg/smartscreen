@@ -497,6 +497,10 @@ static DWORD WINAPI ScanThread(LPVOID) {
             // v2: 폰 앱이 GATT로 연결되어 ~1Hz로 RSSI를 보고 중 → 최우선 사용
             useGatt = true; bleAvail = true; reachable = true;
             rssi = g_bleGatt.GetSmoothedRssi();
+            // 아래 두 갈래는 임계값을 안 본다. 그래도 effThr 은 이 경로의 설정값으로
+            // 둔다 - 기본값(광고 임계값)인 채로 두면 STATE 줄이 "GATT rssi=-65 thr=-67"
+            // 처럼 다른 경로의 숫자를 찍어서, 로그만 보고는 왜 NEAR 가 됐는지 알 수 없다.
+            effThr = g_gattRssiThreshold;
             if (g_bleGatt.CurrentPollIntervalMs() == 0) {
                 isNear = true;                               // 입력 중이라 폴링을 쉬는 상태 = 자리에 있음
             } else if (g_bleGatt.ReportAgeMs() == 0xFFFFFFFF) {
