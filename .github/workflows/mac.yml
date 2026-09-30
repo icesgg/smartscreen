@@ -1,0 +1,62 @@
+# macOS 판 빌드. 이 저장소를 쓰는 사람은 Windows 에서 일하고 Mac 은 가까이 없다 -
+# Swift 코드가 컴파일되는지, 판단 로직 시험이 통과하는지는 여기서만 확인된다.
+#
+# 결과물 SmartScreen-mac.zip 은 이 실행의 artifact 로 남는다. tools/release.ps1 이
+# 방금 올린 커밋의 이 실행을 기다렸다가 zip 을 받아 서버에 게시한다 (docs/MAC.md).
+name: mac
+
+on:
+  push:
+    branches: [main, mac]
+    paths:
+      - 'mac/**'
+      - 'client/version.h'
+      - '.github/workflows/mac.yml'
+  pull_request:
+    paths:
+      - 'mac/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    # shell: bash 는 -o pipefail 을 켠다. 기본 셸은 안 켜서 `swift test | tee` 의 실패가 묻힌다.
+    defaults:
+      run:
+        shell: bash
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      - name: Test (판단 로직)
+        working-directory: mac
+        run: swift test 2>&1 | tee ../swift-test.log
+
+      - name: Build app (유니버설)
+        run: bash mac/build_app.sh 2>&1 | tee swift-build.log
+
+      - name: Upload zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmartScreen-mac
+          path: |
+            mac/dist/SmartScreen-mac.zip
+            mac/dist/VERSION
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: |
+            swift-test.log
+            swift-build.log
+          if-no-files-found: ignore

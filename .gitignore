@@ -14,3 +14,7 @@ dist/*
 # 실제 값이 든 .env 는 추적하지 않는다. 형식은 .env.example 이 보여준다.
 .env
 build-*/
+# macOS 판 빌드 산출물 (mac/build_app.sh)
+mac/.build/
+mac/.swiftpm/
+mac/dist/
