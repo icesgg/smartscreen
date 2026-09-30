@@ -16,9 +16,9 @@ BLE 신호 세기(RSSI)로 거리를 판단한다.
 
 ## 직전 세션: 프로그램 자동 업데이트 + release.bat
 
-**끝까지 돌았다.** 서버에 1.1.0 ~ 1.1.3 이 있고 두 PC 모두 1.1.3 이다. 노트북(기업
+**끝까지 돌았다.** 서버에 1.1.0 ~ 1.1.4 가 있고 두 PC 모두 1.1.4 다. 노트북(기업
 등록)은 대시보드 [승인] → 자동 적용, 데스크톱은 zip 을 깔고 켠 뒤 올라갔다.
-마지막 1.1.3 은 `release.bat` 한 번으로 나갔다 (사용자 보고 "잘된다").
+1.1.3 은 `release.bat` 한 번으로 나갔고, 1.1.4 는 사용자가 혼자 `release.bat` 으로 내놓았다 ("잘된다").
 
 ### 구조 (docs/UPDATE.md 에 근거까지)
 
@@ -352,15 +352,15 @@ Disconnected / Closed 로 보고됐다. `GattDeviceService` 는 반드시 `Close
 
 ## 현재 기기 상태
 
-- 노트북(LG gram 14Z990, Intel 내장): **1.1.3**, 기업 등록(`enterpriseRegistered=1`,
+- 노트북(LG gram 14Z990, Intel 내장): **1.1.4**, 기업 등록(`enterpriseRegistered=1`,
   orgId `0dca070f-…`), `measuredBaseRssi=-61`, `nearRssiThreshold=-67` (거리 3단계의
   [멀리]), `gattRssiThreshold=-61`, `bleDebugLog=0`. IRK 와 폰 토큰 둘 다 설정돼 있다.
   앱은 `C:\work\smartscreen\dist\SmartScreen.exe` 로 돌고 있다 (release.bat 이 그걸
   닫았다 다시 띄운다)
-- 데스크톱: **1.1.3**, 듀얼 모니터. 기업 등록인지 개인인지는 이 세션에서 확인 못 했다
+- 데스크톱: **1.1.4**, 듀얼 모니터. 기업 등록인지 개인인지는 이 세션에서 확인 못 했다
 - 두 대 모두 클립보드 공유 켜짐, 같은 구글 계정(icesgg@gmail.com)
 - Supabase: 네 스키마(`schema`/`device_tokens`/`clipboard`/`releases`) 적용됨.
-  `releases` 에 1.1.0·1.1.1·1.1.2·1.1.3 (1.1.0 은 낡은 빌드가 실수로 다시 올라간 것 -
+  `releases` 에 1.1.0·1.1.1·1.1.2·1.1.3·1.1.4 (1.1.0 은 낡은 빌드가 실수로 다시 올라간 것 -
   해는 없음). `release_admins` 에 icesgg@gmail.com. 대시보드(GitHub Pages)에 승인 칸이
   올라가 있고 [승인] 단추로 1.1.3 을 승인해 노트북이 받았다 (사용자 보고)
-- `client/version.h` = 1.1.3 = 서버의 마지막 = `build\` = `dist\` = `SmartScreen-desktop.zip`
+- `client/version.h` = 1.1.4 = 서버의 마지막 = `build\` = `dist\` = `SmartScreen-desktop.zip`
