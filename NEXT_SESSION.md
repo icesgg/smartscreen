@@ -17,8 +17,9 @@ BLE 신호 세기(RSSI)로 거리를 판단한다.
 ## 직전 세션: 서버와 주고받는 면 전체 검토 + 고치기 (2026-09-30)
 
 "anon 이 `contents` 에 쓸 수 있나" 를 보러 들어갔다가, 서버와 주고받는 면 전체를
-검토하고 고쳤다. **코드는 고쳐졌고 컴파일되지만 아직 앱으로 돌려 본 적이 없다** -
-아래 "남은 작업 0" 이 그 순서다.
+검토하고 고쳤다. **1.1.5 로 나갔다** (2026-10-01, `release.bat`). 두 마이그레이션도
+적용됐다. 노트북은 1.1.5 로 떠서 세션 복구·동기화·업데이트 확인까지 events.log 에
+정상으로 남았다. 아직 안 본 것은 아래 "남은 작업 0".
 
 ### 서버에서 나온 것 (정책을 직접 읽어서 확정 - `supabase/inspect_live.sql`)
 
@@ -69,12 +70,13 @@ low, 전부 고쳤다. 큰 것:
 - `client/p2p` 는 빌드에서 뺐다 (부르는 곳이 없는 인증 없는 LAN 서버였다). 파일은 남아
   있고, 화면의 "P2P 스마트 배포" 문구(`main.cpp`)도 그대로다 - 없는 기능을 말하고 있다
 
-### 서버 쪽 조임: `supabase/hardening.sql` (**아직 적용 안 됨**)
+### 서버 쪽 조임: `supabase/hardening.sql` (적용됨, 2026-10-01)
 
 `contents` 행의 모양 제약(1.1.4 PC 를 새 exe 받기 전까지 서버에서 지킨다), 위치마다
 켜진 행 하나, `clip_items`/버킷 크기 상한, 승인자 본인 확인, `org_exists(uuid)`,
-`org_members.created_at` 을 서버가 적기. **고친 대시보드가 GitHub Pages 에 올라간 뒤에**
-실행해야 한다 - 예전 대시보드는 확장자를 대문자 그대로 붙여 제약에 걸린다.
+`org_members.created_at` 을 서버가 적기. 고친 대시보드가 GitHub Pages 에 올라간 뒤에
+실행했다 (예전 대시보드는 확장자를 대문자 그대로 붙여 제약에 걸린다). 적용 뒤
+`org_exists` 를 anon key 로 불러 실제 조직 `true`, 없는 uuid `false` 를 확인했다.
 
 확장자 목록은 세 군데가 같아야 한다: `hardening.sql` 의 `contents_storage_path_shape`,
 `dashboard.html` 의 `CONTENT_EXT`, `client/video/player.cpp` 의 `IsVideoFile`.
@@ -236,25 +238,26 @@ A 에서 스크린캡처하면 B 에서 Ctrl+V 로 붙는다. 연결고리는 �
 
 ## 남은 작업
 
-### 0. 직전 세션의 것을 내보내고 실제로 돌려 보기
+### 0. 1.1.5 에서 아직 안 본 것
 
-고친 코드는 **별도 빌드 폴더에서 컴파일되고** (`build-review\`, 여섯 타깃, 오류 0)
-`AuthTest.exe` · `Publish.exe --selftest` 가 통과하지만, **새 SmartScreen.exe 가 뜨고,
-동기화하고, 잠그고, 붙여 넣는 것을 본 사람이 없다.** 순서가 중요하다:
+1.1.5 는 나갔고 노트북에서 뜬다 (시작 경로: 세션 복구, 회전 토큰 저장, 기업 동기화
+OK center=1, 업데이트 확인, BLE NEAR, 오버레이 [종료] 로 0.5초 만에 정상 종료). 그
+밖의 길은 아직 사람이 안 봤다:
 
-1. 커밋 + push (대시보드가 GitHub Pages 에 올라간다). 소스 보기에 `CONTENT_EXT` 가
-   보이는지 확인하고, 열어 둔 대시보드 탭은 Ctrl+F5
-2. `supabase/hardening.sql` 을 SQL Editor 에서 실행, 결과(`after_hardening`) 확인
-3. `release.bat` → 대시보드에서 [승인]
-4. 돌려 보기 (노트북 = 기업 등록 PC):
-   - events.log 에 `enterprise sync:` 줄. 영상이 그대로 나오는가 (캐시된 `<sha256>.mp4`
-     가 해시까지 맞아 다시 받지 않아야 한다)
-   - 대시보드에서 [송출 중지] → 앱 다시 켜기 → 그 자리가 비는가. 다시 켜면 돌아오는가
-   - 기업 등록 창: 틀린 UUID → "그런 조직이 없어요" (`org_exists` 가 적용된 뒤),
-     칸을 비우고 누르기 → 등록 해제. **해제는 노트북에서 하면 다시 등록해야 한다**
-   - 클립보드: 두 대 사이 글·그림. 암호 관리자에서 복사한 것은 안 넘어가야 한다
-   - 구글 로그인 한 번 (리스너를 다시 썼다)
-   - 대시보드: `사진.PNG` 올리기(소문자로 들어가야 한다), 같은 파일 두 번, 송출 토글, 삭제
+- **데스크톱이 1.1.5 를 받는가.** 개인 PC 면 띠 → [업데이트], 기업 PC 면 대시보드의
+  [승인] 뒤. 받은 뒤 events.log 의 `start: SmartScreen 1.1.5`
+- 잠금 화면 자체 (1.1.5 의 `DeactivateBlackScreen` 이 그림을 버리고 다음 잠금이 다시
+  읽는다 - 매 잠금마다 그림을 새로 읽는 셈이다, 느려지는지 볼 것)
+- 대시보드에서 [송출 중지] → 앱 다시 켜기 → 그 자리가 비는가. 다시 켜면 돌아오는가.
+  단, **노트북은 `centerImagePath` 가 개인 그림(`Pictures\대시보드.jpg`)이라 조직 영상이
+  원래 안 뜬다** - 이 시험은 그 값을 비우거나(고급 창) 다른 PC 에서
+- 기업 등록 창: 틀린 UUID → "그런 조직이 없어요", 칸을 비우고 누르기 → 등록 해제.
+  **해제는 노트북에서 하면 다시 등록해야 한다**
+- 클립보드: 노트북은 `clipSync=0` 이라 꺼져 있다 (브리프에 "켜짐" 이라 적혀 있던 것은
+  틀렸다). 켜서 두 대 사이 글·그림, 암호 관리자에서 복사한 것은 안 넘어가야 한다
+- 구글 로그인 한 번 (리스너를 다시 썼다). `release.bat` 의 Publish 로그인은 통과했다 -
+  같은 리스너다
+- 대시보드: `사진.PNG` 올리기(소문자로 들어가야 한다), 같은 파일 두 번, 송출 토글, 삭제
 
 ### 1. iOS 재설치 시험 (다시 우선)
 
@@ -491,17 +494,20 @@ Disconnected / Closed 로 보고됐다. `GattDeviceService` 는 반드시 `Close
 
 ## 현재 기기 상태
 
-- 노트북(LG gram 14Z990, Intel 내장): **1.1.4**, 기업 등록(`enterpriseRegistered=1`,
+- 노트북(LG gram 14Z990, Intel 내장): **1.1.5**, 기업 등록(`enterpriseRegistered=1`,
   orgId `0dca070f-…`), `measuredBaseRssi=-61`, `nearRssiThreshold=-67` (거리 3단계의
   [멀리]), `gattRssiThreshold=-61`, `bleDebugLog=0`. IRK 와 폰 토큰 둘 다 설정돼 있다.
-  앱은 `C:\work\smartscreen\dist\SmartScreen.exe` 로 돌고 있다 (release.bat 이 그걸
-  닫았다 다시 띄운다)
-- 데스크톱: **1.1.4**, 듀얼 모니터. 기업 등록인지 개인인지는 이 세션에서 확인 못 했다
-- 두 대 모두 클립보드 공유 켜짐, 같은 구글 계정(icesgg@gmail.com)
-- Supabase: 네 스키마(`schema`/`device_tokens`/`clipboard`/`releases`) + `content_lockdown.sql`
-  적용됨. **`hardening.sql` 은 아직** (`org_exists` 가 없어 새 클라이언트의 등록 창은
-  조직이 있는지 "알 수 없음" 으로 넘어간다). `contents` 에 두 행 (png 꺼짐, mp4 켜짐).
-  `releases` 에 1.1.0·1.1.1·1.1.2·1.1.3·1.1.4 (1.1.0 은 낡은 빌드가 실수로 다시 올라간 것 -
-  해는 없음). `release_admins` 에 icesgg@gmail.com. 대시보드(GitHub Pages)에 승인 칸이
-  올라가 있고 [승인] 단추로 1.1.3 을 승인해 노트북이 받았다 (사용자 보고)
-- `client/version.h` = 1.1.4 = 서버의 마지막 = `build\` = `dist\` = `SmartScreen-desktop.zip`
+  **`centerImagePath` 는 개인 그림(`Pictures\대시보드.jpg`), `clipSync=0`** (2026-10-01
+  에 config.ini 를 직접 봤다). 앱은 `C:\work\smartscreen\build\SmartScreen.exe` 로 돌고
+  있다 (release.bat 이 그걸 닫았다 다시 띄웠다; `dist\` 의 exe 와 같은 파일이다)
+- 데스크톱: **1.1.4** (1.1.5 를 아직 안 받았다 - 위 "남은 작업 0"), 듀얼 모니터. 기업
+  등록인지 개인인지는 확인 못 했다
+- 같은 구글 계정(icesgg@gmail.com). 클립보드 공유는 노트북에서 꺼져 있다
+- Supabase: 네 스키마(`schema`/`device_tokens`/`clipboard`/`releases`) +
+  `content_lockdown.sql` + `hardening.sql` 적용됨 (둘 다 2026-09-30/10-01). `contents`
+  에 두 행 (png 꺼짐, mp4 켜짐). `releases` 에 1.1.0 ~ 1.1.5 (1.1.0 은 낡은 빌드가
+  실수로 다시 올라간 것 - 해는 없음). `release_admins` 에 icesgg@gmail.com.
+  **1.1.5 의 [승인] 은 아직 안 눌렀다** (노트북은 이미 1.1.5 지만, 다른 기업 PC 는
+  승인이 있어야 받는다)
+- `client/version.h` = 1.1.5 = 서버의 마지막 = `build\` = `dist\` = `SmartScreen-desktop.zip`
+  (SHA-256 67b3f4d1…)
