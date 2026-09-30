@@ -17,8 +17,10 @@ add_executable(SmartScreen WIN32
     client/ble_gatt.cpp
     client/ble_ident.cpp
     client/irk.cpp
+    client/clipsync.cpp
     client/enterprise/supabase.cpp
     client/enterprise/auth.cpp
+    client/enterprise/session.cpp
     client/p2p/discovery.cpp
     client/p2p/transfer.cpp
     client/video/player.cpp

@@ -44,6 +44,13 @@ struct AppConfig {
     std::wstring authRefresh;
     std::wstring authUserId;
     std::wstring authEmail;     // 누구로 로그인했는지 보여주기 위한 것뿐
+    // 같은 계정으로 로그인한 다른 PC 와 클립보드를 주고받는다 (client/clipsync.h).
+    // 기본 꺼짐이고 그래야 한다: 켜면 복사한 그림과 텍스트가 서버를 지나간다.
+    // 자리비움 감지와 달리 이건 사용자가 알고 켜는 일이어야 한다.
+    bool clipSync = false;
+    // 이보다 큰 항목은 건너뛴다. 다중 모니터 전체 캡처가 수십 MB 가 되는데,
+    // 그걸 복사할 때마다 올리면 회선만 쓴다.
+    DWORD clipMaxKB = 4096;
     // Enterprise
     std::wstring orgId;
     std::wstring serverUrl;

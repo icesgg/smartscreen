@@ -20,6 +20,9 @@
 #include "ble_ident.h"
 #include "enterprise/supabase.h"
 #include "enterprise/auth.h"
+#include "enterprise/session.h"
+#include "clipsync.h"
+#include <mutex>
 
 // ---------------------------------------------------------------------------
 // UI IDs
@@ -47,6 +50,9 @@ static constexpr UINT WM_SCAN_RESULT = WM_USER + 100;
 // 구글 로그인은 사용자가 브라우저에서 시간을 쓰므로 몇 분이 걸린다.
 // UI 스레드에서 부르면 그동안 창이 멎으므로 작업 스레드에서 돌리고 결과만 보낸다.
 static constexpr UINT WM_LOGIN_RESULT = WM_USER + 101;
+// 세션이 갱신되면서 refresh 토큰이 바뀌었다. WPARAM/LPARAM 대신 전역에 두고
+// 부르는 이유는 아래 OnSessionRotated 주석 참고.
+static constexpr UINT WM_SESSION_ROTATED = WM_USER + 102;
 
 // 기본으로 열리는 간단 창. 만드는 곳과 창 프로시저는 아래 "간단 화면" 절에 있다.
 // 오버레이의 [설정] 이 이 창을 열기 때문에 여기서 미리 알려 둔다.
@@ -70,6 +76,27 @@ struct LoginResult {
     std::wstring refresh;    // DPAPI 로 봉해진 값
     std::wstring phoneToken; // 비어 있으면 "폰에서 아직 로그인 안 함"
 };
+
+// ---------------------------------------------------------------------------
+// 세션 갱신으로 refresh 토큰이 회전했을 때
+// ---------------------------------------------------------------------------
+// Supabase 는 갱신할 때마다 새 refresh 토큰을 주고 예전 것을 무효로 만든다.
+// 저장하지 않으면 지금 실행은 잘 돌다가 다음 실행에서 로그인이 풀리고, 증상이
+// 하루 뒤에 나타나므로 원인을 찾기 어렵다.
+//
+// 콜백은 일꾼 스레드에서 불린다. 거기서 SaveAppConfig 를 부르면 UI 스레드의
+// 저장과 겹쳐 서로의 변경을 덮어쓸 수 있다 (파일을 통째로 다시 쓰기 때문에).
+// 그래서 값만 전역에 놓고 UI 스레드로 넘긴다 - 설정 쓰기는 한 스레드에서만.
+static std::mutex   g_rotatedMx;
+static std::wstring g_rotatedSealed;
+
+static void OnSessionRotated(const std::wstring& sealed) {
+    {
+        std::lock_guard<std::mutex> lock(g_rotatedMx);
+        g_rotatedSealed = sealed;
+    }
+    if (g_hWnd) PostMessageW(g_hWnd, WM_SESSION_ROTATED, 0, 0);
+}
 
 // New combo IDs for simplified settings
 static constexpr int ID_COMBO_DISTANCE = 220;
@@ -597,6 +624,11 @@ static DWORD WINAPI LoginThread(LPVOID) {
     r->email = s.email;
     r->userId = s.userId;
     ProtectSecret(s.refreshToken, r->refresh);
+
+    // 살아 있는 세션으로 심는다. 이게 없으면 방금 로그인해도 클립보드 동기화는
+    // 앱을 다시 켤 때까지 "로그인하지 않았다" 로 남는다 - 로그인한 사람에게
+    // 로그인하라고 말하는 상태가 된다.
+    SessionAdopt(s);
 
     std::wstring token, err;
     if (!FetchDeviceToken(url, key, s, token, err)) r->err = err;
@@ -1953,6 +1985,21 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         auto*r=(ProbeResult*)lParam;OnResult(r);
         InvalidateRect(g_hStateLabel,nullptr,TRUE);delete r;break;
     }
+    case WM_SESSION_ROTATED: {
+        // 설정 쓰기는 이 스레드에서만 한다 (OnSessionRotated 주석 참고).
+        std::wstring sealed;
+        {
+            std::lock_guard<std::mutex> lock(g_rotatedMx);
+            sealed.swap(g_rotatedSealed);
+        }
+        if (!sealed.empty()) {
+            AppConfig c; LoadAppConfig(c);
+            c.authRefresh = sealed;
+            SaveAppConfig(c);
+            DbgEvent(L"session: refresh token rotated, saved");
+        }
+        break;
+    }
     case WM_LOGIN_RESULT: {
         auto* r = (LoginResult*)lParam;
         g_loginBusy = false;
@@ -2090,7 +2137,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 //
 // 명령은 대부분 고급 창으로 넘긴다. 폰 등록이나 그림 고르기를 여기서 다시
 // 구현하면 두 벌이 되고, 한쪽만 고쳐지는 날이 온다.
-static constexpr int SW_W = 430, SW_H = 654;
+// 클립보드 공유 한 칸이 늘어 654 -> 750 이 됐다. 이 창은 세로로 자라기만 해
+// 왔고, 다음에 또 늘릴 일이 생기면 그때는 접기나 스크롤을 넣어야 한다 -
+// 1200 짜리 화면에서도 작업 표시줄까지 치면 여유가 얼마 남지 않았다.
+static constexpr int SW_W = 430, SW_H = 750;
 static constexpr int IDS_ADVANCED   = 601;
 static constexpr int IDS_PHONE      = 602;
 static constexpr int IDS_DIST       = 603;   // 트랙바
@@ -2099,11 +2149,13 @@ static constexpr int IDS_IDLE_BASE  = 610;   // 610..613 = 바로/15초/30초/1�
 static constexpr int IDS_IMAGE      = 620;
 static constexpr int IDS_LOCKNOW    = 621;
 static constexpr int IDS_GUARD      = 622;
+static constexpr int IDS_CLIP       = 623;   // 클립보드 공유 켜기/끄기
 static constexpr int IDT_SIMPLE     = 30;
 
 static HWND g_hSimplePhone = nullptr, g_hSimpleDist = nullptr;
 static HWND g_hSimpleIdle[4] = {};
 static HWND g_hSimpleMeasure = nullptr;
+static HWND g_hSimpleClipMsg = nullptr;
 
 // 몇 초 뒤에 가릴지. 고급 창의 kIdleValues 와 같은 값이어야 한다.
 static const int kSimpleIdle[4] = { 0, 15, 30, 60 };
@@ -2203,8 +2255,28 @@ static void SimpleRefresh() {
     SetWindowTextW(g_hSimpleMeasure,
         c.measuredBaseRssi != 0 ? L"내 자리에 맞게 다시 재기" : L"내 자리에 맞게 재보기  (아직 안 했어요)");
 
+    // 클립보드 공유 상태 한 줄. 서버를 타는 기능이라 "켜 뒀는데 안 넘어간다" 가
+    // 가능하고, 그때 볼 것이 여기 말고는 events.log 뿐이다.
+    if (g_hSimpleClipMsg) {
+        ClipSyncStatus cs = ClipSyncGetStatus();
+        wchar_t cb[256];
+        if (!cs.running) {
+            wcscpy_s(cb, SessionHasAccount() ? L"꺼져 있어요"
+                                             : L"계정으로 로그인하면 쓸 수 있어요");
+        } else if (cs.lastMsg.empty()) {
+            swprintf_s(cb, L"기다리는 중  ·  보냄 %d / 받음 %d", cs.sent, cs.received);
+        } else {
+            swprintf_s(cb, L"%s%s  ·  보냄 %d / 받음 %d",
+                       cs.lastOk ? L"" : L"안 됨: ", cs.lastMsg.c_str(),
+                       cs.sent, cs.received);
+        }
+        SetWindowTextW(g_hSimpleClipMsg, cb);
+    }
+
     HWND guard = GetDlgItem(g_hSimple, IDS_GUARD);
     if (guard) InvalidateRect(guard, nullptr, TRUE);
+    HWND clip = GetDlgItem(g_hSimple, IDS_CLIP);
+    if (clip) InvalidateRect(clip, nullptr, TRUE);
     for (int i = 0; i < 4; i++)
         if (g_hSimpleIdle[i]) InvalidateRect(g_hSimpleIdle[i], nullptr, TRUE);
     InvalidateRect(g_hSimple, nullptr, FALSE);
@@ -2621,6 +2693,22 @@ static LRESULT CALLBACK SimpleProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
         CreateWindowExW(0, L"BUTTON", L"지금 가리기", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             x, y, w, 42, hWnd, (HMENU)(UINT_PTR)IDS_LOCKNOW, hI, nullptr);
 
+        // ---- 클립보드 공유 (client/clipsync.h) ----
+        // 자리비움 감지와 아무 상관이 없는 기능이지만, 이 앱으로 돌아오는 길이
+        // 이 창뿐이라(트레이 아이콘이 없다) 여기 둔다. 상태 한 줄을 반드시
+        // 같이 둔다 - 서버를 타는 기능이라 조용히 실패할 수 있고, 그러면
+        // 사용자는 "켰는데 안 된다" 외에 할 말이 없다.
+        y += 54;
+        CreateWindowExW(0, L"STATIC", L"다른 PC 와 클립보드 공유", WS_CHILD | WS_VISIBLE,
+            x, y, 300, 18, hWnd, nullptr, hI, nullptr);
+        y += 22;
+        CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            x, y, w, 44, hWnd, (HMENU)(UINT_PTR)IDS_CLIP, hI, nullptr);
+        y += 48;
+        g_hSimpleClipMsg = CreateWindowExW(0, L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS, x, y, w, 18,
+            hWnd, nullptr, hI, nullptr);
+
         EnumChildWindows(hWnd, [](HWND h, LPARAM f) -> BOOL {
             SendMessage(h, WM_SETFONT, (WPARAM)f, TRUE); return TRUE;
         }, (LPARAM)g_hFont);
@@ -2736,8 +2824,11 @@ static LRESULT CALLBACK SimpleProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
         // 전부 파랗게 하면 무엇이 켜져 있는지가 안 보인다.
         if (id == IDS_GUARD)
             wcscpy_s(label, g_monitoring ? L"보호 켜짐" : L"보호 꺼짐");
+        if (id == IDS_CLIP)
+            wcscpy_s(label, ClipSyncRunning() ? L"클립보드 공유 켜짐" : L"클립보드 공유 꺼짐");
 
         bool accent = (id == IDS_GUARD && g_monitoring) ||
+                      (id == IDS_CLIP && ClipSyncRunning()) ||
                       (id >= IDS_IDLE_BASE && id < IDS_IDLE_BASE + 4 &&
                        g_idleCountdownSec == kSimpleIdle[id - IDS_IDLE_BASE]);
         bool ghost = (id == IDS_ADVANCED);
@@ -2784,6 +2875,38 @@ static LRESULT CALLBACK SimpleProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
             SimpleRefresh();
             break;
         case IDS_MEASURE: OpenWizard(hWnd); break;
+        case IDS_CLIP: {
+            AppConfig c; LoadAppConfig(c);
+            if (ClipSyncRunning()) {
+                ClipSyncStop();
+                c.clipSync = false;
+                SaveAppConfig(c);
+            } else {
+                // 로그인이 먼저다. 그 말을 여기서 하지 않으면 타일만 안 켜지고
+                // 이유가 어디에도 안 뜬다.
+                if (!SessionHasAccount()) {
+                    MessageBoxW(hWnd,
+                        L"먼저 구글 계정으로 로그인하세요.\n\n"
+                        L"[내 폰] 의 [등록하기] 에서 계정으로 등록하면 로그인됩니다.\n"
+                        L"다른 PC 에서도 같은 계정으로 로그인해야 서로 주고받습니다.",
+                        L"클립보드 공유", MB_OK | MB_ICONINFORMATION);
+                    break;
+                }
+                std::wstring surl = c.serverUrl.empty() ? kDefaultSupabaseUrl : c.serverUrl;
+                std::wstring skey = c.anonKey.empty()   ? kDefaultAnonKey     : c.anonKey;
+                if (ClipSyncStart(surl, skey, c.clipMaxKB * 1024)) {
+                    c.clipSync = true;
+                    SaveAppConfig(c);
+                    MessageBoxW(hWnd,
+                        L"클립보드 공유를 켰습니다.\n\n"
+                        L"복사한 그림과 글이 이 계정의 다른 PC 로 넘어갑니다.\n"
+                        L"복사한 내용이 서버를 지나가므로, 필요할 때만 켜 두세요.",
+                        L"클립보드 공유", MB_OK | MB_ICONINFORMATION);
+                }
+            }
+            SimpleRefresh();
+            break;
+        }
         }
         return 0;
     }
@@ -2818,6 +2941,38 @@ int WINAPI wWinMain(HINSTANCE hI, HINSTANCE, LPWSTR, int nS) {
                 // 관리자 권한으로 실행됨: SYSTEM 작업을 돌려 config에 저장
                 std::wstring m;
                 rc = ImportIrkElevated(argv[2], m) ? 0 : 1;
+            } else if (argc >= 2 && wcscmp(argv[1], L"--clip-test") == 0) {
+                // 클립보드 왕복 진단 (clipsync.h). 여기 있는 이유는 위와 같다 -
+                // 앱이 떠 있는 채로 돌려 봐야 쓸모가 있다. 그래서 winsock 과
+                // GDI+ 를 이 블록에서 따로 올린다.
+                WSADATA wd2; WSAStartup(MAKEWORD(2, 2), &wd2);
+                ULONG_PTR tok = 0;
+                Gdiplus::GdiplusStartupInput gi;
+                Gdiplus::GdiplusStartup(&tok, &gi, nullptr);
+
+                AppConfig c; LoadAppConfig(c);
+                std::wstring surl = c.serverUrl.empty() ? kDefaultSupabaseUrl : c.serverUrl;
+                std::wstring skey = c.anonKey.empty()   ? kDefaultAnonKey     : c.anonKey;
+                std::wstring serr, report;
+                bool ok = false;
+                SessionStart(surl, skey, c.authRefresh, serr);
+                if (!serr.empty()) report = L"[X] 세션: " + serr + L"\n";
+                else ok = ClipSyncRoundTrip(surl, skey, report);
+
+                // 파일로도 남긴다. 창에 뜬 글자를 손으로 옮겨 적게 만들면
+                // 아무도 그러지 않고, 실패한 줄의 상태코드가 그대로 사라진다.
+                std::wstring path = GetConfigDir() + L"\\clip-test.txt";
+                if (FILE* f = nullptr; _wfopen_s(&f, path.c_str(), L"w, ccs=UTF-8") == 0 && f) {
+                    fputws(report.c_str(), f);
+                    fclose(f);
+                    report += L"\n이 내용을 파일로도 적어 두었습니다:\n" + path + L"\n";
+                }
+                MessageBoxW(nullptr, report.c_str(), L"클립보드 왕복 진단",
+                            MB_OK | (ok ? MB_ICONINFORMATION : MB_ICONWARNING));
+
+                if (tok) Gdiplus::GdiplusShutdown(tok);
+                WSACleanup();
+                rc = ok ? 0 : 1;
             }
             LocalFree(argv);
             if (rc >= 0) return rc;
@@ -2896,6 +3051,28 @@ int WINAPI wWinMain(HINSTANCE hI, HINSTANCE, LPWSTR, int nS) {
     ShowWindow(g_hWnd, SW_HIDE);
     AppConfig chk;
     bool configured = LoadAppConfig(chk) && (chk.btAddress != 0 || !chk.phoneToken.empty());
+
+    // ---- 계정 세션과 클립보드 동기화 -------------------------------------
+    // 창을 만든 뒤에 한다. SessionStart 가 네트워크를 타므로 실패하면 여기서
+    // 몇 초를 쓰는데, 그동안 창이 하나도 없으면 사용자에게는 앱이 안 뜬 것이다.
+    {
+        std::wstring surl = chk.serverUrl.empty() ? kDefaultSupabaseUrl : chk.serverUrl;
+        std::wstring skey = chk.anonKey.empty()   ? kDefaultAnonKey     : chk.anonKey;
+        SessionOnRotated(OnSessionRotated);
+
+        std::wstring serr;
+        if (SessionStart(surl, skey, chk.authRefresh, serr)) {
+            DbgEvent(L"session: restored (%s)", SessionEmail().c_str());
+            if (chk.clipSync)
+                ClipSyncStart(surl, skey, chk.clipMaxKB * 1024);
+        } else if (!serr.empty()) {
+            // 로그인한 적은 있는데 되살리지 못했다. 앱을 막을 일은 아니다 -
+            // 자리비움 감지는 계정과 무관하게 돌아간다.
+            DbgEvent(L"session: restore failed - %s", serr.c_str());
+        } else {
+            DbgEvent(L"session: no account yet");
+        }
+    }
     if (g_hSimple) {
         ShowWindow(g_hSimple, configured ? SW_HIDE : SW_SHOW);
         SimpleRefresh();
@@ -2907,6 +3084,9 @@ int WINAPI wWinMain(HINSTANCE hI, HINSTANCE, LPWSTR, int nS) {
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
 
+    // GdiplusShutdown 보다 먼저. 클립보드 스레드가 PNG 를 굽는 중이면
+    // 셧다운 뒤의 GDI+ 호출이 된다.
+    ClipSyncStop();
     FreeBlackScreenImages();
     if (gdipToken) Gdiplus::GdiplusShutdown(gdipToken);
     WSACleanup();

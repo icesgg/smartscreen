@@ -100,6 +100,8 @@ bool LoadAppConfig(AppConfig& cfg) {
     if (m.count(L"authRefresh")) cfg.authRefresh = m[L"authRefresh"];
     if (m.count(L"authUserId")) cfg.authUserId = m[L"authUserId"];
     if (m.count(L"authEmail")) cfg.authEmail = m[L"authEmail"];
+    if (m.count(L"clipSync")) cfg.clipSync = (_wtoi(m[L"clipSync"].c_str()) != 0);
+    if (m.count(L"clipMaxKB")) cfg.clipMaxKB = _wtoi(m[L"clipMaxKB"].c_str());
     if (m.count(L"orgId")) cfg.orgId = m[L"orgId"];
     if (m.count(L"serverUrl")) cfg.serverUrl = m[L"serverUrl"];
     if (m.count(L"anonKey")) cfg.anonKey = m[L"anonKey"];
@@ -163,6 +165,8 @@ void SaveAppConfig(const AppConfig& cfg) {
     m[L"authRefresh"] = cfg.authRefresh;
     m[L"authUserId"] = cfg.authUserId;
     m[L"authEmail"] = cfg.authEmail;
+    m[L"clipSync"] = cfg.clipSync ? L"1" : L"0";
+    swprintf_s(buf, L"%lu", cfg.clipMaxKB); m[L"clipMaxKB"] = buf;
     m[L"orgId"] = cfg.orgId;
     m[L"serverUrl"] = cfg.serverUrl;
     m[L"anonKey"] = cfg.anonKey;
