@@ -222,14 +222,19 @@ static const wchar_t* kDelayLabels[] = {
     L"1\xBD84"               // 1분
 };
 
-// Idle time: "15초" -> 15, "30초" -> 30, "1분" -> 60, "2분" -> 120
-static const int kIdleValues[] = { 15, 30, 60, 120 };
+// Idle time: "바로" -> 0, "15초" -> 15, "30초" -> 30, "1분" -> 60, "2분" -> 120
+// 간단 창의 네 단추(kSimpleIdle)가 고르는 값이 전부 여기 있어야 한다. "바로"(0) 가
+// 없던 동안, 간단 창에서 [바로] 를 골라도 다음 [시작] 이 이 콤보에서 가장 가까운
+// 15초를 다시 읽어 갔다.
+static const int kIdleValues[] = { 0, 15, 30, 60, 120 };
 static const wchar_t* kIdleLabels[] = {
+    L"\xBC14\xB85C",         // 바로
     L"15\xCD08",             // 15초
     L"30\xCD08",             // 30초
     L"1\xBD84",              // 1분
     L"2\xBD84"               // 2분
 };
+static constexpr int kIdleCount = 5;
 
 static int ComboFindValue(const int* values, int count, int target) {
     int best = 0;
@@ -813,7 +818,7 @@ static void StartMon() {
     g_scanIntervalSec = 2;
 
     int idleIdx = (int)SendMessageW(g_hComboIdle, CB_GETCURSEL, 0, 0);
-    if (idleIdx < 0) idleIdx = 1;
+    if (idleIdx < 0 || idleIdx >= kIdleCount) idleIdx = 2;   // 30초
     g_idleCountdownSec = kIdleValues[idleIdx];
     g_nCountdown = g_idleCountdownSec;
 
@@ -1333,9 +1338,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_hComboIdle = CreateWindowExW(0, L"COMBOBOX", L"",
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
             420, row2Y, comboW, 120, hWnd, (HMENU)(UINT_PTR)ID_COMBO_IDLE, hInst, nullptr);
-        for (int i = 0; i < 4; i++)
+        for (int i = 0; i < kIdleCount; i++)
             SendMessageW(g_hComboIdle, CB_ADDSTRING, 0, (LPARAM)kIdleLabels[i]);
-        SendMessageW(g_hComboIdle, CB_SETCURSEL, 1, 0);  // default: 30초
+        SendMessageW(g_hComboIdle, CB_SETCURSEL, 2, 0);  // default: 30초
 
         // Quick action buttons in the group box
         CreateWindowExW(0, L"BUTTON",
@@ -1495,7 +1500,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             SendMessageW(g_hComboDelay, CB_SETCURSEL,
                 ComboFindValue(kDelayValues, 4, g_unlockDelaySec), 0);
             SendMessageW(g_hComboIdle, CB_SETCURSEL,
-                ComboFindValue(kIdleValues, 4, g_idleCountdownSec), 0);
+                ComboFindValue(kIdleValues, kIdleCount, g_idleCountdownSec), 0);
 
             // Update hidden edit controls for compatibility
             wchar_t buf[16];
@@ -2494,9 +2499,13 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_GETMINMAXINFO:((MINMAXINFO*)lParam)->ptMinTrackSize={700,600};break;
 
     case WM_CLOSE:
-        if (g_hOverlay && g_monitoring) { ShowWindow(hWnd, SW_HIDE); return 0; }
+        // X 는 숨기기만 한다. 끝내는 길은 오버레이의 [종료] 하나다 (그래야 화면을
+        // 지키는 프로그램이 실수로 꺼지지 않는다). 예전에는 감시가 멈춰 있을 때만
+        // 예외로 프로그램을 끝냈는데, 그 조건을 아는 사람이 없어서 "[중지] 하고 X 를
+        // 눌렀더니 프로그램이 죽는다" 가 됐다. 오버레이가 없을 때(정상 실행에서는
+        // 없다)만 예전대로 끝낸다 - 그때는 돌아올 길이 없기 때문이다.
+        if (g_hOverlay) { ShowWindow(hWnd, SW_HIDE); return 0; }
         if(g_monitoring)StopMon();
-        if(g_hOverlay){DestroyWindow(g_hOverlay);g_hOverlay=nullptr;}
         DestroyWindow(hWnd);break;
 
     case WM_DESTROY:
@@ -2621,6 +2630,13 @@ static void SimpleApplyDist(int step) {
     if (step < 0 || step > 2) return;
     g_nearRssiThreshold = SimpleBaseRssi() + kDistOffset[step];
     g_gattRssiThreshold = g_nearRssiThreshold;   // 두 경로를 따로 물어볼 화면이 아니다
+    // 고급 창의 "신호 강도" 칸도 같은 값으로. 그 칸은 [시작] 때 다시 읽히므로, 여기서
+    // 안 맞춰 두면 슬라이더로 바꾼 값이 다음 [시작] 에 예전 숫자로 되돌아간다 -
+    // 실제로 그래서 두 창이 다른 값을 보여 줬다 (2026-10-01).
+    if (g_hEditLatency) {
+        wchar_t b[16]; swprintf_s(b, L"%d", g_nearRssiThreshold);
+        SetWindowTextW(g_hEditLatency, b);
+    }
     AppConfig c; LoadAppConfig(c);
     c.nearRssiThreshold = g_nearRssiThreshold;
     c.gattRssiThreshold = g_gattRssiThreshold;
@@ -3410,6 +3426,11 @@ static LRESULT CALLBACK SimpleProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
         if (id >= IDS_IDLE_BASE && id < IDS_IDLE_BASE + 4) {
             g_idleCountdownSec = kSimpleIdle[id - IDS_IDLE_BASE];
             g_nCountdown = g_idleCountdownSec;
+            // 고급 창의 콤보도 같은 값으로. [시작] 이 그 콤보를 다시 읽으므로, 안 맞춰
+            // 두면 여기서 고른 값이 다음 [시작] 에 예전 값으로 되돌아간다.
+            if (g_hComboIdle)
+                SendMessageW(g_hComboIdle, CB_SETCURSEL,
+                    ComboFindValue(kIdleValues, kIdleCount, g_idleCountdownSec), 0);
             AppConfig c; LoadAppConfig(c);
             c.idleCountdownSec = g_idleCountdownSec; SaveAppConfig(c);
             return 0;
