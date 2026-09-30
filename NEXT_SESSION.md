@@ -1,11 +1,16 @@
 SmartScreen 프로젝트를 이어서 개발한다. 저장소: C:\work\smartscreen (main 브랜치, 최신 푸시됨)
 
-설계 배경은 docs/PROXIMITY.md, 식별 구조는 docs/IDENTIFICATION.md 에 있다. 먼저 읽어라.
+설계 배경은 docs/PROXIMITY.md, 식별 구조는 docs/IDENTIFICATION.md,
+클립보드 공유는 docs/CLIPBOARD.md 에 있다. 먼저 읽어라.
 
 ## 지금 상태
 
 자리 비움을 감지해 화면을 가리는 Windows 앱 + iOS 컴패니언 앱(ios/SSBeacon).
 BLE 신호 세기(RSSI)로 거리를 판단한다.
+
+여기에 붙은 기능이 하나 더 있다: 같은 구글 계정으로 로그인한 PC 끼리 클립보드를
+주고받는다. 폰도 블루투스도 안 쓰고 자리비움 감지와 아무 상관이 없다 - 계정
+로그인과 Supabase 배관이 이미 여기 있어서 같은 앱에 들어왔다.
 
 ## 직전 세션: PC 사이 클립보드 공유 (새 기능)
 
@@ -191,19 +196,36 @@ provider 를 지원한다. 사내 배포(TestFlight 내부)면 해당 없다.
   이제 앱에 구글 로그인이 있으니 `device_tokens` 처럼 조일 수 있다
 - 영상을 양쪽 모니터에 띄우려면 `client/video/player.cpp` 가 플레이어를 여러 개
   지원해야 한다 (지금 `s_player` 가 하나뿐)
-- 간단 창이 430x654 다. 항목이 더 늘면 스크롤이나 접기가 필요하다
+- 간단 창이 430x**750** 이다. 클립보드 칸 하나에 96 을 썼고 아래 여유가 17 px 다.
+  **다음에 또 늘릴 일이 생기면 그때는 접기나 스크롤을 넣어야 한다**
+- 클립보드에서 아직 안 해 본 것 셋: 4 MB 상한 근처의 큰 그림, 세션이 실제로
+  만료된 뒤의 자동 갱신(한 시간 뒤), 세 대 이상. 셋 다 코드는 있고 돈 적이 없다
+- 클립보드가 파일(`CF_HDROP`)은 안 넘긴다. 넘기려면 크기 제한과 진행 표시가
+  같이 필요해서 이번에 뺐다
 
 ## 작업 환경
 
 - 빌드: `cmd.exe /c do_build.bat` (MSVC x64 + CMake + nmake)
   **SmartScreen.exe 가 실행 중이면 링크가 실패한다.** 별도 타깃만 필요하면
-  `nmake AuthTest` 처럼 지정하면 앱이 떠 있어도 빌드된다
+  `nmake AuthTest` 처럼 지정하면 앱이 떠 있어도 빌드된다.
+  앱을 건드리지 않고 컴파일만 확인하려면 **다른 빌드 디렉터리**에 cmake 를
+  돌리면 된다 (exe 이름이 안 부딪힌다)
+- **앱을 정상 종료하는 길은 오버레이 위젯의 [종료] 하나뿐이다.** 창의 X 는
+  숨기기만 한다 (`WM_CLOSE` → `SW_HIDE`). 스크립트에서는 오버레이 창
+  (`SmartScreenOverlay`) 에 `WM_COMMAND`/`401`(`ID_OVL_EXIT`) 을 보내면 같은
+  경로로 정리하고 나간다 - 강제 종료보다 이쪽이 낫다
 - 배포 묶음: `make_dist.bat` → `dist\` → 압축은 손으로 `SmartScreen-desktop.zip`
   README.txt 는 저장소가 추적하는 원본이라 make_dist 가 건드리지 않는다
 - 진단: `%APPDATA%\SmartScreen\` 의 events.log(기본 켜짐), ble_scan_log.csv,
   gatt_rssi_log.csv (뒤 둘은 `bleDebugLog=1` 일 때만)
 - 임계값 분석: `tools\rssi-threshold.ps1` (앱 켜둔 채 돌려도 된다)
 - 구글 로그인 점검: `build\AuthTest.exe` (인자 없으면 자체 점검만)
+- 클립보드 점검: `SmartScreen.exe --clip-test` (**앱이 떠 있어도 된다** - 뮤텍스
+  보다 먼저 처리한다). 올리기·조회·내려받기·바이트 비교·덮어쓰기·PNG 풀기를
+  이 PC 한 대에서 돌려 본다. 결과는 창과 `%APPDATA%\SmartScreen\clip-test.txt`
+  양쪽에 남는다. 두 대를 나란히 못 볼 때 "내 코드냐 서버냐 상대 PC 냐" 를 가른다
+- 서버 스키마는 `supabase/*.sql` 을 대시보드 SQL Editor 에 붙여 넣어 적용한다
+  (`schema.sql` / `device_tokens.sql` / `clipboard.sql`). 셋 다 적용돼 있다
 - `.env` 에 Supabase URL/anon key 가 있다 (커밋 안 됨, `.env.example` 이 형식)
 - config.ini 편집은 앱을 완전히 종료한 뒤에. 안 그러면 앱이 덮어쓴다
 - iOS 는 Mac + Xcode 로만 빌드된다. **Swift 를 고치면 "컴파일 검증 못 했음"을 분명히 말할 것**
@@ -296,6 +318,20 @@ events.log, ble_scan_log.csv, gatt_rssi_log.csv 모두 **날짜 없이 계속 �
 번만 불리나(스레드가 살아 있으면 아니다), 두 번째로 불려야 하는데 안 불리고 있는
 건 아닌가, 그리고 두 번째 호출에서만 드러날 상태가 남아 있나.
 
+### 증상이 어느 쪽 것인지 먼저 가를 것
+
+클립보드 공유 첫 실기에서 받는 쪽이 `받음 1` 까지 갔는데 붙여넣은 앱이 "이미지
+처리에 실패했습니다" 를 냈다. 전송은 다 됐고 실패한 것은 **받는 앱**이었다.
+
+거기서 알파를 의심했다 - `GetHBITMAP` 이 알파를 0 으로 만들면 투명한 그림이
+되니 앱이 거절할 것이다. 그럴듯했고 **틀렸다.** 실제로 재 보니 알파는 255 였고
+`CF_DIB`/`CF_DIBV5` 합성도 멀쩡했다. 진짜 차이는 형식의 가짓수였다 - 캡처 도구는
+`PNG` 를 같이 올리는데 우리는 안 올렸고, Chromium 계열 앱은 그걸 먼저 찾는다.
+
+**양쪽을 나란히 열거해 보는 것이 먼저다.** 그럴듯한 원인을 코드로 고치기 전에
+`EnumClipboardFormats` 로 캡처 도구의 클립보드와 우리 것을 찍어 봤으면 그것으로
+끝날 일이었다. 자세한 것은 docs/CLIPBOARD.md 의 "형식이 모자랐던 일".
+
 ### UI 작업 확인 방법
 
 `PrintWindow` 로 창을 직접 캡처해서 눈으로 볼 수 있다. 단 **숨겨진 창은 검게 나온다** -
@@ -305,7 +341,12 @@ events.log, ble_scan_log.csv, gatt_rssi_log.csv 모두 **날짜 없이 계속 �
 
 ## 현재 기기 상태
 
-- 노트북(LG gram 14Z990, Intel 내장): `nearRssiThreshold=-61`, `measuredBaseRssi=-61`
-  (마법사로 잰 값). `bleDebugLog=0`
+- 노트북(LG gram 14Z990, Intel 내장): `measuredBaseRssi=-61` (마법사로 잰 값),
+  `nearRssiThreshold=-67` = 거리 3단계의 **[멀리]**(기준 -6). `gattRssiThreshold=-61`.
+  `bleDebugLog=0`. IRK 와 폰 토큰 둘 다 설정돼 있다
 - 데스크톱: 듀얼 모니터. 계정 로그인만으로 등록되는 것과 재보기 마법사까지 확인됨
-- Supabase 프로젝트는 복구되어 살아 있다. 기업 콘텐츠 동기화도 동작한다
+- **두 대 모두 클립보드 공유 켜짐** (`clipSync=1`, `clipMaxKB=4096`), 같은 구글
+  계정(icesgg@gmail.com). 데스크톱↔노트북 글·그림 주고받기 확인됨
+- Supabase 프로젝트는 살아 있고 세 스키마(`schema`/`device_tokens`/`clipboard`)가
+  모두 적용돼 있다. 기업 콘텐츠 동기화도 동작한다
+- 배포 묶음 `SmartScreen-desktop.zip` 은 마지막 커밋과 같은 빌드다
