@@ -1,4 +1,22 @@
 // transfer.cpp - P2P file transfer via TCP
+//
+// **빌드에 들어가지 않는다** (CMakeLists.txt 에서 뺐다). 부르는 곳이 한 번도 없었고
+// (StartP2PServer / P2PDownloadFile 을 부르는 코드가 저장소 어디에도 없다), 쓰인
+// 그대로 켜면 같은 사내망의 아무에게나 파일을 내주고, 아무에게서나 잠금 화면에 띄울
+// 파일을 받는다. CMakeLists.txt 에 다시 넣기 전에 아래 넷이 전부 있어야 한다.
+//
+//  1. 이름 대조. 내주는 파일 이름이 매니페스트의 ContentItem.localName 과 글자 그대로
+//     같을 때만 연다. 지금 HandleClient 는 받은 이름을 contentDir 뒤에 그대로 붙인다 -
+//     "..\config.ini" 를 달라고 하면 폰 토큰과 IRK 가 든 설정 파일이 나간다.
+//  2. 조직 거르기. discovery.cpp 가 다른 조직의 알림도 피어로 받아들인다. org_id 가
+//     같지 않은 피어에게는 묻지도 내주지도 않는다.
+//  3. SHA-256 확인. 받은 파일의 해시를 ContentItem.fileHash 와 비교한다 (auth.h 의
+//     Sha256File). 지금 DownloadFromPeer 는 피어가 스스로 말한 크기만 본다. 서버에서
+//     받는 길(supabase.cpp 의 DownloadContent)은 해시를 확인하므로, 이 길만 빠지면
+//     사내망의 아무 PC 나 잠금 화면에 뜰 파일을 정할 수 있다.
+//  4. send() 의 반환값. 듣는 소켓이 논블로킹이라 accept 한 소켓도 논블로킹이고, 보내는
+//     버퍼가 차면 send 는 WSAEWOULDBLOCK 으로 돌아온다. 지금은 그것을 무시해서 소켓
+//     버퍼보다 큰 파일(그림·영상 대부분)이 잘린 채 나간다.
 #include "transfer.h"
 #include "../enterprise/supabase.h"
 #include <winsock2.h>

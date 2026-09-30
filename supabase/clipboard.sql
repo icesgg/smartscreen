@@ -47,6 +47,16 @@ create table clip_items (
   constraint clip_items_payload check (
     (kind = 'text'  and body is not null) or
     (kind = 'image' and storage_path is not null)
+  ),
+
+  -- 크기 상한 (hardening.sql). 4 MB 상한은 클라이언트에만 있었고(clipMaxKB), 서버는
+  -- 프로젝트 전체 상한까지 받았다. 설정으로 올릴 수 있으므로 기본값보다 여유를 둔다.
+  -- device 는 컴퓨터 이름(15자 이하)이다.
+  constraint clip_items_limits check (
+    octet_length(coalesce(body, '')) <= 8388608
+    and char_length(device) between 1 and 64
+    and char_length(coalesce(storage_path, '')) <= 200
+    and bytes between 0 and 16777216
   )
 );
 
@@ -54,6 +64,11 @@ create table clip_items (
 create index clip_items_user_newest on clip_items (user_id, id desc);
 
 alter table clip_items enable row level security;
+
+-- 표 권한 (schema.sql 의 같은 자리 참고). 새 표를 자동으로 열어 주지 않는 프로젝트
+-- 에서는 이게 없으면 정책이 있어도 "permission denied" 다. anon 에는 주지 않는다.
+grant select, insert, delete on clip_items to authenticated;
+grant usage, select on sequence clip_items_id_seq to authenticated;
 
 -- ============================================================
 -- RLS - 자기 줄만
@@ -112,9 +127,12 @@ $$;
 -- Storage - 'clip' 버킷
 -- ============================================================
 -- 비공개 버킷. 읽기도 사용자 JWT 로만 된다.
-insert into storage.buckets (id, name, public)
-values ('clip', 'clip', false)
-on conflict (id) do nothing;
+-- PNG 만, 16 MB 까지 - 클라이언트는 'Content-Type: image/png' 로만 올린다.
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('clip', 'clip', false, 16777216, array['image/png'])
+on conflict (id) do update
+  set file_size_limit = excluded.file_size_limit,
+      allowed_mime_types = excluded.allowed_mime_types;
 
 -- 경로는 반드시 '<user_id>/...' 로 시작한다. 아래 정책이 그 첫 칸을
 -- auth.uid() 와 맞춰 보는 것으로 남의 파일을 막는다.

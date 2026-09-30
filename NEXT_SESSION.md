@@ -14,7 +14,87 @@ BLE 신호 세기(RSSI)로 거리를 판단한다.
 - 같은 구글 계정으로 로그인한 PC 끼리 클립보드를 주고받는다 (docs/CLIPBOARD.md)
 - 새 버전을 서버에 올리면 모든 PC 가 스스로 받아 간다 (docs/UPDATE.md)
 
-## 직전 세션: 프로그램 자동 업데이트 + release.bat
+## 직전 세션: 서버와 주고받는 면 전체 검토 + 고치기 (2026-09-30)
+
+"anon 이 `contents` 에 쓸 수 있나" 를 보러 들어갔다가, 서버와 주고받는 면 전체를
+검토하고 고쳤다. **코드는 고쳐졌고 컴파일되지만 아직 앱으로 돌려 본 적이 없다** -
+아래 "남은 작업 0" 이 그 순서다.
+
+### 서버에서 나온 것 (정책을 직접 읽어서 확정 - `supabase/inspect_live.sql`)
+
+- **anon 은 어디에도 못 쓴다.** anon 에게 걸린 정책은 `contents` · `releases` ·
+  `org_release_approvals` 와 `content` · `releases` 버킷의 select 뿐이다
+- **`content` 버킷의 쓰기가 "로그인한 아무나" 에게 열려 있었다.** 올리기와 지우기의
+  조건이 `bucket_id = 'content'` 하나였다. `authenticated` 는 조직 멤버가 아니라 구글
+  계정으로 로그인한 누구나다 - 남의 조직 파일을 지우고 같은 경로에 다른 파일을 올릴
+  수 있었고, PC 는 해시를 안 보고 그걸 잠금 화면에 띄웠다. **`content_lockdown.sql` 로
+  닫았고 적용됐다** (경로 첫 폴더 = 조직 id 의 멤버만). 적용 뒤 확인: 기존 파일 둘 다
+  올린 계정이 멤버이고 크기·시각이 행과 맞는다 = 쓰인 흔적 없음
+- `schema.sql` 이 라이브와 달랐던 것 전부: `active` 열, anon 읽기 정책 둘, `content`
+  버킷 정책 넷, `org_members` 의 select 정책 (저장소 것은 자기 표를 다시 읽어 무한
+  재귀가 나는 꼴이었다). **`schema.sql` 을 라이브(+두 마이그레이션)에 맞췄다**
+- 읽기는 그대로다: anon key 로 모든 조직의 `contents` 행과 `content` 버킷이 읽힌다.
+  조이려면 기업 PC 에 로그인이나 그에 준하는 것이 필요하다 - **정해지지 않았다**
+
+### 검토 (1차 7 차원 → 3 렌즈 반박, 고친 뒤 2차 7 차원 → 3 렌즈)
+
+1차 확정 44건 / 반박 4건(그중 3건은 검토 도중 이미 고친 것). 2차는 회귀 8건, 전부
+low, 전부 고쳤다. 큰 것:
+
+- **기업 콘텐츠 경로** (`client/enterprise/supabase.cpp`, 다시 썼다). `storage_path` 의
+  마지막 `/` 뒤를 로컬 파일 이름으로 썼는데 역슬래시를 안 걸러서 `..\..\` 로
+  `enterprise_content` 밖에 파일을 쓸 수 있었다 (쓰는 사람은 조직 멤버여야 한다).
+  HTTP 상태를 안 봐서 오류 본문이 콘텐츠 파일로 저장됐고, `file_hash` 는 읽기만 하고
+  안 썼다. 지금: 행의 모양을 검증하고(`<org>/<sha256>.<ext>`), 로컬 이름은 검증된
+  해시로만 만들고, 2xx 만 받고, 크기와 SHA-256 이 맞아야 자리에 놓는다
+- **콘텐츠가 처음 받은 것에 고정돼 있었다.** 받은 경로가 `config.ini` 에 저장되고
+  이후 동기화는 "비어 있을 때만" 적용됐다 - 대시보드에서 바꾸거나 [송출 중지] 해도
+  PC 는 그대로였다. 지금: `enterprise_content` 안의 경로는 동기화의 것이라 결과대로
+  바뀌거나 비워진다. 사용자가 다른 곳에서 고른 그림은 그대로 둔다. "켜진 것이 없으면
+  최신 둘" 대체 조회도 없앴다. 동기화는 여전히 **켤 때와 등록 단추뿐**이다 (주기 없음)
+- 시작할 때의 동기화가 `WM_CREATE` 안에서 UI 스레드를 막고 있었다 → 작업 스레드 +
+  `WM_ENTERPRISE_SYNC`
+- **기업 등록**: 확인 전에 저장하던 것 → UUID 모양 + `org_exists` + 동기화가 끝난 뒤에만
+  저장. 칸을 비우고 누르면 등록 해제 (그 전에는 해제하는 코드가 없었다)
+- `config.ini`: 못 읽은 것과 없는 것을 가르고(못 읽었으면 저장을 거절), 임시 파일 +
+  `MoveFileExW`. 회전된 refresh 토큰 저장은 실패하면 다시 한다
+- 클립보드: 받을 때도 상한·PNG 서명·픽셀 수, 암호 관리자의 "올리지 말라" 표시,
+  본문은 새 항목일 때만, 401 → `SessionInvalidate`, 기준선은 첫 성공한 조회가 정함
+- 로그인 리스너: 엉뚱한 연결 하나에 끝나던 것, 조용한 연결에 멎던 것
+- 대시보드: `escapeHtml` 이 따옴표를 안 바꿔 속성 안에서 XSS (멤버만), 구글 로그인 뒤
+  [조직 생성] 이 RLS 에 거절되던 것(`.select()` = `INSERT ... RETURNING` 에 select 정책이
+  걸린다), 확장자 허용 목록 `CONTENT_EXT`, 행 등록 실패 시 올린 파일 되돌리기
+- iOS `adoptToken`: 올릴 때마다 지우고 올림, 실패하면 한 번 재시도하고 화면에 말함,
+  Bluetooth 가 다른 상태를 거치면 처음부터. **컴파일 검증 못 했음**
+- `client/p2p` 는 빌드에서 뺐다 (부르는 곳이 없는 인증 없는 LAN 서버였다). 파일은 남아
+  있고, 화면의 "P2P 스마트 배포" 문구(`main.cpp`)도 그대로다 - 없는 기능을 말하고 있다
+
+### 서버 쪽 조임: `supabase/hardening.sql` (**아직 적용 안 됨**)
+
+`contents` 행의 모양 제약(1.1.4 PC 를 새 exe 받기 전까지 서버에서 지킨다), 위치마다
+켜진 행 하나, `clip_items`/버킷 크기 상한, 승인자 본인 확인, `org_exists(uuid)`,
+`org_members.created_at` 을 서버가 적기. **고친 대시보드가 GitHub Pages 에 올라간 뒤에**
+실행해야 한다 - 예전 대시보드는 확장자를 대문자 그대로 붙여 제약에 걸린다.
+
+확장자 목록은 세 군데가 같아야 한다: `hardening.sql` 의 `contents_storage_path_shape`,
+`dashboard.html` 의 `CONTENT_EXT`, `client/video/player.cpp` 의 `IsVideoFile`.
+
+### 닫지 않은 것 (정해야 하는 것)
+
+- **폰 토큰은 근처의 아무 BLE 기기나 읽을 수 있는 값이고, GATT 연결 경로에는 신원
+  확인이 없다.** 둘 다 프로토콜을 바꿔야 한다 (토큰 대신 HMAC). 검은 화면은 마우스만
+  움직여도 풀리므로 검증자들은 low~medium 으로 봤다
+- `claim_device_token` 은 토큰을 바꾸지 못한다 (폰을 바꾸면 옛 폰의 신원을 물려받는다)
+- 아무 계정이나 조직을 만들고, 남의 계정을 자기 조직에 넣을 수 있다 (초대 흐름이 없다)
+- 대시보드의 supabase-js 가 버전 고정 없이 CDN 에서 온다 (파일을 받아 `docs/` 에 넣어야 한다)
+- 로그인 리스너: 같은 PC 의 다른 프로세스가 가짜 `code=`/`error=` 로 로그인을 끝낼 수
+  있다. 리다이렉트에 난수 경로를 넣으면 닫히는데, Supabase 의 Redirect URLs 허용 목록이
+  경로를 받는지 저장소에서는 알 수 없다 (안 받으면 조용히 Site URL 로 바뀐다)
+- `clip_items` 행 개수와 `clip` 버킷 파일 개수에는 서버 상한이 없다
+- 1.1.4 이하에서 등록한 PC 의 `config.ini` 에는 `serverUrl`/`anonKey` 가 박혀 있고 그대로다
+- 등록 전에 개인 그림을 골라 둔 자리에는 기업 콘텐츠가 안 뜨고, 그걸 지울 UI 가 없다
+
+## 그 앞 세션: 프로그램 자동 업데이트 + release.bat
 
 **끝까지 돌았다.** 서버에 1.1.0 ~ 1.1.4 가 있고 두 PC 모두 1.1.4 다. 노트북(기업
 등록)은 대시보드 [승인] → 자동 적용, 데스크톱은 zip 을 깔고 켠 뒤 올라갔다.
@@ -156,6 +236,26 @@ A 에서 스크린캡처하면 B 에서 Ctrl+V 로 붙는다. 연결고리는 �
 
 ## 남은 작업
 
+### 0. 직전 세션의 것을 내보내고 실제로 돌려 보기
+
+고친 코드는 **별도 빌드 폴더에서 컴파일되고** (`build-review\`, 여섯 타깃, 오류 0)
+`AuthTest.exe` · `Publish.exe --selftest` 가 통과하지만, **새 SmartScreen.exe 가 뜨고,
+동기화하고, 잠그고, 붙여 넣는 것을 본 사람이 없다.** 순서가 중요하다:
+
+1. 커밋 + push (대시보드가 GitHub Pages 에 올라간다). 소스 보기에 `CONTENT_EXT` 가
+   보이는지 확인하고, 열어 둔 대시보드 탭은 Ctrl+F5
+2. `supabase/hardening.sql` 을 SQL Editor 에서 실행, 결과(`after_hardening`) 확인
+3. `release.bat` → 대시보드에서 [승인]
+4. 돌려 보기 (노트북 = 기업 등록 PC):
+   - events.log 에 `enterprise sync:` 줄. 영상이 그대로 나오는가 (캐시된 `<sha256>.mp4`
+     가 해시까지 맞아 다시 받지 않아야 한다)
+   - 대시보드에서 [송출 중지] → 앱 다시 켜기 → 그 자리가 비는가. 다시 켜면 돌아오는가
+   - 기업 등록 창: 틀린 UUID → "그런 조직이 없어요" (`org_exists` 가 적용된 뒤),
+     칸을 비우고 누르기 → 등록 해제. **해제는 노트북에서 하면 다시 등록해야 한다**
+   - 클립보드: 두 대 사이 글·그림. 암호 관리자에서 복사한 것은 안 넘어가야 한다
+   - 구글 로그인 한 번 (리스너를 다시 썼다)
+   - 대시보드: `사진.PNG` 올리기(소문자로 들어가야 한다), 같은 파일 두 번, 송출 토글, 삭제
+
 ### 1. iOS 재설치 시험 (다시 우선)
 
 `adoptToken` 의 몸통은 **아직 한 번도 실행된 적이 없다.** Mac + 아이폰이 있어야 한다.
@@ -178,6 +278,13 @@ A 에서 스크린캡처하면 B 에서 Ctrl+V 로 붙는다. 연결고리는 �
 
 폰이 T1 을 내주는지 PC 없이 직접 보려면 `ProbeScan.exe` 를 쓴다.
 
+직전 세션에서 이 경로를 고쳤다 (컴파일 검증 못 했음 - **Xcode 에서 먼저 빌드가 되는지
+볼 것**). 화면이 달라졌다: 서비스를 다시 올리는 동안 `기기 토큰` 줄이 사라졌다가
+`didAdd` 가 성공하면 돌아온다. 올리기가 실패하면 "신원 서비스 등록 실패, 다시
+시도합니다: ..." 가 한 번 뜨고, 두 번째도 실패하면 "신원 서비스 등록 실패: ..." 로
+멈춘다. 그때는 "연동되었습니다" 대신 "계정은 연동됐지만 폰이 토큰을 내주지 못하고
+있습니다" 가 뜬다.
+
 ### 2. App Store 심사 4.8
 
 구글 로그인만 넣고 제출하면 Sign in with Apple 도 요구될 수 있다. Supabase 가 Apple
@@ -185,18 +292,14 @@ provider 를 지원한다. 사내 배포(TestFlight 내부)면 해당 없다.
 
 ### 3. 검토해 볼 것
 
-- **`contents` 가 로그인 없이 읽히는 것을 실제로 확인했다 (2026-09-30).** anon key
-  만으로 `contents` 전 행(전 org)이 나오고, `content` 버킷의 **파일 바이트도 나오고
-  목록도 열린다** (HTTP 206 / list 200). 버킷이 public 이어서가 아니라
-  `storage.objects` 의 anon 정책 때문이다. 대조군 `device_tokens`·`clip_items`·`orgs`·
-  `org_members`·`clip` 버킷은 전부 막혀 있다. 그 anon key 는 배포 zip 의 exe 에 박혀
-  있다. **`supabase/schema.sql` 이 라이브와 어긋나 있다**: 라이브에는 `active` 열과
-  anon 정책이 있고 schema.sql 에는 둘 다 없다 - schema.sql 로 새 프로젝트를 세우면
-  `FetchManifest` 의 `active=eq.true` 가 400 을 받는다. 조이려면 기업 PC 마다 구글
-  로그인이 필요해진다 (`org_release_approvals` 도 같은 이유로 anon 읽기다) - 그 대가를
-  받아들일지는 정해지지 않았다. anon 이 `contents` 에 **쓸** 수 있는지는 확인 못 했다
-  (쓰기 시험은 하지 않았다). 쓸 수 있다면 잠금 화면에 아무 그림이나 밀어 넣을 수
-  있으므로 먼저 볼 것
+- **`contents` 와 `content` 버킷은 여전히 로그인 없이 읽힌다** (전 org 의 행, 파일
+  바이트, 목록). 쓰기는 닫혔다 (위 "직전 세션"). 조이려면 기업 PC 에 로그인이나 그에
+  준하는 것이 필요해진다 (`org_release_approvals` 도 같은 이유로 anon 읽기다) - 그
+  대가를 받아들일지는 정해지지 않았다. 조직이 하나뿐인 지금은 드러나지 않는다.
+  로그인 없이 가는 길로 생각해 볼 것: 조직 id 를 아는 것 자체를 열쇠로 삼아, 표는
+  `org_id` 를 받는 security definer 함수로만 읽게 하고 anon 의 select 정책을 없앤다
+  (버킷 쪽은 같은 방법이 안 통한다 - 목록과 내려받기가 같은 select 정책이다)
+- 위 "직전 세션 - 닫지 않은 것" 의 목록
 - 자동 업데이트에서 안 해 본 것: 실패 기록 뒤 [다시 시도], 화면이 가려진 채로 Ready
   가 됐을 때 풀리면 적용되는지, `updateChannel=beta`, 세 대 이상. 검토에서 저위험으로
   남긴 것: 복사본이 pid 만으로 원래 프로세스를 찾는 것(실제로는 살아 있을 때
@@ -232,8 +335,16 @@ provider 를 지원한다. 사내 배포(TestFlight 내부)면 해당 없다.
 - 클립보드 점검: `SmartScreen.exe --clip-test` (앱이 떠 있어도 된다). 결과는 창과
   `%APPDATA%\SmartScreen\clip-test.txt`
 - 임계값 분석: `tools\rssi-threshold.ps1`. 구글 로그인 점검: `build\AuthTest.exe`
-- 서버 스키마는 `supabase/*.sql` 을 대시보드 SQL Editor 에 붙여 넣어 적용한다
-  (`schema.sql` / `device_tokens.sql` / `clipboard.sql` / `releases.sql`). 넷 다 적용돼 있다
+- 서버 스키마는 `supabase/*.sql` 을 대시보드 SQL Editor 에 붙여 넣어 적용한다.
+  새 프로젝트용 넷(`schema.sql` / `device_tokens.sql` / `clipboard.sql` / `releases.sql`,
+  이 순서)과, 돌고 있는 프로젝트를 고치는 둘(`content_lockdown.sql` 적용됨,
+  `hardening.sql` **아직**). 넷은 "라이브 + 두 마이그레이션" 과 같게 맞춰 두었다 -
+  마이그레이션을 고치면 넷도 같이 고칠 것
+- **라이브가 실제로 어떤지는 `supabase/inspect_live.sql` 로 본다** (읽기 전용, select
+  하나, 결과 한 칸). 정책·RLS·버킷·함수·트리거가 다 나온다. anon key 로 밖에서 찔러
+  보는 것보다 이게 먼저다 - 아래 함정
+- `build-review\` 는 직전 세션이 앱을 건드리지 않고 컴파일을 확인하려고 만든 폴더다
+  (.gitignore). `do_build.bat` 와 같은 명령을 빌드 폴더만 바꿔 돌린 것이고, 지워도 된다
 - `.env` 에 Supabase URL/anon key 가 있다 (커밋 안 됨, `.env.example` 이 형식)
 - config.ini 편집은 앱을 완전히 종료한 뒤에. 안 그러면 앱이 덮어쓴다
 - iOS 는 Mac + Xcode 로만 빌드된다. **Swift 를 고치면 "컴파일 검증 못 했음"을 분명히
@@ -308,6 +419,34 @@ events.log, ble_scan_log.csv, gatt_rssi_log.csv 모두 **날짜 없이 계속 �
 시각으로 자르지 말고 세션 경계(`# session`, `START thr=`, `start: SmartScreen x.y.z`)를
 기준으로 볼 것.
 
+### `authenticated` 는 "우리 사용자" 가 아니다
+
+Supabase 의 `to authenticated` 는 **구글 계정으로 로그인한 아무나**다. 가입이 열려
+있고 anon key 는 exe 와 대시보드에 박혀 있다. 조건이 `bucket_id = '...'` 하나뿐인
+`authenticated` 정책은 사실상 공개다 - `content` 버킷이 그랬다. 정책에는 "누구의 것인가"
+(`auth.uid()`, 조직 멤버십)가 반드시 들어가야 한다.
+
+### 저장소의 SQL 은 라이브가 아니다
+
+`schema.sql` 은 다섯 달 동안 라이브와 달랐다 (열 하나, 정책 일곱). 대시보드에서 손으로
+고친 것은 저장소에 남지 않는다. 정책을 의심할 때는 `.sql` 파일을 읽지 말고
+`inspect_live.sql` 을 돌려라. 그리고 밖에서 찔러 보는 것으로는 절반만 안다 - insert 는
+저장될 수 없는 행으로 안전하게 찔러 볼 수 있지만, update / delete / Storage 쓰기는
+실제로 바꾸지 않고는 알 수 없다. 정책을 읽으면 아무것도 안 쓰고 전부 안다.
+
+### `INSERT ... RETURNING` 에는 select 정책도 걸린다
+
+supabase-js 의 `.insert(...).select()` 는 `RETURNING` 이 되고, 그러면 그 표의 select
+정책이 **새 행에** 걸린다 - 행이 들어가기 전에. select 정책이 "트리거가 만들어 주는
+다른 행" 에 기대고 있으면(조직을 만들면 트리거가 멤버십을 만든다) 아직 없으니
+거절된다. 오류 문구는 insert 정책 위반과 똑같다.
+
+### 검토 도중에 고치면 검증자가 "이미 고쳐졌다" 고 한다
+
+검증 에이전트는 작업 트리를 읽는다. 발견을 받자마자 고치면 그 발견은 반박표를
+받는다 (1차의 반박 4건 중 3건이 그랬다). 틀린 것은 아니지만 집계가 흐려진다 - 고치는
+것은 검증이 끝난 뒤에, 아니면 검증자에게 `git show HEAD:` 를 보라고 할 것.
+
 ### Supabase 가 조용히 다른 곳으로 보낸다
 
 허용 목록(Redirect URLs)에 없는 `redirect_to` 를 **오류로 만들지 않고 Site URL 로
@@ -359,7 +498,9 @@ Disconnected / Closed 로 보고됐다. `GattDeviceService` 는 반드시 `Close
   닫았다 다시 띄운다)
 - 데스크톱: **1.1.4**, 듀얼 모니터. 기업 등록인지 개인인지는 이 세션에서 확인 못 했다
 - 두 대 모두 클립보드 공유 켜짐, 같은 구글 계정(icesgg@gmail.com)
-- Supabase: 네 스키마(`schema`/`device_tokens`/`clipboard`/`releases`) 적용됨.
+- Supabase: 네 스키마(`schema`/`device_tokens`/`clipboard`/`releases`) + `content_lockdown.sql`
+  적용됨. **`hardening.sql` 은 아직** (`org_exists` 가 없어 새 클라이언트의 등록 창은
+  조직이 있는지 "알 수 없음" 으로 넘어간다). `contents` 에 두 행 (png 꺼짐, mp4 켜짐).
   `releases` 에 1.1.0·1.1.1·1.1.2·1.1.3·1.1.4 (1.1.0 은 낡은 빌드가 실수로 다시 올라간 것 -
   해는 없음). `release_admins` 에 icesgg@gmail.com. 대시보드(GitHub Pages)에 승인 칸이
   올라가 있고 [승인] 단추로 1.1.3 을 승인해 노트북이 받았다 (사용자 보고)

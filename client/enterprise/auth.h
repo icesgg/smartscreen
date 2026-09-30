@@ -17,8 +17,8 @@
 // HTTP 한 번 왕복 (WinHTTP)
 // ---------------------------------------------------------------------------
 // auth.cpp 안에만 static 으로 있던 것을 꺼냈다. 클립보드 동기화가 똑같은 것을
-// 필요로 하는데(clipsync.cpp), 한 벌 더 만들면 두 벌이 된다. supabase.cpp 의
-// GET 은 본문을 보내지 못해서 쓸 수 없다.
+// 필요로 하는데(clipsync.cpp), 한 벌 더 만들면 두 벌이 된다. 기업 콘텐츠
+// (supabase.cpp)도 이제 이것을 쓴다.
 //
 // body 와 outBody 는 바이너리도 담는다 - std::string 은 여기서 문자열이 아니라
 // 바이트 통이다. PNG 를 그대로 싣고 그대로 받는다.
@@ -27,10 +27,22 @@
 // 끌어오면 이걸 포함하는 쪽의 헤더 순서 문제가 된다(config.h 가 winsock2 로
 // 겪은 일). 그래서 상태 코드가 DWORD 가 아니라 unsigned long 이다 - 윈도에서
 // 같은 타입이므로 DWORD 변수를 그대로 넘겨도 된다.
+//
+// true 는 응답을 본문 끝까지 받았다는 뜻이다 (상태 코드가 4xx/5xx 여도 true 다 -
+// 그건 outStatus 로 본다). 헤더는 왔는데 본문을 읽다가 끊기면(수신 시간 제한,
+// 연결 리셋) false 를 주고 outBody 를 비운다. 예전에는 그때도 true 여서 잘린
+// 본문이 온전한 응답처럼 쓰일 수 있었다. outStatus 는 헤더에서 읽은 값이 남으므로
+// "false 인데 outStatus 가 0 이 아니다" 는 닿기는 했는데 본문을 못 받은 것이다.
+//
+// maxBodyBytes 가 0 이 아니면 본문이 그 크기를 넘는 순간 읽기를 그만두고 false 를
+// 준다 (outBody 는 비고 outStatus 는 남는다). 서버가 주는 대로 메모리에 쌓지
+// 않으려는 호출이 쓴다. 0 은 상한 없음 - 몇 MB 짜리 exe 를 되받아 대조하는
+// tools/publish.cpp 가 그렇게 부른다.
 bool SupabaseHttp(const wchar_t* verb, const std::wstring& url,
                   const std::vector<std::wstring>& headers,
                   const std::string& body,
-                  unsigned long& outStatus, std::string& outBody);
+                  unsigned long& outStatus, std::string& outBody,
+                  size_t maxBodyBytes = 0);
 
 // UTF-8 <-> UTF-16. 같은 이유로 여기 있다.
 std::wstring Utf8ToWide(const std::string& s);
@@ -40,6 +52,7 @@ std::string  WideToUtf8(const std::wstring& w);
 // 않는다. 첫 번째로 나오는 것을 준다 - 배열을 읽을 때는 PostgREST 에
 // 단일 객체를 달라고 해서(Accept: application/vnd.pgrst.object+json) 배열을
 // 아예 만들지 않는 편이 맞다.
+// JsonGetString 은 닫는 따옴표가 없는 문자열(잘린 본문)을 값으로 치지 않는다 - false.
 bool JsonGetString(const std::string& body, const std::string& key, std::string& out);
 bool JsonGetNumber(const std::string& body, const std::string& key, long long& out);
 
@@ -74,6 +87,14 @@ public:
     // 브라우저가 돌아올 때까지 기다렸다가 ?code= 를 꺼낸다.
     // 사용자가 취소하면 구글/Supabase 가 ?error= 로 돌아오므로 그것도 받는다.
     // 시간 안에 아무것도 안 오면 false.
+    //
+    // "GET /?..." 에 code 나 error 를 실은 요청만 결과로 친다. 그 밖의 연결
+    // (아무 말 없는 연결, 다른 경로, 다른 메서드)은 닫고 timeoutMs 가 다할 때까지
+    // 계속 기다린다 - 이 포트는 같은 PC 의 누구나 닿을 수 있어서, 첫 연결을
+    // 결과로 치면 남이 로그인을 끝내거나 붙잡아 둘 수 있다.
+    // error 쪽 글(outErr)은 여전히 남이 넣을 수 있는 값이다. 그대로 믿지 말 것.
+    // outCode 도 같다 - 남이 그럴듯한 가짜 코드를 먼저 보내면 그것이 돌아가고,
+    // 교환이 실패하면서 진짜 요청은 놓친다 (auth.cpp 의 WaitForCode 에 까닭).
     bool WaitForCode(unsigned timeoutMs, std::string& outCode, std::string& outErr);
 
     void Stop();

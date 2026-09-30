@@ -343,4 +343,8 @@ void DeactivateBlackScreen() {
     for (HWND h : s_banners) if (h) DestroyWindow(h);
     s_banners.clear();
     if (g_hBlackScreen) { DestroyWindow(g_hBlackScreen); g_hBlackScreen = nullptr; }
+    // 잠금 중에 그림 경로가 바뀌었을 수 있다 (기업 콘텐츠 동기화의 결과는 작업
+    // 스레드에서 오므로 잠금 중에도 도착한다). 떠 있는 동안에는 보여 주던 것을 그대로
+    // 두고, 여기서 버려서 다음 잠금의 WM_CREATE 가 새 경로로 다시 읽게 한다.
+    FreeBlackScreenImages();
 }

@@ -338,8 +338,15 @@ int wmain(int argc, wchar_t** argv) {
     // 버킷 정책과 파일 둘 다 맞는 것이고, 실패하면 PC 들이 실패하기 전에 여기서 안다.
     printf("anon 으로 다시 내려받아 대조\n");
     std::string back;
-    if (!SupabaseHttp(L"GET", url + L"/storage/v1/object/authenticated/releases/" + storagePath,
-                      Hdr(key, key), std::string(), st, back) || st < 200 || st >= 300) {
+    bool got = SupabaseHttp(L"GET", url + L"/storage/v1/object/authenticated/releases/" + storagePath,
+                            Hdr(key, key), std::string(), st, back);
+    // SupabaseHttp 는 본문을 끝까지 못 받으면 false 를 준다 (상태는 200 인 채로).
+    // 그걸 아래 문구로 보내면 네트워크가 끊긴 것을 버킷 정책 탓으로 읽게 된다.
+    if (!got && (st == 0 || (st >= 200 && st < 300))) {
+        printf("  [FAIL] 내려받다가 끊겼다 (HTTP %lu, 본문을 끝까지 못 받음). 네트워크 문제다 - 다시 돌려라\n", st);
+        return 1;
+    }
+    if (!got || st < 200 || st >= 300) {
         printf("  [FAIL] anon 으로 못 받는다 (%ls). releases 버킷 select 정책을 보라\n", ErrOf(back, st).c_str());
         return 1;
     }

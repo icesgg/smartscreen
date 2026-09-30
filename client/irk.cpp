@@ -262,9 +262,11 @@ bool ImportIrkElevated(const std::wstring& targetName, std::wstring& outMessage)
     }
     if (chosen.empty()) {
         wchar_t buf[256];
-        swprintf_s(buf, L"IRK를 %zu개 찾았지만 \"%s\"의 것을 고르지 못했습니다.\n\n"
-                        L"아이폰을 \"휴대폰과 연결\"로 한 번 연결한 뒤 다시 시도하세요.",
-                   irks.size(), targetName.c_str());
+        // 기기 이름은 상대 기기가 정한다 (최대 248자). swprintf_s 는 넘치면 프로세스를 끝낸다.
+        _snwprintf_s(buf, _countof(buf), _TRUNCATE,
+                     L"IRK를 %zu개 찾았지만 \"%s\"의 것을 고르지 못했습니다.\n\n"
+                     L"아이폰을 \"휴대폰과 연결\"로 한 번 연결한 뒤 다시 시도하세요.",
+                     irks.size(), targetName.c_str());
         outMessage = buf;
         WriteResult(outMessage);
         return false;
@@ -273,8 +275,15 @@ bool ImportIrkElevated(const std::wstring& targetName, std::wstring& outMessage)
     AppConfig cfg;
     LoadAppConfig(cfg);
     cfg.bleIrk = chosen;
-    SaveAppConfig(cfg);
+    // SaveAppConfig 는 못 읽은 구조체를 받지 않고, 못 쓰면 false 를 준다 (config.h).
+    // 안 보면 아무것도 안 적혔는데 "가져왔습니다" 라고 말하게 된다.
+    const bool saved = SaveAppConfig(cfg);
     SecureZeroMemory(&chosen[0], chosen.size() * sizeof(wchar_t));
+    if (!saved) {
+        outMessage = L"기기 키를 설정 파일에 저장하지 못했습니다. 잠시 뒤 다시 시도하세요.";
+        WriteResult(outMessage);
+        return false;
+    }
 
     outMessage = L"기기 키를 가져왔습니다. (" + chosenName + L")\n\n"
                  L"이제 아이폰이 잠긴 상태에서도 인식됩니다.\n"

@@ -62,6 +62,9 @@ final class LinkManager: NSObject, ObservableObject,
     @Published var lastRssi = 0
     @Published var reportCount = 0
     @Published var tokenText = ""
+    // 신원 서비스를 올리지 못한 상태. 계정 연동(서버)은 끝났어도 이게 서 있으면
+    // 폰은 아무것도 내주지 않으므로, 화면이 "연동되었습니다" 를 그대로 두지 않게 한다.
+    @Published var identFailed = false
 
     private var central: CBCentralManager!
     private var peripheralMgr: CBPeripheralManager!
@@ -71,6 +74,9 @@ final class LinkManager: NSObject, ObservableObject,
     private var discoverTries = 0
 
     private var identAdded = false
+    // add() 가 실패하면 한 번만 다시 해 본다. 끝없이 돌지 않게 세어 두고, 성공하거나
+    // 밖에서 새로 올리기 시작할 때(adoptToken, Bluetooth 상태 변화) 다시 푼다.
+    private var identRetried = false
     // 서버가 다른 값을 확정해 주면 갈아탄다 (adoptToken 참고) - 그래서 var 다.
     private var token = LinkManager.loadOrCreateToken()
 
@@ -117,6 +123,18 @@ final class LinkManager: NSObject, ObservableObject,
                                          permissions: [.readable])
         let svc = CBMutableService(type: kIdentUUID, primary: true)
         svc.characteristics = [ch]
+        // 올릴 때마다 있던 것을 전부 치우고 올린다. 라디오가 꺼진 채 adoptToken 을
+        // 거치면 옛 토큰을 실은 서비스가 남아 있는데, 그 위에 add 하면 같은 UUID 가
+        // 둘이 되고 PC 는 먼저 나오는 옛 값을 읽는다. iOS 가 데이터베이스를 남겼든
+        // 비웠든(Bluetooth 재시작) 결과가 같도록 항상 빈 상태에서 시작한다.
+        // 광고도 멈춘다 - 서비스가 없는 사이에 찾아온 PC 는 읽을 게 없어 이 폰을
+        // "남의 기기" 로 10분 접어 둔다. didAdd 가 성공하면 다시 시작한다.
+        // 토큰 줄도 비운다: 화면의 값은 "폰이 실제로 내주는 값" 이어야 하는데
+        // 지금부터 didAdd 까지는 내주는 값이 없다.
+        if peripheralMgr.isAdvertising { peripheralMgr.stopAdvertising() }
+        isAdvertising = false
+        tokenText = ""
+        peripheralMgr.removeAllServices()
         peripheralMgr.add(svc)
     }
 
@@ -144,22 +162,27 @@ final class LinkManager: NSObject, ObservableObject,
         token = d
         UserDefaults.standard.set(d, forKey: kTokenDefaultsKey)
 
-        // tokenText 는 여기서 건드리지 않는다. 화면의 값은 "폰이 실제로 내주는 값"
+        // tokenText 에 새 값을 여기서 쓰지 않는다. 화면의 값은 "폰이 실제로 내주는 값"
         // 이어야 하고, 그건 add() 가 성공한 뒤 didAdd 에서만 알 수 있다. 먼저 써 두면
         // 서비스를 다시 올리지 못한 폰이 새 토큰을 내준다고 거짓말을 하는데,
         // 재설치 시험에서 폰 쪽에 보이는 값은 이것 하나뿐이다.
+        // 옛 값도 남겨 두지 않는다 - 지금부터 옛 토큰은 내주면 안 되는 값이다.
+        // 줄이 사라졌다가 didAdd 가 성공해야만 새 값으로 돌아온다.
+        tokenText = ""
         advText = "토큰 적용 중"
         isAdvertising = false
         identAdded = false
+        identRetried = false
+        identFailed = false
 
         // 계정 등록은 블루투스를 쓰지 않으므로 라디오가 꺼진 채로 여기 올 수 있다.
         // 값은 이미 저장했으니, 켜지면 didUpdateState 가 새 토큰으로 올려 준다.
+        // 옛 토큰을 실은 서비스는 그때 addIdentService 가 올리기 직전에 치운다.
         guard peripheralMgr.state == .poweredOn else {
             advText = "Bluetooth 를 켜면 새 토큰으로 광고합니다"
             return
         }
-        if peripheralMgr.isAdvertising { peripheralMgr.stopAdvertising() }
-        peripheralMgr.removeAllServices()
+        // 광고를 멈추고 옛 서비스를 내리는 일은 addIdentService 안에서 한다.
         addIdentService()      // didAdd 콜백이 광고를 다시 시작한다
     }
 
@@ -176,8 +199,30 @@ final class LinkManager: NSObject, ObservableObject,
     }
 
     func peripheralManagerDidUpdateState(_ p: CBPeripheralManager) {
+        // poweredOn 이 아닌 상태를 한 번이라도 거치면 서비스를 처음부터 다시 올린다.
+        // resetting(bluetoothd 재시작) 뒤에는 iOS 가 데이터베이스를 비우는데,
+        // identAdded 가 true 로 남아 있으면 서비스 없이 광고만 나가고 화면은 초록
+        // "광고 중" 이다 - PC 는 붙어도 읽을 게 없어 이 폰을 10분씩 접어 둔다.
+        // 꺼짐(poweredOff)은 데이터베이스가 남는다고 돼 있지만 실기로 본 적이 없어
+        // 가리지 않는다: addIdentService 가 치우고 올리므로 어느 쪽이든 결과가 같다.
+        if p.state != .poweredOn {
+            identAdded = false
+            identRetried = false
+            identFailed = false
+            isAdvertising = false
+        }
         switch p.state {
-        case .poweredOn:    advText = "신원 서비스 등록 중"; addIdentService(); startAdvertising()
+        case .poweredOn:
+            if identAdded && p.isAdvertising {
+                // 복원된 세션: 서비스와 광고가 이미 살아 있어 didAdd 도
+                // didStartAdvertising 도 오지 않는다. 여기서 말해 주지 않으면 폰은
+                // 토큰을 내주고 있는데 화면은 "등록 중" 에 멈춰 있다.
+                advText = "광고 중"
+                isAdvertising = true
+            } else {
+                advText = "신원 서비스 등록 중"
+            }
+            addIdentService(); startAdvertising()
         case .poweredOff:   advText = "Bluetooth 꺼짐"; isAdvertising = false
         case .unauthorized: advText = "Bluetooth 권한 없음"
         default:            advText = "대기 중"
@@ -188,21 +233,49 @@ final class LinkManager: NSObject, ObservableObject,
         if let error = error {
             // 광고는 신원 서비스가 올라간 뒤에만 시작하므로, 여기서 실패하면
             // 폰은 아무것도 내주지 않는다. 등이 켜진 채로 두면 안 된다.
-            advText = "신원 서비스 등록 실패: \(error.localizedDescription)"
             isAdvertising = false
+            identFailed = true
+            // 한 번만 다시 해 본다. adoptToken 은 옛 서비스를 내린 뒤에 여기로 오므로
+            // 그대로 두면 폰은 Bluetooth 를 껐다 켜거나 앱을 다시 띄울 때까지 아무것도
+            // 내주지 않는다 (같은 토큰으로 다시 로그인해도 adoptToken 은 그냥 돌아간다).
+            // 두 번째도 실패하면 문구를 남기고 멈춘다.
+            if identRetried {
+                advText = "신원 서비스 등록 실패: \(error.localizedDescription)"
+            } else {
+                identRetried = true
+                advText = "신원 서비스 등록 실패, 다시 시도합니다: \(error.localizedDescription)"
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                    guard let self = self else { return }
+                    // 그 사이 라디오가 꺼졌거나 다른 경로로 이미 올라갔으면
+                    // addIdentService 의 guard 가 돌려보낸다.
+                    self.addIdentService()
+                }
+            }
             return
         }
         guard service.uuid == kIdentUUID else { return }
         identAdded = true
+        identRetried = false
+        identFailed = false
         tokenText = token.prefix(4).map { String(format: "%02X", $0) }.joined()
         startAdvertising()
     }
 
     func peripheralManager(_ p: CBPeripheralManager, willRestoreState dict: [String: Any]) {
         // 복원된 세션에는 서비스가 이미 올라와 있다. 다시 add 하면 실패한다.
+        // 단, 그 서비스가 지금 토큰을 싣고 있을 때만 믿는다. UUID 만 보면 라디오가
+        // 꺼진 채 adoptToken 을 거치고 종료된 앱이 옛 토큰 서비스를 "이미 올라가
+        // 있다" 로 받아들여 계속 내준다. 하나가 아니거나 값이 다르거나 값을 못
+        // 읽으면 identAdded 를 false 로 두고, addIdentService 가 전부 치우고 올린다.
         if let svcs = dict[CBPeripheralManagerRestoredStateServicesKey] as? [CBMutableService],
-           svcs.contains(where: { $0.uuid == kIdentUUID }) {
+           svcs.count == 1,
+           svcs[0].uuid == kIdentUUID,
+           let ch = svcs[0].characteristics?.first(where: { $0.uuid == kTokenUUID }),
+           ch.value == token {
             identAdded = true
+            // 방금 복원된 서비스의 값이 token 과 같은 것을 확인했다. 토큰 줄은
+            // "폰이 실제로 내주는 값" 이므로 여기서도 채운다 (didAdd 가 오지 않는다).
+            tokenText = token.prefix(4).map { String(format: "%02X", $0) }.joined()
         }
         isAdvertising = p.isAdvertising
     }
@@ -359,6 +432,10 @@ final class AuthManager: NSObject, ObservableObject,
 
     private var session: ASWebAuthenticationSession?
 
+    // 성공 문구. 화면이 이 문장인지 비교해서, 신원 서비스를 못 올린 폰 위에는
+    // 띄우지 않는다 (ContentView).
+    static let linkedText = "연동되었습니다"
+
     func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
         let scene = UIApplication.shared.connectedScenes
             .compactMap { $0 as? UIWindowScene }
@@ -406,10 +483,28 @@ final class AuthManager: NSObject, ObservableObject,
         let s = ASWebAuthenticationSession(url: comps.url!,
                                           callbackURLScheme: kCallbackScheme) { [weak self] cb, err in
             guard let self = self else { return }
-            guard let cb = cb,
-                  let code = URLComponents(url: cb, resolvingAgainstBaseURL: false)?
-                      .queryItems?.first(where: { $0.name == "code" })?.value else {
-                self.finish(nil, "로그인이 취소되었습니다", completion)
+            var items: [URLQueryItem] = []
+            if let u = cb, let c = URLComponents(url: u, resolvingAgainstBaseURL: false) {
+                items = c.queryItems ?? []
+            }
+            guard let code = items.first(where: { $0.name == "code" })?.value else {
+                // code 가 없는 이유를 그대로 보여 준다. 서버나 구글 쪽에서 실패하면
+                // Supabase 는 콜백에 code 대신 error / error_description 을 실어 보내는데,
+                // 전부 "취소" 로 뭉개면 서버 설정 오류가 사용자가 닫은 것으로 읽힌다.
+                // "취소" 는 사용자가 창을 닫았을 때(canceledLogin)만 쓴다.
+                let errName = items.first(where: { $0.name == "error" })?.value
+                let errDesc = items.first(where: { $0.name == "error_description" })?.value
+                var msg = "로그인 실패: 콜백에 code 가 없습니다"
+                if let d = errDesc ?? errName {
+                    // queryItems 는 %XX 만 풀고 '+' 는 그대로 둔다.
+                    let text = d.replacingOccurrences(of: "+", with: " ")
+                    msg = "로그인 실패: \(text.prefix(160))"
+                } else if let e = err as? ASWebAuthenticationSessionError, e.code == .canceledLogin {
+                    msg = "로그인이 취소되었습니다"
+                } else if let e = err {
+                    msg = "로그인 실패: \(e.localizedDescription)"
+                }
+                self.finish(nil, msg, completion)
                 return
             }
             self.exchange(code: code, verifier: verifier,
@@ -466,14 +561,17 @@ final class AuthManager: NSObject, ObservableObject,
                 return
             }
             let mail = ((o["user"] as? [String: Any])?["email"] as? String) ?? ""
-            DispatchQueue.main.async { self.email = mail }
 
             // 서버가 이 계정의 토큰을 확정한다. 이미 있으면 그 값이 돌아온다.
             self.post("/rest/v1/rpc/claim_device_token",
                       body: ["p_token": currentTokenHex, "p_platform": "ios"],
                       bearer: access) { res, code2, raw2 in
                 if let hex = res as? String, hex.count == 32 {
-                    self.finish(hex, "연동되었습니다", completion)
+                    // email 은 토큰을 받은 뒤에만 알린다. 화면은 email 이 차면 로그인
+                    // 버튼을 내리고 "PC 에서 등록하라" 고 안내하는데, 등록이 실패한
+                    // 채로 그렇게 되면 서버에 행이 없는데도 다시 시도할 길이 없다.
+                    DispatchQueue.main.async { self.email = mail }
+                    self.finish(hex, AuthManager.linkedText, completion)
                 } else {
                     self.finish(nil, "등록 실패 [\(code2)] \(raw2.prefix(160))", completion)
                 }
@@ -543,7 +641,12 @@ struct ContentView: View {
                     .multilineTextAlignment(.center)
             }
 
-            if !auth.statusText.isEmpty {
+            // "연동되었습니다" 는 서버 쪽 얘기다. 신원 서비스를 올리지 못한 폰 위에
+            // 그 말을 그대로 두면 재설치 시험이 성공한 것으로 읽힌다.
+            if link.identFailed && auth.statusText == AuthManager.linkedText {
+                Text("계정은 연동됐지만 폰이 토큰을 내주지 못하고 있습니다")
+                    .font(.caption).foregroundColor(.secondary)
+            } else if !auth.statusText.isEmpty {
                 Text(auth.statusText).font(.caption).foregroundColor(.secondary)
             }
 

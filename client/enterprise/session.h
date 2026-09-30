@@ -46,6 +46,25 @@ void SessionAdopt(const AuthSession& s);
 // 부르지 말 것.
 bool SessionToken(std::wstring& outAccess, std::wstring& outErr);
 
+// 서버가 방금 이 access 토큰을 401 로 돌려보냈을 때 부른다. 들고 있던 access
+// 토큰을 버려서, 다음 SessionToken 이 남은 수명을 따지지 않고 갱신하게 한다.
+//
+// 이게 없던 동안에는 만료를 이 PC 의 시계로만 판단했다. 그 판단이 서버와
+// 어긋나면(토큰을 받은 뒤 시계가 뒤로 맞춰졌다, 서버의 JWT 비밀이 바뀌었다)
+// 요청마다 401 이 돌아오는데도 같은 토큰을 계속 내주었고, 어긋난 만큼의
+// 시간이 지나거나 앱을 다시 켜기 전에는 풀리지 않았다.
+//
+// 여기서 갱신하지는 않는다. 갱신은 다음 SessionToken 이 한다. 다만 다른
+// 스레드가 마침 갱신 중이면 그것이 끝날 때까지 기다리므로, SessionToken 과
+// 마찬가지로 UI 스레드에서 부르지 말 것.
+//
+// 로그인은 그대로다 - refresh 토큰은 건드리지 않는다. 갱신이 실패하면 그 뒤의
+// SessionToken 은 거절된 토큰을 다시 내주지 않고 false 를 준다.
+//
+// 401 을 볼 때마다 부르면 그때마다 갱신이 한 번씩 돌고 refresh 토큰도 그만큼
+// 회전한다. 부르는 쪽이 재시도 간격을 벌려야 한다 (clipsync.cpp 의 일꾼이 그렇게 한다).
+void SessionInvalidate();
+
 // 로그인한 계정이 있는지 (세션이 지금 유효한지와는 다르다 - 서버가 죽어도
 // 계정은 있다). UI 가 "로그인하세요" 를 띄울지 판단하는 데 쓴다.
 bool SessionHasAccount();

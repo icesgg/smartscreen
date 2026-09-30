@@ -118,6 +118,17 @@ create table org_release_approvals (
 
 alter table org_release_approvals enable row level security;
 
+-- 표 권한 (schema.sql 의 같은 자리 참고). 새 표를 자동으로 열어 주지 않는 프로젝트
+-- 에서는 이게 없으면 정책이 있어도 "permission denied" 다. 무엇이 되는지는 정책이 정한다.
+-- release_admins 를 anon 에도 준다: releases 의 select 정책이 release_admins 를 하위
+-- 질의로 읽고, 그 권한 검사는 부르는 역할(anon)로 한다 - 없으면 로그인 없는 PC 의
+-- 업데이트 확인이 "permission denied for table release_admins" 로 끝난다. anon 에게
+-- 보이는 줄은 없다 (release_admins 의 정책이 authenticated 뿐이다).
+grant select on release_admins to anon, authenticated;
+grant select on releases, org_release_approvals to anon, authenticated;
+grant insert, update, delete on releases to authenticated;
+grant insert, delete on org_release_approvals to authenticated;
+
 -- 로그인 없이 읽는다. 기업 PC 는 (지금 구조에서는) 로그인이 없다 - 콘텐츠도
 -- anon 키로 받는다. 행에 든 것은 조직 id 와 버전 번호뿐이다.
 create policy "anyone_reads_approvals"
@@ -126,12 +137,15 @@ create policy "anyone_reads_approvals"
   using (true);
 
 -- 쓰기는 그 조직의 admin 만. member 는 대시보드에서 목록만 본다.
+-- approved_by 는 본인이어야 한다 - 기본값이 auth.uid() 지만 보내는 쪽이 다른 값을
+-- 적을 수 있었다 (hardening.sql).
 create policy "org_admins_approve"
   on org_release_approvals for insert
   to authenticated
   with check (
-    exists (
-      select 1 from org_members m
+    approved_by = auth.uid()
+    and exists (
+      select 1 from public.org_members m
        where m.org_id = org_release_approvals.org_id
          and m.user_id = auth.uid()
          and m.role = 'admin'

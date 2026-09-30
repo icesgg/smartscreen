@@ -181,7 +181,9 @@ unsigned short LoopbackListener::Start() {
     addr.sin_port = 0;                            // OS 가 빈 포트를 고른다
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1 만. 외부 노출 금지
     if (bind(m_impl->sock, (sockaddr*)&addr, sizeof(addr)) != 0) return 0;
-    if (listen(m_impl->sock, 1) != 0) return 0;
+    // 대기열이 1 이면 WaitForCode 가 남의 연결 하나를 정리하는 동안 브라우저의
+    // 진짜 요청이 거절당한다. 이제 남의 연결을 넘기고 계속 받으므로 자리가 필요하다.
+    if (listen(m_impl->sock, 8) != 0) return 0;
 
     sockaddr_in bound{};
     int len = sizeof(bound);
@@ -237,38 +239,124 @@ static bool QueryParam(const std::string& req, const char* key, std::string& out
     return false;
 }
 
+// s 에 읽을 것이 생길 때까지 길어야 ms 만큼 기다린다. 리스너에서는 "들어온
+// 연결이 있다", 받은 소켓에서는 "바이트가 왔거나 상대가 끊었다" 는 뜻이다.
+static bool WaitReadable(SOCKET s, ULONGLONG ms) {
+    fd_set rd;
+    FD_ZERO(&rd);
+    FD_SET(s, &rd);
+    timeval tv{};
+    tv.tv_sec = (long)(ms / 1000);
+    tv.tv_usec = (long)((ms % 1000) * 1000);
+    return select(0, &rd, nullptr, nullptr, &tv) > 0;
+}
+
+// 코드는 토큰 교환 요청의 JSON 에 그대로 끼워 넣는다 (SignInWithGoogle).
+// Supabase 가 주는 코드는 URL 안전 문자뿐이므로, 따옴표·역슬래시·제어문자가 든
+// 값은 코드가 아니다 - 받아 주면 이 포트에 닿은 아무나 그 JSON 의 모양을 바꾼다.
+static bool PlausibleCode(const std::string& s) {
+    if (s.empty()) return false;
+    for (unsigned char ch : s)
+        if (ch < 0x20 || ch == '"' || ch == '\\') return false;
+    return true;
+}
+
 bool LoopbackListener::WaitForCode(unsigned timeoutMs, std::string& outCode,
                                    std::string& outErr) {
     outCode.clear();
     outErr.clear();
     if (m_impl->sock == INVALID_SOCKET) return false;
 
-    fd_set rd;
-    FD_ZERO(&rd);
-    FD_SET(m_impl->sock, &rd);
-    timeval tv{};
-    tv.tv_sec = timeoutMs / 1000;
-    tv.tv_usec = (timeoutMs % 1000) * 1000;
-    if (select(0, &rd, nullptr, nullptr, &tv) <= 0) return false;
+    // 예전에는 select 한 번, accept 한 번이었다. 그래서 이 포트에 먼저 닿은 연결이
+    // 무엇이든(포트를 훑는 다른 프로세스, 파비콘 요청) 그것이 로그인의 결과가
+    // 됐고, 붙기만 하고 아무것도 안 보내는 연결은 시간 제한 없는 recv 에서
+    // LoginThread 를 붙잡았다 - 그 동안 로그인 단추가 죽고 받아 둔 업데이트도
+    // 적용되지 않는다 (2026-09-30 검토). 이제 마감까지 계속 받으면서, code= 나
+    // error= 를 실은 요청이 올 때만 돌아간다.
+    //
+    // 리스너는 논블로킹으로 둔다. select 가 "연결이 왔다" 고 한 뒤 accept 하기
+    // 전에 상대가 끊고 가면 대기열이 비는데, 블로킹 accept 는 거기서 마감 없이
+    // 다음 연결을 기다린다.
+    u_long nonBlocking = 1;
+    ioctlsocket(m_impl->sock, FIONBIO, &nonBlocking);
 
-    SOCKET c = accept(m_impl->sock, nullptr, nullptr);
-    if (c == INVALID_SOCKET) return false;
+    // 연결 하나에 쓰는 시간. 브라우저는 붙자마자 요청 줄을 보내므로 넉넉하다.
+    const DWORD kConnMs = 5000;
+    const ULONGLONG deadline = GetTickCount64() + timeoutMs;
 
-    // 요청 줄만 있으면 된다. 헤더를 다 읽을 필요가 없다.
-    std::string req;
-    char buf[2048];
-    for (int i = 0; i < 8; ++i) {
-        int n = recv(c, buf, sizeof(buf), 0);
-        if (n <= 0) break;
-        req.append(buf, n);
-        if (req.find("\r\n") != std::string::npos) break;
-    }
+    SOCKET c = INVALID_SOCKET;
+    bool gotCode = false;
+    for (;;) {
+        ULONGLONG now = GetTickCount64();
+        if (now >= deadline) return false;
+        if (!WaitReadable(m_impl->sock, deadline - now)) return false;
 
-    bool gotCode = QueryParam(req, "code", outCode);
-    if (!gotCode) {
-        std::string d;
-        if (!QueryParam(req, "error_description", d)) QueryParam(req, "error", d);
-        outErr = d;
+        c = accept(m_impl->sock, nullptr, nullptr);
+        if (c == INVALID_SOCKET) {
+            int e = WSAGetLastError();
+            if (e == WSAEWOULDBLOCK || e == WSAECONNRESET) continue;   // 붙었다가 가 버린 연결
+            return false;
+        }
+
+        // 받은 소켓은 리스너의 논블로킹을 물려받는다. 블로킹으로 되돌리고 (응답을
+        // 보내는 send 가 예전과 같게) 읽기와 쓰기에 시간 제한을 건다.
+        u_long blocking = 0;
+        ioctlsocket(c, FIONBIO, &blocking);
+        DWORD ioMs = kConnMs;
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char*)&ioMs, sizeof(ioMs));
+        setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, (const char*)&ioMs, sizeof(ioMs));
+
+        // 요청 줄만 있으면 된다. 헤더를 다 읽을 필요가 없다.
+        // 마감은 recv 마다가 아니라 연결 전체에 둔다 - 한 바이트씩 흘려 보내며
+        // 붙잡는 상대에게 recv 횟수만큼 시간을 내주지 않는다.
+        std::string req;
+        char buf[2048];
+        ULONGLONG connEnd = GetTickCount64() + kConnMs;
+        if (connEnd > deadline) connEnd = deadline;
+        for (int i = 0; i < 8; ++i) {
+            ULONGLONG t = GetTickCount64();
+            if (t >= connEnd || !WaitReadable(c, connEnd - t)) break;
+            int n = recv(c, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+            req.append(buf, n);
+            if (req.find("\r\n") != std::string::npos) break;
+        }
+
+        // 우리가 내준 주소는 http://127.0.0.1:<포트> 이고 (SignInWithGoogle)
+        // 브라우저는 거기에 "GET /?code=..." 로 온다. 그 모양이 아니거나 code 도
+        // error 도 없는 요청은 로그인의 결과가 아니다.
+        //
+        // 주소에 난수 경로를 붙여 남이 error= 조차 못 넣게 하는 방법은 쓰지 않았다.
+        // Supabase 는 허용 목록에 없는 redirect_to 를 말없이 Site URL 로 바꾸는데
+        // (docs/IDENTIFICATION.md "붙이면서 틀렸던 것"), 경로가 붙은 주소가 지금의
+        // 허용 목록에 맞는지 여기서는 확인할 길이 없다.
+        //
+        // 그래서 남은 것이 둘이다 (2026-09-30 검토, 닫지 못함). 이 포트에 닿은 쪽이
+        // "GET /?error_description=..." 을 보내면 로그인이 그 글과 함께 바로 끝나고,
+        // 그럴듯한 가짜 "GET /?code=..." 를 보내면 교환이 실패하면서 뒤에 오는 진짜
+        // 요청을 놓친다. 둘 다 로그인을 망칠 뿐 성사시키지는 못한다 - 교환에는 이
+        // 프로세스만 아는 verifier 가 든다.
+        std::string code, errText;
+        bool onPath = req.compare(0, 6, "GET /?") == 0;
+        gotCode = onPath && QueryParam(req, "code", code) && PlausibleCode(code);
+        bool gotErr = false;
+        if (onPath && !gotCode) {
+            gotErr = QueryParam(req, "error_description", errText) && !errText.empty();
+            if (!gotErr) gotErr = QueryParam(req, "error", errText) && !errText.empty();
+        }
+        if (gotCode) { outCode = code; break; }
+        if (gotErr)  { outErr = errText; break; }
+
+        // 남의 연결이다. 요청을 보낸 쪽에는 빈 404 를 주어 매달려 있지 않게 하고
+        // (브라우저의 /favicon.ico), 다음 연결을 기다린다.
+        if (!req.empty()) {
+            static const char kNotFound[] =
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            send(c, kNotFound, (int)(sizeof(kNotFound) - 1), 0);
+        }
+        shutdown(c, SD_BOTH);
+        closesocket(c);
+        c = INVALID_SOCKET;
     }
 
     // 브라우저에 남길 화면. 여기서 창을 닫으라고 말해 주지 않으면
@@ -354,14 +442,15 @@ bool UnprotectSecret(const std::wstring& b64, std::wstring& outPlain) {
 // ---------------------------------------------------------------------------
 // HTTP (WinHTTP)
 // ---------------------------------------------------------------------------
-// supabase.cpp 에도 GET 이 있지만 static 이고 본문을 보내지 못한다.
-// 토큰 교환은 POST + JSON 본문이라 여기에 따로 둔다.
+// 앱의 HTTP 는 전부 이것 하나로 간다 (supabase.cpp 에 따로 있던 GET 은 상태 코드를
+// 보지 않아서 없앴다). 파일로 흘려 받는 내려받기만 각자 가진다.
 //
 // clipsync.cpp 도 이걸 쓴다 (선언은 auth.h). 그래서 static 이 아니다.
 bool SupabaseHttp(const wchar_t* verb, const std::wstring& url,
                         const std::vector<std::wstring>& headers,
                         const std::string& body,
-                        unsigned long& outStatus, std::string& outBody) {
+                        unsigned long& outStatus, std::string& outBody,
+                        size_t maxBodyBytes) {
     outStatus = 0;
     outBody.clear();
 
@@ -406,11 +495,27 @@ bool SupabaseHttp(const wchar_t* verb, const std::wstring& url,
                             WINHTTP_HEADER_NAME_BY_INDEX, &code, &sz, WINHTTP_NO_HEADER_INDEX);
         outStatus = code;
 
+        // 본문을 끝까지 받았을 때만 성공이다. 예전 루프는 WinHttpReadData 가
+        // 실패해서 끝난 것(수신 시간 제한, 연결 리셋)과 길이 0 을 읽고 끝난 것을
+        // 가리지 않고 ok 로 두었고, 그래서 도중에 끊긴 200 응답의 잘린 본문이
+        // 온전한 것처럼 쓰일 수 있었다 - 클립보드 텍스트가 잘린 채 붙고, 기준점은
+        // 이미 넘어가 있어 다시 받지도 않는다 (2026-09-30 검토).
+        // 성공한 길이 0 읽기만이 "본문 끝" 이다.
         char buf[4096];
-        DWORD n = 0;
-        while (WinHttpReadData(hReq, buf, sizeof(buf), &n) && n > 0)
+        bool complete = false;
+        for (;;) {
+            DWORD n = 0;
+            if (!WinHttpReadData(hReq, buf, sizeof(buf), &n)) break;   // 도중에 끊겼다
+            if (n == 0) { complete = true; break; }                    // 본문 끝
+            // 상한은 부르는 쪽이 정한다 (0 = 없음). 넘는 순간 그만 읽는다 -
+            // 서버가 주는 대로 메모리에 다 쌓지 않는다.
+            if (maxBodyBytes != 0 && outBody.size() + n > maxBodyBytes) break;
             outBody.append(buf, n);
-        ok = true;
+        }
+        // 잘린 본문은 내주지 않는다. 반환값을 안 보고 본문만 쓰는 호출이 있어도
+        // 잘린 것을 온전한 것으로 읽지 못하게. outStatus 는 그대로 둔다.
+        if (!complete) outBody.clear();
+        ok = complete;
     }
 
     WinHttpCloseHandle(hReq);
@@ -480,6 +585,11 @@ static bool JsonFindString(const std::string& body, const std::string& key,
                     case 'n': v += '\n'; break;
                     case 't': v += '\t'; break;
                     case 'r': v += '\r'; break;
+                    // Postgres 는 0x08 과 0x0C 를 \u00XX 가 아니라 짧은 꼴로 적는다.
+                    // 이 둘이 없으면 default 가 글자 'b' / 'f' 를 남긴다 - 쪽 나눔이
+                    // 든 글을 복사하면 받는 PC 에서 그 자리에 f 가 찍힌다.
+                    case 'b': v += '\b'; break;
+                    case 'f': v += '\f'; break;
                     // \uXXXX. 이게 없으면 'u' 와 숫자 넷이 그대로 본문에 남는다.
                     // 응답이 토큰과 이메일뿐일 때는 만난 적이 없었지만, 이제
                     // 클립보드 텍스트가 이 파서를 지나간다 - 사람이 복사한
@@ -508,6 +618,9 @@ static bool JsonFindString(const std::string& body, const std::string& key,
             }
             ++q;
         }
+        // 닫는 따옴표를 못 만나고 본문이 끝났다. 잘린 응답이다 - 여기까지 모은
+        // 것을 값이라고 내주면 잘린 토큰이나 잘린 글이 온전한 것으로 쓰인다.
+        if (q >= body.size()) return false;
         out = v;
         return true;
     }
@@ -558,11 +671,35 @@ static std::wstring UrlEncode(const std::wstring& in) {
     return out;
 }
 
+// 밖에서 온 글(서버의 오류 본문, 루프백으로 들어온 error_description)을 오류
+// 문장으로 내보낼 때의 상한.
+//
+// 예전에는 서버가 준 문자열을 통째로 돌려줬다. 그 글은 상태 줄과 로그와
+// MessageBox 로 가는데, 받는 쪽 하나가 고정 버퍼에 swprintf_s 로 찍고 있었다
+// (main.cpp 의 클립보드 상태 줄, wchar_t[256]) - 갱신 오류 문장이 234자쯤부터
+// 프로세스가 끝난다 (NEXT_SESSION.md "swprintf_s 는 잘라 쓰지 않는다").
+// 받는 쪽을 고치는 것과 별개로, 여기서 나가는 글은 길이가 정해져 있어야 한다.
+//
+// UTF-16 단위로 자르되 서러게이트 앞짝에서 끊기면 하나 더 버린다 (반쪽 글자).
+// 제어문자는 빈칸으로 - 이 글은 한 줄짜리 상태 줄과 한 줄에 한 건인 events.log
+// 에 찍히는데, 줄바꿈이 섞이면 남이 로그에 줄을 지어낼 수 있다.
+static std::wstring CapErrorText(std::wstring w) {
+    const size_t kMaxChars = 160;
+    if (w.size() > kMaxChars) {
+        size_t n = kMaxChars;
+        if (w[n - 1] >= 0xD800 && w[n - 1] <= 0xDBFF) --n;
+        w.resize(n);
+    }
+    for (wchar_t& ch : w)
+        if (ch < 0x20) ch = L' ';
+    return w;
+}
+
 // 오류 본문에서 사람이 읽을 문장을 고른다. Supabase 는 키 이름이 일정하지 않다.
 static std::wstring PickError(const std::string& body, DWORD status) {
     for (const char* k : { "error_description", "msg", "message", "error" }) {
         std::string v;
-        if (JsonFindString(body, k, v) && !v.empty()) return Widen(v);
+        if (JsonFindString(body, k, v) && !v.empty()) return CapErrorText(Widen(v));
     }
     wchar_t buf[64];
     swprintf_s(buf, L"HTTP %lu", status);
@@ -633,11 +770,16 @@ bool SignInWithGoogle(const std::wstring& supabaseUrl, const std::wstring& anonK
 
     std::string code, err;
     if (!listener.WaitForCode(timeoutSec * 1000, code, err)) {
-        outErr = err.empty() ? L"로그인이 시간 안에 끝나지 않았다" : Widen(err);
+        // err 는 이 포트에 닿은 누구든 넣을 수 있는 글이다. 서버 글과 같은 상한을 걸고,
+        // 앱이 한 말로 읽히지 않게 어디서 온 글인지 앞에 붙인다 (MessageBox 에 그대로 뜬다).
+        outErr = err.empty() ? L"로그인이 시간 안에 끝나지 않았다"
+                             : L"브라우저가 돌려준 오류: " + CapErrorText(Widen(err));
         return false;
     }
 
     // 코드 -> 토큰. verifier 는 여기서 처음 밖으로 나간다.
+    // code 를 이스케이프 없이 끼워 넣어도 되는 것은 WaitForCode 가 따옴표·역슬래시·
+    // 제어문자가 든 값을 코드로 받지 않기 때문이다 (PlausibleCode).
     std::string body = "{\"auth_code\":\"" + code + "\",\"code_verifier\":\"" + verifier + "\"}";
     std::vector<std::wstring> headers = {
         L"apikey: " + anonKey,
@@ -749,7 +891,9 @@ bool ClaimDeviceToken(const std::wstring& supabaseUrl, const std::wstring& anonK
         return false;
     }
     if (status < 200 || status >= 300) {
-        outErr = PickError(resp, status) + L"  [본문] " + Widen(resp);
+        // 본문은 진단용으로 앞 300바이트만 싣는다 (AuthTest 가 콘솔에 찍는다).
+        // 통째로 붙이면 PickError 에 건 상한이 여기서 도로 풀린다.
+        outErr = PickError(resp, status) + L"  [본문] " + Widen(resp.substr(0, 300));
         return false;
     }
     // text 를 돌려주므로 응답이 따옴표 붙은 문자열 하나다
@@ -783,7 +927,8 @@ bool DeleteDeviceToken(const std::wstring& supabaseUrl, const std::wstring& anon
         return false;
     }
     if (status < 200 || status >= 300) {
-        outErr = PickError(resp, status) + L"  [본문] " + Widen(resp);
+        // 본문은 앞 300바이트만 (ClaimDeviceToken 과 같은 이유)
+        outErr = PickError(resp, status) + L"  [본문] " + Widen(resp.substr(0, 300));
         return false;
     }
     return true;

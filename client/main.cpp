@@ -58,6 +58,14 @@ static constexpr UINT WM_SESSION_ROTATED = WM_USER + 102;
 // 업데이트 작업 스레드가 상태를 바꿨다 (client/update.h). 확인·내려받기가
 // 끝났을 때 오고, 받는 쪽(UpdateTick)이 적용 여부를 정한다.
 static constexpr UINT WM_UPDATE_STATE = WM_USER + 103;
+// 켤 때의 기업 콘텐츠 동기화가 끝났다. LPARAM = new EnterpriseSyncResult*.
+// 동기화는 네트워크를 타고 파일을 받으므로 작업 스레드에서 돌고, 결과를 화면
+// 이미지 경로와 config 에 반영하는 일만 UI 스레드가 한다.
+static constexpr UINT WM_ENTERPRISE_SYNC = WM_USER + 104;
+// 스캔 스레드가 컴패니언 앱의 첫 연결을 봤다. gattSeen 을 config 에 적는 일을 UI
+// 스레드로 넘긴다. 예전에는 스캔 스레드가 직접 Load -> Save 했고, 그것이 "설정
+// 쓰기는 한 스레드에서만" (아래 OnSessionRotated 주석) 의 유일한 예외였다.
+static constexpr UINT WM_GATT_SEEN = WM_USER + 105;
 
 // 기본으로 열리는 간단 창. 만드는 곳과 창 프로시저는 아래 "간단 화면" 절에 있다.
 // 오버레이의 [설정] 이 이 창을 열기 때문에 여기서 미리 알려 둔다.
@@ -123,6 +131,7 @@ static constexpr int OVL_H = 100;
 
 static constexpr int IDT_COUNTDOWN   = 10;
 static constexpr int IDT_UPDATE      = 11;   // 1분마다 UpdateTick
+static constexpr int IDT_AUTHSAVE    = 12;   // 못 쓴 계정 값을 다시 쓴다 (FlushAuthSave)
 static constexpr int WINDOW_W = 820;
 static constexpr int WINDOW_H = 780;
 static constexpr int CHART_H_UI = CHART_HEIGHT;
@@ -259,7 +268,9 @@ static void UpdateOverlayState() {
 
     // Line 1: device name or "SmartScreen"
     if (g_monitoring && !g_targetName.empty()) {
-        swprintf_s(g_ovlLine1, L"\u25A3 %s", g_targetName.c_str());
+        // 기기 이름은 상대 기기가 정한다 (최대 248자). swprintf_s 는 넘치면 잘라 쓰지
+        // 않고 프로세스를 끝낸다 - 이름이 긴 기기를 고르면 검은 화면째 죽는다.
+        _snwprintf_s(g_ovlLine1, _countof(g_ovlLine1), _TRUNCATE, L"\u25A3 %s", g_targetName.c_str());
     } else {
         wcscpy_s(g_ovlLine1, L"\u25A3 SmartScreen");
     }
@@ -549,7 +560,9 @@ static DWORD WINAPI ScanThread(LPVOID) {
         // 앱이 처음 연결되면 config에 기록 → 다음부터는 미연결을 "부재"로 취급
         if (!g_gattSeen && g_bleGatt.EverSubscribed()) {
             g_gattSeen = true;
-            AppConfig sc; LoadAppConfig(sc); sc.gattSeen = true; SaveAppConfig(sc);
+            // 저장은 UI 스레드가 한다 (WM_GATT_SEEN). 여기서 직접 Load -> Save 하면
+            // 그 사이에 UI 스레드가 쓴 값(회전한 refresh 토큰 등)을 낡은 사본으로 덮는다.
+            PostMessage(g_hWnd, WM_GATT_SEEN, 0, 0);
             DbgEvent(L"companion app seen - GATT connection is now required for NEAR");
         }
 
@@ -649,6 +662,65 @@ static DWORD WINAPI LoginThread(LPVOID) {
 }
 
 // ---------------------------------------------------------------------------
+// 계정 값을 config 에 쓰기 (UI 스레드에서만)
+// ---------------------------------------------------------------------------
+// 회전한 refresh 토큰과 로그인 결과는 "썼다" 를 확인해야 하는 값이다. 못 쓰면
+// 지금 실행은 멀쩡하다가 다음 실행에서 로그인이 풀린다.
+//
+// 예전에는 Load 의 결과도 Save 의 결과도 보지 않았고, 로그는 어느 쪽이든
+// "rotated, saved" 였다. 못 쓴 값은 그 자리에서 버려졌다. 지금은 못 쓴 값을
+// 여기 들고 있다가 타이머(IDT_AUTHSAVE)로 다시 쓴다.
+struct AuthSave {
+    bool         pending = false;   // 아래에 아직 못 쓴 것이 있다
+    std::wstring refresh;           // 봉한 refresh 토큰. 빈 값이면 authRefresh 를 덮지 않는다
+    bool         login = false;     // 로그인 결과도 같이 쓴다 (아래 셋)
+    std::wstring userId, email, phoneToken;
+    int          tries = 0;         // 연달아 실패한 횟수 (다시 쓰는 간격을 벌린다)
+};
+static AuthSave g_authSave;
+
+// g_authSave 를 config 에 쓴다. 썼으면 true. 못 썼으면 타이머를 걸어 둔다.
+static bool FlushAuthSave() {
+    if (!g_authSave.pending) return true;
+
+    // Load 가 "파일이 없다" 로 false 인 것은 괜찮다 - 처음 로그인하는 PC 다.
+    // "있는데 못 읽었다" 면 SaveAppConfig 가 거절하고, 그러면 아래에서 다시 건다.
+    AppConfig c; LoadAppConfig(c);
+    if (g_authSave.login) {
+        // 서버 주소/키는 여기서 적지 않는다. 예전에는 로그인할 때 exe 의 기본값을
+        // config.ini 에 적어 넣었고, 한 번 적힌 값은 exe 의 기본값이 바뀌어도 그 PC 에
+        // 남았다. 읽는 쪽은 전부 비어 있으면 기본값을 쓴다 (kDefaultSupabaseUrl 주석).
+        //
+        // 봉인(DPAPI)이 실패해 새 토큰이 없을 때: 저장돼 있던 토큰을 빈 값으로
+        // 덮지 않는다 - 같은 계정이면 아직 살아 있을 수 있다. 다른 계정의 것이면
+        // 지운다. 남겨 두면 다음 실행에서 화면은 새 계정인데 세션은 예전 계정이 된다.
+        if (g_authSave.refresh.empty() && c.authUserId != g_authSave.userId)
+            c.authRefresh.clear();
+        c.authUserId = g_authSave.userId;
+        c.authEmail  = g_authSave.email;
+        if (!g_authSave.phoneToken.empty()) {
+            c.phoneToken  = g_authSave.phoneToken;
+            c.phoneOvfBit = -1;   // 비트는 잠긴 폰을 처음 탐색할 때 배운다
+        }
+    }
+    if (!g_authSave.refresh.empty()) c.authRefresh = g_authSave.refresh;
+
+    if (SaveAppConfig(c)) {
+        g_authSave = AuthSave{};
+        KillTimer(g_hWnd, IDT_AUTHSAVE);
+        return true;
+    }
+    // 30초, 1분, 2분 ... 10분. 파일이 계속 안 써지는 PC(읽기 전용, 권한)에서 로그가
+    // 이것으로 차지 않게 벌린다. 실패 사유는 SaveAppConfig 가 적는다.
+    UINT waitMs = 30000;
+    for (int i = 0; i < g_authSave.tries && waitMs < 600000; i++) waitMs *= 2;
+    if (waitMs > 600000) waitMs = 600000;
+    g_authSave.tries++;
+    SetTimer(g_hWnd, IDT_AUTHSAVE, waitMs, nullptr);
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // PopulateCombo
 //
 // 목록은 원래 "페어링된 기기"였다. 등록된 폰은 페어링할 필요가 없는 것이 요점이라
@@ -682,7 +754,8 @@ static void PopulateCombo() {
     }
     for (size_t i = 0; i < g_paired.size(); i++) {
         wchar_t it[256];
-        swprintf_s(it, L"%s  [%s]%s", g_paired[i].name.c_str(),
+        // 이름은 상대 기기가 정한 값이다 (UpdateOverlayState 의 같은 주석)
+        _snwprintf_s(it, _countof(it), _TRUNCATE, L"%s  [%s]%s", g_paired[i].name.c_str(),
             FmtAddr(g_paired[i].address).c_str(), g_paired[i].connected ? L" *" : L"");
         SendMessageW(g_hCombo, CB_ADDSTRING, 0, (LPARAM)it);
     }
@@ -760,7 +833,9 @@ static void StartMon() {
     // BLE RSSI 스캐너 시작 (기기 이름으로 BLE 광고 매칭)
     // config.ini에 bleDebugLog=1 이면 주변 광고를 ble_scan_log.csv로 기록
     // IRK: exe 옆에 irk.txt(1회 추출 파일)가 있으면 config로 가져온 뒤 삭제
-    if (cfg.bleIrk.empty()) ImportBleIrkFile(cfg, GetExeDir() + L"irk.txt");
+    // config 를 못 읽은 채로는 가져오지 않는다: 가져오면 irk.txt 가 지워지는데,
+    // 못 읽은 구조체는 저장되지 않으므로(SaveAppConfig) 키가 그대로 사라진다.
+    if (cfg.bleIrk.empty() && !cfg.loadFailed) ImportBleIrkFile(cfg, GetExeDir() + L"irk.txt");
     g_bleScanner.SetIrk(cfg.bleIrk);
     g_bleLostMeansFar = cfg.bleLostMeansFar;
     DbgEvent(L"START thr=%d dBm keepAlive=%lus idle=%ds unlockDelay=%ds bleTimeout=%lus lostMeansFar=%d irk=%d",
@@ -1042,12 +1117,13 @@ static void OnResult(ProbeResult* r) {
         :                                        (g_hasIrk ? L"토큰+IRK" : L"토큰");
     if(r->bleAvailable)
         // 초당 수신 건수: 신호가 얼마나 촘촘한지 보면서 임계값을 잡을 수 있다
-        swprintf_s(status,L"  \"%s\"  |  %s  |  RSSI: %d dBm%s  |  %.1f/s  |  Near>=%d dBm  |  ID: %s  |  GATT: %s  |  Idle: %ds",
+        // g_targetName 은 상대 기기가 정한 이름이라 길이를 믿을 수 없다 - _TRUNCATE 로 쓴다
+        _snwprintf_s(status,_countof(status),_TRUNCATE,L"  \"%s\"  |  %s  |  RSSI: %d dBm%s  |  %.1f/s  |  Near>=%d dBm  |  ID: %s  |  GATT: %s  |  Idle: %ds",
             g_targetName.c_str(),StateStr(r->state),r->rssiDbm,r->gatt?L" (GATT)":L"",
             g_bleScanner.RecentPacketRate(),
             r->gatt?g_gattRssiThreshold:g_nearRssiThreshold,idSt,gattSt,g_nCountdown);
     else
-        swprintf_s(status,L"  \"%s\"  |  %s  |  Latency: %lu ms  |  BLE: N/A  |  ID: %s  |  GATT: %s  |  Idle: %ds",
+        _snwprintf_s(status,_countof(status),_TRUNCATE,L"  \"%s\"  |  %s  |  Latency: %lu ms  |  BLE: N/A  |  ID: %s  |  GATT: %s  |  Idle: %ds",
             g_targetName.c_str(),StateStr(r->state),r->latencyMs,idSt,gattSt,g_nCountdown);
     SetWindowTextW(g_hStatus,status);
     UpdateOverlayState();
@@ -1059,6 +1135,84 @@ static void OnResult(ProbeResult* r) {
 static std::wstring TruncPath(const std::wstring& p, int maxLen = 35) {
     if (p.length() <= (size_t)maxLen) return p;
     return L"..." + p.substr(p.length() - maxLen + 3);
+}
+
+// ---------------------------------------------------------------------------
+// 기업 콘텐츠 동기화
+// ---------------------------------------------------------------------------
+// 켤 때의 동기화는 작업 스레드에서 돈다. 예전에는 WM_CREATE 안에서, UI 스레드로,
+// 창이 하나도 뜨기 전에 돌았다. 서버가 느리거나 닿지 않으면 WinHTTP 의 제한
+// 시간만큼 앱이 안 뜬 것처럼 보였고, 자동 시작(자리비움 감지)도 그 뒤로 밀렸다.
+// 구글 로그인과 같은 모양으로, 여기서 돌리고 결과만 창으로 보낸다.
+struct EnterpriseSyncJob {
+    HWND         hWnd;
+    std::wstring url, key, org;
+};
+struct EnterpriseSyncResult {
+    EnterpriseSync outcome = EnterpriseSync::RequestFailed;
+    std::wstring   org;              // 어느 조직으로 돌렸나. 도는 사이에 등록이 바뀔 수 있다
+    std::wstring   center, banner;   // 자리마다 받은 파일. 빈 값 = 그 자리에 쓸 것이 없다
+};
+
+static DWORD WINAPI EnterpriseSyncThread(LPVOID param) {
+    auto* job = (EnterpriseSyncJob*)param;
+    auto* r = new EnterpriseSyncResult{};
+    r->org = job->org;
+    r->outcome = SyncEnterpriseContentEx(job->url, job->key, job->org, r->center, r->banner);
+    // g_hWnd 가 아니라 받은 핸들로 보낸다. 이 스레드는 WM_CREATE 에서 시작하는데
+    // 그때 g_hWnd 는 아직 비어 있다 (CreateWindowExW 가 돌아와야 채워진다).
+    if (!PostMessageW(job->hWnd, WM_ENTERPRISE_SYNC, 0, (LPARAM)r)) delete r;   // 창이 이미 닫혔다
+    delete job;
+    return 0;
+}
+
+// 동기화 결과를 화면 이미지 경로에 반영한다. UI 스레드에서만 부른다 (config 를 쓴다).
+// 바뀐 것이 있으면 true.
+//
+// 경로의 주인: enterprise_content 폴더 안을 가리키는 경로는 동기화의 것이다. 서버에
+// 물어본 결과가 나올 때마다 그 자리의 새 경로로 바꾸고, 서버에 그 자리 것이 없으면
+// 비운다. 사용자가 다른 곳에서 고른 그림은 건드리지 않고, 빈 자리는 채운다.
+//
+// 예전에는 "비어 있을 때만 채운다" 였다. 그런데 한 번 채운 경로는 config.ini 에
+// 저장되므로(StartMon) 다음 실행부터는 비어 있는 적이 없었고, 관리자가 콘텐츠를
+// 바꾸거나 송출을 멈춰도 PC 는 처음 받은 파일을 계속 띄웠다.
+//
+// 요청이 실패했으면 아무것도 건드리지 않는다 - 오프라인인 PC 는 갖고 있던 것을
+// 계속 보여 준다.
+static bool ApplyEnterpriseSync(EnterpriseSync outcome,
+                                const std::wstring& center, const std::wstring& banner) {
+    if (outcome == EnterpriseSync::RequestFailed) return false;
+
+    bool changed = false;
+    auto apply = [&changed](std::wstring& cur, const std::wstring& synced, HWND hLabel) {
+        if (!cur.empty() && !IsEnterpriseContentPath(cur)) return;   // 사용자가 고른 그림
+        if (cur == synced) return;
+        cur = synced;
+        std::wstring text = synced.empty() ? std::wstring(L"(기본)") : TruncPath(synced);
+        if (hLabel) SetWindowTextW(hLabel, text.c_str());
+        changed = true;
+    };
+    apply(g_centerImagePath, center, g_hLabelCenter);
+    apply(g_bannerImagePath, banner, g_hLabelBanner);
+    if (!changed) return false;
+
+    // 올려 둔 그림을 버린다 (LoadBlackScreenImages 는 이미 올린 것이 있으면 다시
+    // 읽지 않는다). 단, 잠금 화면이 떠 있는 동안에는 건드리지 않는다 - 동기화가 작업
+    // 스레드로 가면서 결과가 잠금 중에 도착할 수 있게 됐는데, 영상은 그 창의
+    // WM_CREATE 에서만 시작하므로 여기서 그림만 버리면 (새 경로가 영상이거나 비었을
+    // 때) 다음에 그려질 때 그림도 영상도 없이 개발용 자리표시자가 나온다. 지금 잠금은
+    // 보여 주던 것을 그대로 보여 주고, 풀릴 때 DeactivateBlackScreen 이 버린다.
+    if (!g_bBlackActive) FreeBlackScreenImages();
+
+    // StartMon 이 저장하는 것과 같은 두 값이다. 여기서도 저장해야 감시를 다시
+    // 시작하지 않아도 다음 실행에 남는다.
+    AppConfig c;
+    if (LoadAppConfig(c)) {
+        c.centerImagePath = g_centerImagePath;
+        c.bannerImagePath = g_bannerImagePath;
+        SaveAppConfig(c);
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1352,17 +1506,23 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         //
         // 결과를 기록한다. 예전에는 조용히 실패했고, 서버가 몇 달간 닿지 않는
         // 동안에도 로그에 아무 흔적이 없었다 - 고장을 알 방법이 없었다.
-        if (cfg.enterpriseRegistered && !cfg.orgId.empty() && !cfg.serverUrl.empty() && !cfg.anonKey.empty()) {
-            bool synced = SyncEnterpriseContent(cfg.serverUrl, cfg.anonKey, cfg.orgId);
-            if (synced) {
-                auto cp = GetEnterpriseCenterPath();
-                auto bp = GetEnterpriseBannerPath();
-                if (!cp.empty() && g_centerImagePath.empty()) g_centerImagePath = cp;
-                if (!bp.empty() && g_bannerImagePath.empty()) g_bannerImagePath = bp;
-                DbgEvent(L"enterprise sync: OK (center=%d banner=%d)",
-                         cp.empty() ? 0 : 1, bp.empty() ? 0 : 1);
+        //
+        // 여기서는 시작만 시킨다. 결과는 WM_ENTERPRISE_SYNC 로 오고 기록도 거기서
+        // 한다 (위 "기업 콘텐츠 동기화" 참고). 그때까지는 config 에 저장돼 있던
+        // 경로로 뜬다 - 위에서 이미 g_centerImagePath / g_bannerImagePath 에 넣었다.
+        if (cfg.enterpriseRegistered && !cfg.orgId.empty()) {
+            // config 에 주소/키가 없으면 exe 의 기본값으로 묻는다 (kDefaultSupabaseUrl 주석).
+            // 예전에는 셋이 다 config 에 있어야 돌았고, 그래서 등록할 때 기본값을 config.ini 에
+            // 적어 넣었다 - 한 번 적힌 값은 exe 의 기본값이 바뀌어도 그 PC 에 남는다.
+            std::wstring eurl = cfg.serverUrl.empty() ? kDefaultSupabaseUrl : cfg.serverUrl;
+            std::wstring ekey = cfg.anonKey.empty()   ? kDefaultAnonKey     : cfg.anonKey;
+            auto* job = new EnterpriseSyncJob{ hWnd, eurl, ekey, cfg.orgId };
+            HANDLE hSync = CreateThread(nullptr, 0, EnterpriseSyncThread, job, 0, nullptr);
+            if (hSync) {
+                CloseHandle(hSync);
             } else {
-                DbgEvent(L"enterprise sync: FAILED (org=%s)", cfg.orgId.c_str());
+                delete job;
+                DbgEvent(L"enterprise sync: FAILED - could not start the worker thread");
             }
         } else if (cfg.enterpriseRegistered) {
             DbgEvent(L"enterprise sync: skipped - 설정이 비어 있다");
@@ -1387,6 +1547,12 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_TIMER:
         if (wParam == IDT_UPDATE) { UpdateTick(false); break; }
+        if (wParam == IDT_AUTHSAVE) {
+            // 못 쓴 계정 값을 다시 쓴다. 실패하면 FlushAuthSave 가 간격을 벌려 다시 건다.
+            if (!g_authSave.pending) { KillTimer(hWnd, IDT_AUTHSAVE); break; }
+            if (FlushAuthSave()) DbgEvent(L"session: account values saved on retry");
+            break;
+        }
         if (wParam == IDT_COUNTDOWN && g_monitoring) {
             // 프로버가 잠긴 폰을 찾아내면서 overflow 비트를 새로 배웠으면 저장한다.
             // 다음 실행 때 후보를 훨씬 빨리 좁힌다 (없어도 동작은 한다).
@@ -1896,7 +2062,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                     CreateWindowExW(0, L"BUTTON",
                         L"\xC5F0\xACB0 \xBC0F \xB3D9\xAE30\xD654",  // 연결 및 동기화
                         WS_CHILD | WS_VISIBLE, 20, 215, 140, 36, hDlg, (HMENU)5010, nullptr, nullptr);
-                    HWND hStatus2 = CreateWindowExW(0, L"STATIC", L"",
+                    // 이미 등록된 PC 에서는 돌아가는 길을 여기에 적어 둔다. 단추가 하나뿐이라
+                    // 적어 두지 않으면 해제할 수 있다는 것을 알 방법이 없다.
+                    HWND hStatus2 = CreateWindowExW(0, L"STATIC",
+                        ecfg.enterpriseRegistered ? L"해제: 칸을 비우고 누르기" : L"",
                         WS_CHILD | WS_VISIBLE, 170, 223, 250, 20, hDlg, (HMENU)5011, nullptr, nullptr);
 
                     // Help link
@@ -1919,34 +2088,176 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
                             wchar_t o[128];
                             GetWindowTextW(ho, o, 128);
-
-                            if (!wcslen(o)) {
-                                SetWindowTextW(hs, L"\xC870\xC9C1 ID\xB97C \xC785\xB825\xD558\xC138\xC694.");  // 조직 ID를 입력하세요.
-                                return 0;
-                            }
+                            // 붙여 넣은 값에는 앞뒤 공백이나 줄바꿈이 딸려 온다.
+                            std::wstring typed = o;
+                            auto isSp = [](wchar_t ch) {
+                                return ch == L' ' || ch == L'\t' || ch == L'\r' || ch == L'\n';
+                            };
+                            while (!typed.empty() && isSp(typed.back())) typed.pop_back();
+                            while (!typed.empty() && isSp(typed.front())) typed.erase(typed.begin());
 
                             AppConfig sc;
                             LoadAppConfig(sc);
-                            sc.serverUrl = L"https://vnonoschrzbgvyeduosm.supabase.co";
-                            sc.anonKey = L"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZub25vc2NocnpiZ3Z5ZWR1b3NtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU2NzkyNjQsImV4cCI6MjA5MTI1NTI2NH0.KqkmH7UtcR4ihFDMmAMfWRH0O2P2s__Jglzr5QWIzfc";
-                            sc.orgId = o;
-                            sc.enterpriseRegistered = true;
-                            SaveAppConfig(sc);
+
+                            // ---- 돌아가는 길: 빈 칸 + 같은 단추 = 등록 해제 ----
+                            // 예전에는 enterpriseRegistered 를 끄는 코드가 어디에도 없었다.
+                            // 한 번 눌러 본 개인 사용자는 config.ini 를 손으로 고치기 전에는
+                            // 기업 PC 로 남았고, 그 PC 의 업데이트는 없는 관리자의 승인을
+                            // 영영 기다렸다.
+                            if (typed.empty()) {
+                                if (!sc.enterpriseRegistered) {
+                                    SetWindowTextW(hs, L"\xC870\xC9C1 ID\xB97C \xC785\xB825\xD558\xC138\xC694.");  // 조직 ID를 입력하세요.
+                                    return 0;
+                                }
+                                if (MessageBoxW(hw2,
+                                        L"조직 ID 칸이 비어 있어요.\n\n"
+                                        L"이 PC 의 기업 등록을 해제할까요?\n"
+                                        L"잠금 화면에서 조직 콘텐츠가 빠지고, 저장된 조직 ID 도 지워져요.",
+                                        L"기업 등록 해제",
+                                        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
+                                    return 0;
+
+                                LoadAppConfig(sc);   // 묻는 동안 다른 저장이 있었을 수 있다
+                                sc.enterpriseRegistered = false;
+                                sc.orgId.clear();
+                                if (IsEnterpriseContentPath(sc.centerImagePath)) sc.centerImagePath.clear();
+                                if (IsEnterpriseContentPath(sc.bannerImagePath)) sc.bannerImagePath.clear();
+                                // 저장이 먼저다. 못 썼으면 해제된 것이 아니다 - 다음 실행에 다시
+                                // 기업 PC 로 뜬다. 화면을 바꾸기 전에 그렇게 말하고 그만둔다.
+                                if (!SaveAppConfig(sc)) {
+                                    DbgEvent(L"enterprise: unregister NOT saved - nothing changed");
+                                    SetWindowTextW(hs, L"설정을 저장하지 못했어요");
+                                    return 0;
+                                }
+                                // 동기화가 넣어 둔 경로만 지운다. 사용자가 고른 그림은 그대로다.
+                                bool dropped = false;
+                                if (IsEnterpriseContentPath(g_centerImagePath)) {
+                                    g_centerImagePath.clear();
+                                    SetWindowTextW(g_hLabelCenter, L"(기본)");
+                                    dropped = true;
+                                }
+                                if (IsEnterpriseContentPath(g_bannerImagePath)) {
+                                    g_bannerImagePath.clear();
+                                    SetWindowTextW(g_hLabelBanner, L"(기본)");
+                                    dropped = true;
+                                }
+                                if (dropped && !g_bBlackActive) FreeBlackScreenImages();
+                                DbgEvent(L"enterprise: unregistered by the user");
+                                SetWindowTextW(hs, L"등록을 해제했어요");
+                                // UpdateInit 은 켤 때 한 번 조직 id 를 받는다 (wWinMain). 그래서
+                                // 이번 실행의 업데이트 확인은 아직 그 조직의 승인 목록을 본다.
+                                if (UpdateEnabled())
+                                    MessageBoxW(hw2,
+                                        L"기업 등록을 해제했어요.\n\n"
+                                        L"프로그램 업데이트는 SmartScreen 을 다시 켠 뒤부터\n"
+                                        L"조직의 승인을 기다리지 않고 받아요.",
+                                        L"기업 등록 해제", MB_OK | MB_ICONINFORMATION);
+                                return 0;
+                            }
+
+                            // ---- 등록 ----
+                            // 조직 id 는 URL 에 그대로 들어가는 값이다. uuid 가 아니면 서버에
+                            // 묻지도 저장하지도 않는다 (대시보드의 다른 복사 단추가 주는
+                            // API URL 을 붙여 넣는 일이 실제로 생긴다).
+                            std::wstring org;
+                            if (!NormalizeOrgId(typed, org)) {
+                                SetWindowTextW(hs, L"36자 조직 ID 가 아니에요");
+                                return 0;
+                            }
+
+                            // config 에 값이 있으면 그쪽이 이긴다 (kDefaultSupabaseUrl 주석).
+                            // 예전에는 여기서 기본값을 다시 적어 넣어 직접 바꿔 둔 서버 주소를
+                            // 덮어썼다.
+                            std::wstring url = sc.serverUrl.empty() ? kDefaultSupabaseUrl : sc.serverUrl;
+                            std::wstring key = sc.anonKey.empty()   ? kDefaultAnonKey     : sc.anonKey;
 
                             SetWindowTextW(hs, L"\xC5F0\xACB0 \xC911...");  // 연결 중...
                             UpdateWindow(hw2);
 
-                            bool ok = SyncEnterpriseContent(sc.serverUrl, sc.anonKey, sc.orgId);
-                            if (ok) {
-                                auto cp = GetEnterpriseCenterPath();
-                                auto bp = GetEnterpriseBannerPath();
-                                if (!cp.empty()) g_centerImagePath = cp;
-                                if (!bp.empty()) g_bannerImagePath = bp;
-                                FreeBlackScreenImages();
-                                SetWindowTextW(hs, L"\xC5F0\xACB0 \xC644\xB8CC!");  // 연결 완료!
-                            } else {
-                                SetWindowTextW(hs, L"\xC5F0\xACB0 \xC2E4\xD328 - ID\xB97C \xD655\xC778\xD558\xC138\xC694");  // 연결 실패 - ID를 확인하세요
+                            // 예전에는 서버에 묻기 **전에** 저장했고 실패해도 되돌리지 않았다.
+                            // 오타 하나로 없는 조직에 등록된 채 남았고, 그 전에 맞게 들어 있던
+                            // 조직 id 도 같이 사라졌다. 지금은 확인이 끝난 뒤에만 저장한다.
+                            //
+                            // -1 (알 수 없다) 은 계속 간다: org_exists 가 아직 서버에 없을 수
+                            // 있고, 서버에 닿지 못한 것이라면 바로 아래 동기화가 가려 준다.
+                            int exists = CheckOrgExists(url, key, org);
+                            if (exists == 0) {
+                                DbgEvent(L"enterprise: register refused - no such org (%s)", org.c_str());
+                                SetWindowTextW(hs, L"그런 조직이 없어요");
+                                return 0;
                             }
+
+                            std::wstring cp, bp;
+                            EnterpriseSync outcome = SyncEnterpriseContentEx(url, key, org, cp, bp);
+                            if (outcome == EnterpriseSync::RequestFailed) {
+                                DbgEvent(L"enterprise: register failed - server not reached (%s)", org.c_str());
+                                SetWindowTextW(hs, L"서버에 닿지 못했어요");
+                                return 0;
+                            }
+
+                            // 조직이 있는지 확인하지 못했고 (org_exists 가 서버에 아직 없거나
+                            // 그 요청만 실패했다) 받을 콘텐츠도 없다면, 이 id 가 맞다는 근거가
+                            // 하나도 없다. 그 상태로 이미 등록된 다른 조직을 덮어쓰면 오타
+                            // 하나로 맞는 id 가 사라지고 화면의 콘텐츠도 빠진다. 묻고 나서 한다.
+                            if (exists < 0 && outcome == EnterpriseSync::NoContent) {
+                                AppConfig cur;
+                                LoadAppConfig(cur);
+                                std::wstring curOrg;
+                                if (cur.enterpriseRegistered && NormalizeOrgId(cur.orgId, curOrg) &&
+                                    curOrg != org &&
+                                    MessageBoxW(hw2,
+                                        L"이 ID 의 조직이 실제로 있는지 서버에서 확인하지 못했고, 받을 콘텐츠도 없어요.\n\n"
+                                        L"지금 등록된 조직을 이 ID 로 바꿀까요?",
+                                        L"기업 등록", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+                                    SetWindowTextW(hs, L"바꾸지 않았어요");
+                                    return 0;
+                                }
+                            }
+
+                            AppConfig nc;
+                            LoadAppConfig(nc);       // 동기화하는 동안 다른 저장이 있었을 수 있다
+                            const bool orgChanged = !nc.enterpriseRegistered ||
+                                                    _wcsicmp(nc.orgId.c_str(), org.c_str()) != 0;
+                            nc.orgId = org;
+                            nc.enterpriseRegistered = true;
+                            // 못 썼으면 등록된 것이 아니다 - 다음 실행에 남지 않는다.
+                            // "연결 완료" 라고 말하기 전에 그만둔다.
+                            if (!SaveAppConfig(nc)) {
+                                DbgEvent(L"enterprise: register NOT saved (%s)", org.c_str());
+                                SetWindowTextW(hs, L"설정을 저장하지 못했어요");
+                                return 0;
+                            }
+                            SetWindowTextW(ho, org.c_str());   // 저장된 그대로 (다듬은 값) 보여 준다
+
+                            ApplyEnterpriseSync(outcome, cp, bp);
+                            // 받은 것이 있는데 그 자리가 다른 경로면, 사용자가 고른 그림이 남은 것이다.
+                            const bool keptOwn = (!cp.empty() && g_centerImagePath != cp) ||
+                                                 (!bp.empty() && g_bannerImagePath != bp);
+                            const bool found = (outcome == EnterpriseSync::Ready);
+                            DbgEvent(L"enterprise: registered org=%s (org_exists=%d, center=%d banner=%d)",
+                                     org.c_str(), exists, cp.empty() ? 0 : 1, bp.empty() ? 0 : 1);
+
+                            SetWindowTextW(hs, found ? L"연결 완료 - 콘텐츠 받음"
+                                                     : L"연결 완료 - 콘텐츠 없음");
+
+                            std::wstring more;
+                            if (!found) {
+                                more += L"이 조직에 송출 중인 콘텐츠가 아직 없어요.\n"
+                                        L"대시보드에서 올리고 [송출 중] 으로 바꾼 뒤 이 단추를 다시 누르세요.\n\n";
+                                if (exists < 0)
+                                    more += L"조직이 실제로 있는지는 서버에서 확인하지 못했어요.\n"
+                                            L"ID 를 잘못 넣었다면 콘텐츠가 오지 않아요.\n\n";
+                            }
+                            if (keptOwn)
+                                more += L"직접 고른 그림이 있는 자리는 그 그림을 그대로 써요.\n\n";
+                            // UpdateInit 은 켤 때 한 번 조직 id 를 받는다 (wWinMain). 이번
+                            // 실행의 업데이트 확인은 등록하기 전 그대로다.
+                            if (orgChanged && UpdateEnabled())
+                                more += L"프로그램 업데이트는 SmartScreen 을 다시 켠 뒤부터\n"
+                                        L"이 조직 관리자의 승인을 따라요.\n";
+                            if (!more.empty())
+                                MessageBoxW(hw2, (L"연결 완료.\n\n" + more).c_str(),
+                                            L"기업 등록", MB_OK | MB_ICONINFORMATION);
                             return 0;
                         }
                         if (msg2 == WM_COMMAND && LOWORD(wp2) == 5025) {
@@ -2000,6 +2311,43 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         UpdateTick(true);
         break;
 
+    case WM_ENTERPRISE_SYNC: {
+        auto* r = (EnterpriseSyncResult*)lParam;
+        // 도는 사이에 등록이 바뀌었으면 (해제했거나 다른 조직으로 다시 등록) 이
+        // 결과는 지금의 조직 것이 아니다. 반영하면 방금 비운 경로를 되살린다.
+        AppConfig c;
+        bool current = LoadAppConfig(c) && c.enterpriseRegistered &&
+                       _wcsicmp(c.orgId.c_str(), r->org.c_str()) == 0;
+        if (!current) {
+            DbgEvent(L"enterprise sync: result dropped - registration changed while it ran");
+        } else if (r->outcome == EnterpriseSync::RequestFailed) {
+            // 아무것도 건드리지 않는다. 오프라인인 PC 는 갖고 있던 것을 계속 보여 준다.
+            DbgEvent(L"enterprise sync: FAILED (org=%.40s) - keeping what this PC already shows",
+                     r->org.c_str());
+        } else {
+            bool changed = ApplyEnterpriseSync(r->outcome, r->center, r->banner);
+            DbgEvent(L"enterprise sync: %s (center=%d banner=%d)%s",
+                     r->outcome == EnterpriseSync::Ready ? L"OK" : L"no active content",
+                     r->center.empty() ? 0 : 1, r->banner.empty() ? 0 : 1,
+                     changed ? L" - image paths updated" : L"");
+        }
+        delete r;
+        break;
+    }
+
+    case WM_GATT_SEEN: {
+        // 스캔 스레드 대신 여기서 쓴다 (WM_GATT_SEEN 주석). 못 써도 다시 걸지 않는다 -
+        // 다음에 감시를 시작할 때 g_gattSeen 이 config 에서 다시 읽히고, 앱이 붙으면
+        // 이 메시지가 또 온다.
+        AppConfig sc; LoadAppConfig(sc);
+        if (!sc.gattSeen) {
+            sc.gattSeen = true;
+            if (!SaveAppConfig(sc))
+                DbgEvent(L"companion app seen - gattSeen NOT saved (it will be set again on a later run)");
+        }
+        break;
+    }
+
     case WM_SESSION_ROTATED: {
         // 설정 쓰기는 이 스레드에서만 한다 (OnSessionRotated 주석 참고).
         std::wstring sealed;
@@ -2008,10 +2356,16 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             sealed.swap(g_rotatedSealed);
         }
         if (!sealed.empty()) {
-            AppConfig c; LoadAppConfig(c);
-            c.authRefresh = sealed;
-            SaveAppConfig(c);
-            DbgEvent(L"session: refresh token rotated, saved");
+            // 아직 못 쓴 로그인 결과가 있으면 같이 나간다 (g_authSave 의 다른 칸은 그대로 둔다).
+            g_authSave.refresh = sealed;
+            g_authSave.pending = true;
+            // 예전에는 결과를 보지 않고 "rotated, saved" 라고 적었다. 못 썼는데도
+            // 로그는 매번 성공이었다.
+            if (FlushAuthSave())
+                DbgEvent(L"session: refresh token rotated, saved");
+            else
+                DbgEvent(L"session: refresh token rotated but NOT saved - will retry "
+                         L"(if the app exits first, the next start may need a new login)");
         }
         break;
     }
@@ -2028,19 +2382,25 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             delete r; break;
         }
 
-        AppConfig c; LoadAppConfig(c);
-        if (c.serverUrl.empty()) c.serverUrl = kDefaultSupabaseUrl;
-        if (c.anonKey.empty())   c.anonKey   = kDefaultAnonKey;
-        c.authRefresh = r->refresh;
-        c.authUserId  = r->userId;
-        c.authEmail   = r->email;
-        if (!r->phoneToken.empty()) {
-            c.phoneToken  = r->phoneToken;
-            c.phoneOvfBit = -1;   // 비트는 잠긴 폰을 처음 탐색할 때 배운다
-        }
-        SaveAppConfig(c);
-        DbgEvent(L"google login: %s (phone token: %s)", r->email.c_str(),
-                 r->phoneToken.empty() ? L"none yet" : L"received");
+        // 봉인(DPAPI)이 실패했으면 r->refresh 가 비어 있다 (LoginThread 의 ProtectSecret).
+        // 예전에는 그 빈 값을 authRefresh 에 그대로 써서 저장돼 있던 토큰까지 지웠고,
+        // 로그에는 아무것도 남지 않았다. 지금은 덮지 않는다 (FlushAuthSave).
+        if (r->refresh.empty())
+            DbgEvent(L"google login: could not seal the refresh token (DPAPI) - "
+                     L"this login will not survive a restart");
+
+        // 새 로그인이 앞의 것을 대신한다. 못 쓴 채 남아 있던 예전 세션의 값은 버린다.
+        g_authSave = AuthSave{};
+        g_authSave.pending    = true;
+        g_authSave.login      = true;
+        g_authSave.refresh    = r->refresh;
+        g_authSave.userId     = r->userId;
+        g_authSave.email      = r->email;
+        g_authSave.phoneToken = r->phoneToken;
+        bool saved = FlushAuthSave();
+        DbgEvent(L"google login: %s (phone token: %s)%s", r->email.c_str(),
+                 r->phoneToken.empty() ? L"none yet" : L"received",
+                 saved ? L"" : L" - NOT saved to config.ini yet, will retry");
 
         // 돌고 있는 스캐너에도 알려 준다. 계정 등록은 블루투스 등록과 달리
         // 감시를 멈추지 않고 할 수 있어서 StartMon 을 다시 지나지 않는다 -
@@ -2048,7 +2408,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         // 토큰이 있고, 스캐너는 끝까지 폰을 확인하지 못한다.
         if (!r->phoneToken.empty()) {
             g_hasToken = true;
-            g_bleScanner.SetIdentity(c.phoneToken, c.phoneOvfBit,
+            // 비트는 -1: FlushAuthSave 가 config 에 쓰는 값과 같다
+            g_bleScanner.SetIdentity(r->phoneToken, -1,
                                      g_nearRssiThreshold - 10);
         }
 
@@ -2127,6 +2488,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         DestroyWindow(hWnd);break;
 
     case WM_DESTROY:
+        // 못 쓴 계정 값이 남아 있으면 나가기 전에 한 번 더 써 본다. 타이머는 창과
+        // 함께 사라지므로 이것이 마지막 기회다.
+        if (g_authSave.pending && !FlushAuthSave())
+            DbgEvent(L"session: account values still NOT saved at exit - the next start may need a new login");
         if(g_hFont)DeleteObject(g_hFont);if(g_hFontBold)DeleteObject(g_hFontBold);
         if(g_hFontBig)DeleteObject(g_hFontBig);if(g_hFontSmall)DeleteObject(g_hFontSmall);
         if(g_hFontSection)DeleteObject(g_hFontSection);
@@ -2301,10 +2666,13 @@ static void SimpleRefresh() {
     wchar_t buf[192];
     if (!c.phoneToken.empty()) {
         std::wstring head = c.phoneToken.substr(0, (std::min)((size_t)8, c.phoneToken.size()));
+        // 메일 주소는 로그인 응답에서 온 값이 config.ini 에 그대로 들어간 것이다.
+        // swprintf_s 는 넘치면 프로세스를 끝내는데, 이 함수는 1초마다 그리고 켤 때
+        // 메시지 루프보다 먼저 불린다 - 183자 넘는 주소 하나로 앱이 다시는 안 뜬다.
         if (!c.authEmail.empty())
-            swprintf_s(buf, L"%s 계정으로 등록됨", c.authEmail.c_str());
+            _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%s 계정으로 등록됨", c.authEmail.c_str());
         else
-            swprintf_s(buf, L"등록됨 (토큰 %s)", head.c_str());
+            _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"등록됨 (토큰 %s)", head.c_str());
     } else {
         wcscpy_s(buf, L"아직 등록하지 않았어요");
     }
@@ -2330,9 +2698,11 @@ static void SimpleRefresh() {
         } else if (cs.lastMsg.empty()) {
             swprintf_s(cb, L"기다리는 중  ·  보냄 %d / 받음 %d", cs.sent, cs.received);
         } else {
-            swprintf_s(cb, L"%s%s  ·  보냄 %d / 받음 %d",
-                       cs.lastOk ? L"" : L"안 됨: ", cs.lastMsg.c_str(),
-                       cs.sent, cs.received);
+            // lastMsg 에는 서버가 준 오류 문구(세션 갱신 실패)가 그대로 실릴 수 있다.
+            // 아래 업데이트 띠와 같은 이유로 _TRUNCATE 로 쓴다 - 이 줄만 빠져 있었다.
+            _snwprintf_s(cb, _countof(cb), _TRUNCATE, L"%s%s  ·  보냄 %d / 받음 %d",
+                         cs.lastOk ? L"" : L"안 됨: ", cs.lastMsg.c_str(),
+                         cs.sent, cs.received);
         }
         SetWindowTextW(g_hSimpleClipMsg, cb);
     }
@@ -3261,8 +3631,6 @@ int WINAPI wWinMain(HINSTANCE hI, HINSTANCE, LPWSTR, int nS) {
         std::wstring serr;
         if (SessionStart(surl, skey, chk.authRefresh, serr)) {
             DbgEvent(L"session: restored (%s)", SessionEmail().c_str());
-            if (chk.clipSync)
-                ClipSyncStart(surl, skey, chk.clipMaxKB * 1024);
         } else if (!serr.empty()) {
             // 로그인한 적은 있는데 되살리지 못했다. 앱을 막을 일은 아니다 -
             // 자리비움 감지는 계정과 무관하게 돌아간다.
@@ -3270,6 +3638,19 @@ int WINAPI wWinMain(HINSTANCE hI, HINSTANCE, LPWSTR, int nS) {
         } else {
             DbgEvent(L"session: no account yet");
         }
+
+        // 클립보드 동기화는 "세션을 되살렸는가" 가 아니라 "계정이 있는가" 로 켠다.
+        // 예전에는 SessionStart 가 true 일 때만 켰다. 켜는 순간 네트워크가 아직 없거나
+        // 서버가 잠깐 5xx 를 주면 그 실행 내내 꺼진 채였고, 타일은 오류도 없이
+        // "꺼져 있어요" 였다. 일꾼은 세션이 없으면 30초마다 다시 물어보게 돼 있으므로
+        // (clipsync.cpp WorkerThread) 띄워 두기만 하면 네트워크가 돌아올 때 이어진다.
+        //
+        // refresh 토큰이 정말로 죽은 경우(폐기)에도 이 길로 온다. 그때는 일꾼이 30초마다
+        // 갱신을 다시 시도하고 타일에 "안 됨: <사유>" 가 뜬다 - 말없이 꺼져 있는 것보다
+        // 낫다. 다른 PC 의 config 를 복사해 와 봉인이 안 풀리는 경우는 계정이 없는
+        // 것으로 남으므로(SessionStart) 여기서 켜지 않는다.
+        if (chk.clipSync && SessionHasAccount())
+            ClipSyncStart(surl, skey, chk.clipMaxKB * 1024);
     }
 
     // ---- 프로그램 업데이트 (client/update.h) --------------------------------

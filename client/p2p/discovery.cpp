@@ -1,4 +1,14 @@
 // discovery.cpp - P2P peer discovery via UDP broadcast on LAN
+//
+// **빌드에 들어가지 않는다** (CMakeLists.txt 에서 뺐다). 부르는 곳이 한 번도 없었다
+// (StartP2PDiscovery 를 부르는 코드가 저장소 어디에도 없다). CMakeLists.txt 에 다시
+// 넣기 전에 넷이 전부 있어야 한다: 내주는 파일 이름을 매니페스트와 대조하기, 조직
+// 거르기, 받은 파일의 SHA-256 을 file_hash 와 비교하기, send() 의 반환값 보기.
+// 자세한 것은 transfer.cpp 머리에 있다. 이 파일의 몫은 조직 거르기다.
+//
+//  - 받은 알림의 조직을 s_orgId 와 비교하지 않고 전부 피어로 넣는다 (DiscoveryThread)
+//  - 피어의 주소로 알림 안에 적힌 IP 를 믿는다. 보낸 쪽 주소(recvfrom 의 from)를
+//    써야 한다 - 적힌 값은 보내는 쪽이 마음대로 쓴다
 #include "discovery.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>

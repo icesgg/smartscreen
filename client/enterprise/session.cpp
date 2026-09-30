@@ -25,9 +25,36 @@ std::wstring      s_pendingSealed;
 // 401 로 돌아오고, 그 401 은 "권한이 없다" 와 구분되지 않는다.
 constexpr long long kRenewAheadSec = 300;
 
+// access 토큰의 만료를 GetTickCount64 로도 적어 둔다. s_mx 가 지킨다.
+//
+// expiresAtUnix 는 받은 순간의 벽시계 + expires_in 이다 (auth.cpp 의 ParseSession).
+// 그 뒤에 시계가 뒤로 맞춰지면(빨리 가던 시계를 시간 동기화가 고친다, 사람이
+// 손으로 바꾼다) 벽시계로는 만료가 그만큼 멀어 보인다. 토큰은 실제로 한 시간
+// 뒤에 죽는데 갱신은 미뤄지고, 그 사이의 요청은 전부 401 이 된다. 틱은 시계를
+// 바꿔도 그대로 흐르고, 절전 중에도 센다 (윈도 8 부터).
+//
+// 벽시계 쪽 판단도 남겨 둔다. 둘 중 하나라도 "곧 만료" 라고 하면 갱신한다 -
+// 일찍 갱신하는 것은 요청 한 번이고, 늦게 갱신하는 것은 401 이다.
+ULONGLONG         s_expiresTick = 0;
+
 bool ExpiringSoon(const AuthSession& s) {
     if (s.accessToken.empty()) return true;
-    return (long long)s.expiresAtUnix - (long long)_time64(nullptr) < kRenewAheadSec;
+    if ((long long)s.expiresAtUnix - (long long)_time64(nullptr) < kRenewAheadSec) return true;
+    return GetTickCount64() + (ULONGLONG)kRenewAheadSec * 1000ULL >= s_expiresTick;
+}
+
+// s_mx 를 잡은 채로, s_session 을 새 세션으로 바꾼 바로 다음에 부른다.
+// 남은 수명은 방금 계산된 expiresAtUnix 에서 도로 꺼낸다 - 받은 직후라 그 사이에
+// 시계가 움직였을 틈이 없다. AuthSession 에 칸을 더하지 않으려는 것이다 (auth.h 는
+// 다른 곳에서도 쓴다).
+void StampDeadlineLocked() {
+    long long left = (long long)s_session.expiresAtUnix - (long long)_time64(nullptr);
+    if (left < 0) left = 0;
+    // 서버가 터무니없는 expires_in 을 줘도 곱셈이 넘치지 않게. 그보다 긴 토큰은
+    // 30일에 한 번 일찍 갱신될 뿐이다.
+    const long long kMaxLeftSec = 30LL * 24 * 3600;
+    if (left > kMaxLeftSec) left = kMaxLeftSec;
+    s_expiresTick = GetTickCount64() + (ULONGLONG)left * 1000ULL;
 }
 
 // s_mx 를 잡은 채로 부른다. 네트워크를 타므로 수백 ms 가 걸린다.
@@ -48,6 +75,7 @@ bool RenewLocked(std::wstring& outErr) {
 
     bool rotated = (fresh.refreshToken != s_session.refreshToken);
     s_session = fresh;
+    StampDeadlineLocked();
 
     if (rotated) {
         std::wstring sealed;
@@ -92,6 +120,7 @@ bool SessionStart(const std::wstring& supabaseUrl, const std::wstring& anonKey,
         s_url = supabaseUrl;
         s_key = anonKey;
         s_session = AuthSession{};
+        s_expiresTick = 0;
         s_hasAccount = false;
 
         if (sealedRefresh.empty()) {
@@ -119,6 +148,7 @@ void SessionAdopt(const AuthSession& s) {
     std::lock_guard<std::mutex> lock(s_mx);
     s_session = s;
     s_hasAccount = !s.refreshToken.empty();
+    StampDeadlineLocked();
 }
 
 bool SessionToken(std::wstring& outAccess, std::wstring& outErr) {
@@ -136,6 +166,19 @@ bool SessionToken(std::wstring& outAccess, std::wstring& outErr) {
     }
     FireRotatedIfPending();
     return ok;
+}
+
+void SessionInvalidate() {
+    std::lock_guard<std::mutex> lock(s_mx);
+    // access 토큰만 버린다. 빈 토큰은 ExpiringSoon 이 "만료" 로 읽으므로 다음
+    // SessionToken 이 RenewLocked 로 간다. refresh 토큰과 s_hasAccount 는 그대로
+    // 둔다 - SessionClear 를 쓰면 로그인한 사람에게 "로그인하지 않았다" 가 뜬다.
+    //
+    // 마감만 0 으로 하고 토큰을 남기는 방법도 있지만, 그러면 어딘가에서 마감을
+    // 보지 않고 토큰을 꺼내는 코드가 생겼을 때 서버가 거절한 값을 또 내주게 된다.
+    s_session.accessToken.clear();
+    s_session.expiresAtUnix = 0;
+    s_expiresTick = 0;
 }
 
 bool SessionHasAccount() {
@@ -156,5 +199,6 @@ std::wstring SessionEmail() {
 void SessionClear() {
     std::lock_guard<std::mutex> lock(s_mx);
     s_session = AuthSession{};
+    s_expiresTick = 0;
     s_hasAccount = false;
 }

@@ -29,6 +29,10 @@ create table device_tokens (
 
 alter table device_tokens enable row level security;
 
+-- 표 권한 (schema.sql 의 같은 자리 참고). 새 표를 자동으로 열어 주지 않는 프로젝트
+-- 에서는 이게 없으면 정책이 있어도 "permission denied" 다. anon 에는 주지 않는다.
+grant select, insert, update, delete on device_tokens to authenticated;
+
 -- ============================================================
 -- RLS - 자기 줄만
 -- ============================================================

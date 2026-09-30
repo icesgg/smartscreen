@@ -61,6 +61,11 @@ struct AppConfig {
     bool updateCheck = true;
     // stable 이 기본. beta 는 내 PC 에서 먼저 돌려 보는 용도다 (docs/UPDATE.md).
     std::wstring updateChannel = L"stable";
+
+    // 파일에 쓰이는 값이 아니다. LoadAppConfig 가 "config.ini 가 있는데 읽지 못했다"
+    // 일 때 세운다 (아래 LoadAppConfig 주석). 이 표시가 선 구조체는 기본값뿐이라
+    // SaveAppConfig 가 받지 않는다.
+    bool loadFailed = false;
 };
 
 std::wstring GetConfigDir();
@@ -68,8 +73,25 @@ std::wstring GetConfigDir();
 // 진단용 이벤트 로그 (events.log). g_debugEvents가 true일 때만 기록
 extern bool g_debugEvents;
 void DbgEvent(const wchar_t* fmt, ...);
+
+// config.ini 를 읽는다. false 에는 두 가지가 있고, cfg.loadFailed 로 가른다.
+//  - false, loadFailed=false : 파일이 없다 (또는 비어 있다). 처음 실행이다.
+//                              기본값에 자기 값을 얹어 저장해도 잃을 것이 없다
+//  - false, loadFailed=true  : 파일은 있는데 열거나 읽지 못했다 (다른 프로세스가
+//                              잡고 있다, 권한). cfg 는 기본값 그대로다
+//
+// 예전에는 둘이 똑같이 false 였고, 부르는 쪽 거의 전부가 결과를 보지 않고
+// Load -> 한 칸 고침 -> Save 를 했다. 잠깐 못 읽은 것만으로 폰 토큰, 로그인,
+// 조직 등록, 임계값이 전부 기본값으로 덮였다.
 bool LoadAppConfig(AppConfig& cfg);
-void SaveAppConfig(const AppConfig& cfg);
+
+// config.ini 를 통째로 다시 쓴다. 썼으면 true.
+// config.ini.tmp 에 다 쓴 뒤 이름을 바꿔 끼운다 - 쓰다가 죽어도 원래 파일이 남는다.
+// 읽지 못한 구조체(cfg.loadFailed)는 쓰지 않고 false 를 준다. 실패는 events.log 에 남는다.
+//
+// 읽고-고치고-쓰기는 여전히 UI 스레드에서만 할 것 (main.cpp OnSessionRotated 주석).
+// 파일이 깨지지 않게는 해 주지만, 두 스레드가 서로의 변경을 덮어쓰는 것은 막지 못한다.
+bool SaveAppConfig(const AppConfig& cfg);
 
 // "reg query ... /v IRK" 출력 파일에서 IRK를 읽어 cfg.bleIrk에 넣고 파일을 삭제
 // (BTHPORT 키는 SYSTEM 권한으로만 읽을 수 있어 사용자가 1회 추출한 파일을 가져옴)

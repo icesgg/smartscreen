@@ -22,12 +22,12 @@ add_executable(SmartScreen WIN32
     client/enterprise/supabase.cpp
     client/enterprise/auth.cpp
     client/enterprise/session.cpp
-    client/p2p/discovery.cpp
-    client/p2p/transfer.cpp
     client/video/player.cpp
 )
+# client/p2p/*.cpp 는 빌드하지 않는다. 부르는 곳이 하나도 없었고, 쓰인 그대로 켜면
+# 사내망의 아무에게나 파일을 내주는 서버가 된다 (각 파일 머리의 조건 참고).
 
-target_include_directories(SmartScreen PRIVATE client client/enterprise client/p2p client/video)
+target_include_directories(SmartScreen PRIVATE client client/enterprise client/video)
 
 target_link_libraries(SmartScreen PRIVATE
     ws2_32
