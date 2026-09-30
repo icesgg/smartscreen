@@ -31,8 +31,10 @@ param(
     [switch]$DryRun
 )
 $ErrorActionPreference = 'Continue'
-# 콘솔 인코딩은 건드리지 않는다. 한글 콘솔(CP949)은 한글을 그대로 보여 주고, UTF-8 로
-# 바꾸면 cl.exe 의 CP949 출력이 깨져 로그에 섞인다.
+# 콘솔을 UTF-8 로 쓴다. Publish.exe 가 자기 출력을 위해 콘솔 코드페이지를 UTF-8 로 바꾸는데
+# 그건 콘솔 전체의 설정이라, 그 뒤에 이 스크립트가 CP949 로 쓰면 한글이 깨진다. cl.exe 의
+# 출력은 do_build.bat 의 VSLANG=1033 으로 영어라 인코딩과 무관하다.
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
 
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $root
