@@ -366,9 +366,9 @@ provider 를 지원한다. 사내 배포(TestFlight 내부)면 해당 없다.
 - 임계값 분석: `tools\rssi-threshold.ps1`. 구글 로그인 점검: `build\AuthTest.exe`
 - 서버 스키마는 `supabase/*.sql` 을 대시보드 SQL Editor 에 붙여 넣어 적용한다.
   새 프로젝트용 넷(`schema.sql` / `device_tokens.sql` / `clipboard.sql` / `releases.sql`,
-  이 순서)과, 돌고 있는 프로젝트를 고치는 둘(`content_lockdown.sql` 적용됨,
-  `hardening.sql` **아직**). 넷은 "라이브 + 두 마이그레이션" 과 같게 맞춰 두었다 -
-  마이그레이션을 고치면 넷도 같이 고칠 것
+  이 순서)과, 돌고 있는 프로젝트를 고친 둘(`content_lockdown.sql`, `hardening.sql` - 둘 다
+  적용됨). 넷은 "라이브 + 두 마이그레이션" 과 같게 맞춰 두었다 - 서버를 또 고치면
+  새 마이그레이션 파일을 만들고 넷도 같이 고칠 것
 - **라이브가 실제로 어떤지는 `supabase/inspect_live.sql` 로 본다** (읽기 전용, select
   하나, 결과 한 칸). 정책·RLS·버킷·함수·트리거가 다 나온다. anon key 로 밖에서 찔러
   보는 것보다 이게 먼저다 - 아래 함정
