@@ -162,6 +162,22 @@ bool PngToBitmap(const std::string& png, HBITMAP& out, std::wstring& why) {
 // ---------------------------------------------------------------------------
 // 클립보드
 // ---------------------------------------------------------------------------
+// 등록 클립보드 형식 "PNG".
+//
+// CF_BITMAP 하나만 올려도 윈도가 CF_DIB / CF_DIBV5 를 알파까지 제대로 합성해
+// 준다 (실측함). 그런데 캡처 도구가 남기는 클립보드에는 그 셋 말고 "PNG" 가
+// 같이 있고, Chromium/Electron 으로 만든 앱은 이미지를 붙여넣을 때 그것을
+// 먼저 찾는다. 그게 없으면 "이미지 처리에 실패했습니다" 로 끝난다 - 그림판에는
+// 멀쩡히 붙는데 특정 앱에서만 안 되는 모양이 된다.
+//
+// 우리는 PNG 바이트를 이미 들고 있으므로 그대로 얹으면 된다. 읽을 때도 같다 -
+// 클립보드에 PNG 가 있으면 GDI+ 로 다시 구울 이유가 없고, 그 편이 알파도
+// 원본 그대로 간다.
+UINT PngFormat() {
+    static UINT f = RegisterClipboardFormatW(L"PNG");
+    return f;
+}
+
 // 다른 앱이 쥐고 있으면 OpenClipboard 는 실패한다. 흔한 일이라 몇 번 기다린다.
 bool OpenClipboardRetry(HWND owner) {
     for (int i = 0; i < 8; i++) {
@@ -194,6 +210,23 @@ bool ReadClipboard(HWND owner, Payload& out, std::wstring& why) {
             }
         }
     }
+    // 캡처 도구가 PNG 를 같이 올려 두었으면 그것을 그대로 쓴다. 다시 굽지
+    // 않으므로 빠르고, 알파도 원본 그대로 간다.
+    if (!ok && IsClipboardFormatAvailable(PngFormat())) {
+        HANDLE h = GetClipboardData(PngFormat());
+        if (h) {
+            SIZE_T n = GlobalSize(h);
+            const char* p = (const char*)GlobalLock(h);
+            if (p && n > 8) {
+                out.bytes.assign(p, n);
+                GlobalUnlock(h);
+                out.isImage = true;
+                ok = true;
+            } else if (p) {
+                GlobalUnlock(h);
+            }
+        }
+    }
     if (!ok && IsClipboardFormatAvailable(CF_BITMAP)) {
         HBITMAP hbm = (HBITMAP)GetClipboardData(CF_BITMAP);
         if (hbm && BitmapToPng(hbm, out.bytes, why)) {
@@ -210,11 +243,24 @@ bool ReadClipboard(HWND owner, Payload& out, std::wstring& why) {
 bool WriteClipboard(HWND owner, const Payload& in, std::wstring& why) {
     HBITMAP hbm = nullptr;
     HGLOBAL hText = nullptr;
+    HGLOBAL hPng = nullptr;
 
     // 클립보드를 열기 전에 만든다. 여는 동안 다른 앱이 기다리게 되므로
     // 안에서 PNG 를 푸는 시간을 보내지 않는다.
     if (in.isImage) {
         if (!PngToBitmap(in.bytes, hbm, why)) return false;
+        // 받은 PNG 바이트를 그대로 얹을 사본 (PngFormat 주석 참고).
+        // 실패해도 CF_BITMAP 은 올라가므로 그림판 같은 곳에는 붙는다.
+        hPng = GlobalAlloc(GMEM_MOVEABLE, in.bytes.size());
+        if (hPng) {
+            if (void* q = GlobalLock(hPng)) {
+                memcpy(q, in.bytes.data(), in.bytes.size());
+                GlobalUnlock(hPng);
+            } else {
+                GlobalFree(hPng);
+                hPng = nullptr;
+            }
+        }
     } else {
         std::wstring w = Utf8ToWide(in.bytes);
         size_t cb = (w.size() + 1) * sizeof(wchar_t);
@@ -229,6 +275,7 @@ bool WriteClipboard(HWND owner, const Payload& in, std::wstring& why) {
     if (!OpenClipboardRetry(owner)) {
         if (hbm) DeleteObject(hbm);
         if (hText) GlobalFree(hText);
+        if (hPng) GlobalFree(hPng);
         why = L"클립보드를 열지 못했다";
         return false;
     }
@@ -239,6 +286,9 @@ bool WriteClipboard(HWND owner, const Payload& in, std::wstring& why) {
     if (in.isImage) {
         ok = (SetClipboardData(CF_BITMAP, hbm) != nullptr);
         if (!ok) DeleteObject(hbm);
+        // PNG 는 덤이다. 이게 없으면 Electron 계열 앱이 못 받고, 이것만 있으면
+        // 옛 앱이 못 받는다. 둘 다 올린다.
+        if (hPng && !SetClipboardData(PngFormat(), hPng)) GlobalFree(hPng);
     } else {
         ok = (SetClipboardData(CF_UNICODETEXT, hText) != nullptr);
         if (!ok) GlobalFree(hText);
