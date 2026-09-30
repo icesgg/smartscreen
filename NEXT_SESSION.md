@@ -19,7 +19,9 @@ BLE 신호 세기(RSSI)로 거리를 판단한다.
 "anon 이 `contents` 에 쓸 수 있나" 를 보러 들어갔다가, 서버와 주고받는 면 전체를
 검토하고 고쳤다. **1.1.5 로 나갔고**, 그 뒤 설정 창 문제 셋을 고쳐 **1.1.6 으로 나갔다**
 (둘 다 `release.bat`, 2026-10-01). 두 마이그레이션도 적용됐다. 노트북은 1.1.6 으로 떠서
-사용자가 "잘된다" 고 했다. 아직 안 본 것은 아래 "남은 작업 0".
+사용자가 "잘된다" 고 했고, 바로 뒤에 사용자가 혼자 `release.bat` 으로 **1.1.7** 을
+내놓았다 (코드 변화 없음, 번호만 - 서버의 마지막은 1.1.7 이다). 아직 안 본 것은 아래
+"남은 작업 0".
 
 ### 1.1.6 에서 고친 것 (사용자가 1.1.5 를 쓰다 찾은 것)
 
@@ -259,15 +261,15 @@ A 에서 스크린캡처하면 B 에서 Ctrl+V 로 붙는다. 연결고리는 �
 
 ## 남은 작업
 
-### 0. 1.1.6 에서 아직 안 본 것
+### 0. 1.1.6/1.1.7 에서 아직 안 본 것
 
-1.1.6 은 나갔고 노트북에서 뜬다 (시작 경로: 세션 복구, 회전 토큰 저장, 기업 동기화
+1.1.6 은 나갔고(1.1.7 은 같은 코드) 노트북에서 1.1.7 로 뜬다 (시작 경로: 세션 복구, 회전 토큰 저장, 기업 동기화
 OK center=1, 업데이트 확인, BLE NEAR, 오버레이 [종료] 로 0.5초 만에 정상 종료. 설정 창
 둘의 동기화와 X 는 사용자가 "잘된다"). 그 밖의 길은 아직 사람이 안 봤다:
 
-- **데스크톱이 1.1.6 을 받는가.** 개인 PC 면 띠 → [업데이트], 기업 PC 면 대시보드의
-  [승인] 뒤 (1.1.6 의 [승인] 을 눌렀는지 확인 안 됨). 받은 뒤 events.log 의
-  `start: SmartScreen 1.1.6`. 받으면 [시작] 을 거치면서 그 PC 의 두 임계값도 같아진다
+- **데스크톱이 1.1.7 을 받는가.** 개인 PC 면 띠 → [업데이트], 기업 PC 면 대시보드의
+  [승인] 뒤 (1.1.7 의 [승인] 을 눌렀는지 확인 안 됨). 받은 뒤 events.log 의
+  `start: SmartScreen 1.1.7`. 받으면 [시작] 을 거치면서 그 PC 의 두 임계값도 같아진다
 - 잠금 화면 자체 (1.1.5 부터 `DeactivateBlackScreen` 이 그림을 버리고 다음 잠금이 다시
   읽는다 - 매 잠금마다 그림을 새로 읽는 셈이다, 느려지는지 볼 것)
 - 앉아 있는데 잠기는 일이 -67 로도 이어지면 폰을 평소 자리에 둔 채 [내 자리에 맞게
@@ -527,7 +529,7 @@ Disconnected / Closed 로 보고됐다. `GattDeviceService` 는 반드시 `Close
 
 ## 현재 기기 상태
 
-- 노트북(LG gram 14Z990, Intel 내장): **1.1.6**, 기업 등록(`enterpriseRegistered=1`,
+- 노트북(LG gram 14Z990, Intel 내장): **1.1.7**, 기업 등록(`enterpriseRegistered=1`,
   orgId `0dca070f-…`), **`measuredBaseRssi=-67`, `nearRssiThreshold=-67` =
   `gattRssiThreshold=-67` (거리 3단계의 [보통])**, `idleCountdownSec=15`, `bleDebugLog=0`.
   IRK 와 폰 토큰 둘 다 설정돼 있다. **`centerImagePath` 는 개인 그림
@@ -539,8 +541,8 @@ Disconnected / Closed 로 보고됐다. `GattDeviceService` 는 반드시 `Close
 - 같은 구글 계정(icesgg@gmail.com). 클립보드 공유는 노트북에서 꺼져 있다
 - Supabase: 네 스키마(`schema`/`device_tokens`/`clipboard`/`releases`) +
   `content_lockdown.sql` + `hardening.sql` 적용됨 (2026-09-30/10-01). `contents` 에 두 행
-  (png 꺼짐, mp4 켜짐). `releases` 에 1.1.0 ~ 1.1.6 (1.1.0 은 낡은 빌드가 실수로 다시
-  올라간 것 - 해는 없음). `release_admins` 에 icesgg@gmail.com. **1.1.6 의 [승인] 을
-  눌렀는지 확인 안 됨** (노트북은 이미 1.1.6 이지만, 다른 기업 PC 는 승인이 있어야 받는다)
-- `client/version.h` = 1.1.6 = 서버의 마지막 = `build\` = `dist\` = `SmartScreen-desktop.zip`
-  (exe 691,712 bytes)
+  (png 꺼짐, mp4 켜짐). `releases` 에 1.1.0 ~ 1.1.7 (1.1.0 은 낡은 빌드가 실수로 다시
+  올라간 것 - 해는 없음; 1.1.7 은 1.1.6 과 같은 코드). `release_admins` 에
+  icesgg@gmail.com. **1.1.7 의 [승인] 을 눌렀는지 확인 안 됨** (노트북은 이미 1.1.7
+  이지만, 다른 기업 PC 는 승인이 있어야 받는다)
+- `client/version.h` = 1.1.7 = 서버의 마지막 = `build\` = `dist\` = `SmartScreen-desktop.zip`
