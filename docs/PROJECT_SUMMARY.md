@@ -39,6 +39,10 @@ compatibility results.
   through a copy of its own exe (`--apply-update`). Personal PCs confirm in
   the settings window; enterprise PCs apply whatever version the org admin
   approved on the dashboard. See `docs/UPDATE.md`.
+- Releasing is one double-click: `release.bat` bumps the version, closes the
+  app cleanly, builds, verifies the build actually happened, publishes,
+  refreshes `dist\` and the zip, commits, pushes and relaunches the app
+  (`tools/release.ps1`).
 
 ### 2. Screen Saver (Black Screen)
 - **Activation**: Triggers immediately when device transitions to FAR
