@@ -157,13 +157,24 @@ PC 들이 받는 길 그대로다. 이게 통과하면 버킷 정책과 파일�
 
 ## 배포하는 사람이 하는 일
 
+`release.bat` 을 더블클릭한다. 그것이 순서대로 한다:
+
 ```
-1. client/version.h 의 숫자를 올린다
-2. cmd.exe /c do_build.bat            (SmartScreen.exe 와 Publish.exe 가 같이 나온다)
-3. publish.bat --notes "무엇이 바뀌었나"
-      브라우저에서 구글 로그인 -> 업로드 -> anon 으로 다시 받아 대조 -> 행 upsert
-4. (기업) 대시보드 > 프로그램 업데이트 > 그 버전에 [승인]
+version.h 패치 번호 +1  ->  배포 메모 묻기  ->  앱 정상 종료(오버레이 [종료] 와 같은 길)
+->  do_build.bat  ->  Publish.exe (브라우저 로그인 -> 업로드 -> anon 대조 -> 행)
+->  make_dist + SmartScreen-desktop.zip  ->  git commit "Release x.y.z" + push  ->  앱 다시 띄우기
 ```
+
+그 다음 (기업) 대시보드 > 프로그램 업데이트 > 그 버전에 [승인].
+
+`release.bat 1.2.0` 은 그 번호로, `-NoGit` 은 커밋·푸시를 빼고, `-DryRun` 은 빌드까지만
+돌려 보고 번호를 되돌린다. 빌드가 실패하면 번호를 되돌리고(안 그러면 다음 시도가 두 번
+올린다), 게시가 실패하면 번호는 둔다(같은 번호로 `release.bat x.y.z` 를 다시). 로직은
+`tools/release.ps1` 에 있다 - .bat 은 한글을 못 담아서 실행기만 한다.
+
+손으로 할 때의 순서도 같다: `version.h` 올리기 -> 앱 끄기 -> `do_build.bat` ->
+`publish.bat --notes "..."`. 앱을 안 끄면 링크가 실패하고, 그러면 `Publish.exe` 가
+낡은 빌드라고 거절한다.
 
 `publish.bat --list` 가 서버의 목록을, `publish.bat --deactivate 1.2.3` 이 잘못
 올린 것을 끈다. 끄는 것뿐이다 - 이미 받은 PC 는 그대로다. 되돌리려면 더 높은

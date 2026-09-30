@@ -203,13 +203,12 @@ BLE 핸드셰이크 대신 폰과 PC 가 같은 구글 계정으로 로그인해
 
 ## 남은 작업
 
-### 1. 자동 업데이트 - 끝까지 한 번 돌았다. 다음 배포부터는 이 순서
+### 1. 자동 업데이트 - 끝까지 한 번 돌았다. 다음 배포는 `release.bat` 더블클릭
 
-1. `client/version.h` 의 숫자를 올린다
-2. **앱을 끄고** `cmd.exe /c do_build.bat` (떠 있으면 링크가 실패하고, 그러면
-   `Publish.exe` 가 낡은 빌드라고 거절한다)
-3. `publish.bat --notes "무엇이 바뀌었나"` (cmd 에서. Git Bash 에서는 따옴표가 깨진다)
-4. 기업 PC 는 대시보드 > 프로그램 업데이트 > [승인] (푸시된 `docs/dashboard.html`)
+번호 올리기 -> 메모 -> 앱 종료 -> 빌드 -> 게시 -> dist/zip -> 커밋·푸시 -> 앱 다시
+띄우기를 한 번에 한다 (`tools/release.ps1`, docs/UPDATE.md "배포하는 사람이 하는 일").
+그 다음 기업 PC 는 대시보드 > 프로그램 업데이트 > [승인]. `-DryRun` 으로 빌드까지만
+돌려 본 것은 확인했고, 실제 게시까지 이 스크립트로 한 적은 아직 없다.
 
 안 해 본 것: Program Files 에 둔 exe, 화면이 가려진 채로 Ready 가 됐을 때 풀리면
 적용되는지, 실패 기록 뒤 [다시 시도], 세 대 이상. 대시보드 승인 칸도 이번엔 SQL 로
@@ -292,9 +291,10 @@ provider 를 지원한다. 사내 배포(TestFlight 내부)면 해당 없다.
   gatt_rssi_log.csv (뒤 둘은 `bleDebugLog=1` 일 때만)
 - 임계값 분석: `tools\rssi-threshold.ps1` (앱 켜둔 채 돌려도 된다)
 - 구글 로그인 점검: `build\AuthTest.exe` (인자 없으면 자체 점검만)
-- 업데이트 올리기: `publish.bat [--notes "..."] [--channel beta] [--force]`,
-  `publish.bat --list`, `publish.bat --deactivate 1.2.3`. `.env` 를 읽는다.
-  `build\Publish.exe --selftest` 는 서버 없이 해시·버전 비교를 점검한다
+- 새 버전 내놓기: `release.bat` (더블클릭. 번호·빌드·게시·커밋까지). 낱개로는
+  `publish.bat [--notes "..."] [--channel beta] [--force]`, `publish.bat --list`,
+  `publish.bat --deactivate 1.2.3`. `.env` 를 읽는다. `build\Publish.exe --selftest`
+  는 서버 없이 해시·버전 비교를 점검한다
 - 업데이트 적용 경로 시험: `SmartScreen.exe --apply-update 0 <src> <dst> --sha <hex>
   --ver 9.9.9 --no-relaunch` (pid 0 = 기다리지 않음). src 는 `%APPDATA%\SmartScreen\update\`
   안에, dst 이름은 `SmartScreen.exe` 여야 받는다. 성공·해시 불일치·이름·위치·해시 없음
