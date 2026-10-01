@@ -510,15 +510,25 @@ static DWORD WINAPI ScanThread(LPVOID) {
         if (g_bleGatt.IsHealthy()) {
             // v2: 폰 앱이 GATT로 연결되어 ~1Hz로 RSSI를 보고 중 → 최우선 사용
             useGatt = true; bleAvail = true; reachable = true;
+            // 읽는 순서가 중요하다: 간격 -> 보고 시각 -> RSSI. 필드마다 따로 읽으므로,
+            // RSSI 를 먼저 읽으면 재구독 직후 첫 보고와 엇갈려 "보고 있음" 과 지난 연결의
+            // 마지막 RSSI(예: 책상에서 -50)가 짝이 될 수 있다 -> 멀리 있는데 NEAR.
+            // OnReport 는 smoothedRssi 를 lastReportTick 보다 먼저 쓰므로, 보고 시각을
+            // 본 뒤에 읽은 RSSI 는 그 보고 것이거나 더 새 것이다.
+            DWORD iv = g_bleGatt.CurrentPollIntervalMs();
+            DWORD age = g_bleGatt.ReportAgeMs();
             rssi = g_bleGatt.GetSmoothedRssi();
             // 아래 두 갈래는 임계값을 안 본다. 그래도 effThr 은 이 경로의 설정값으로
             // 둔다 - 기본값(광고 임계값)인 채로 두면 STATE 줄이 "GATT rssi=-65 thr=-67"
             // 처럼 다른 경로의 숫자를 찍어서, 로그만 보고는 왜 NEAR 가 됐는지 알 수 없다.
             effThr = g_gattRssiThreshold;
-            if (g_bleGatt.CurrentPollIntervalMs() == 0) {
+            if (iv == 0 && g_bleGatt.IsClientSubscribed()) {
                 isNear = true;                               // 입력 중이라 폴링을 쉬는 상태 = 자리에 있음
-            } else if (g_bleGatt.ReportAgeMs() == 0xFFFFFFFF) {
-                isNear = (g_proxState == ProxState::Near);   // 첫 보고 대기 중: 현재 상태 유지
+            } else if (iv == 0 || age == 0xFFFFFFFF) {
+                // 첫 보고 대기 중, 또는 IsHealthy 뒤에 구독이 끊겨 틱이 간격을 0 으로 내린 것
+                // (끊김 콜백은 구독자 수를 먼저 0 으로 만든다 - "입력 중" 이 아니다): 현재 상태 유지.
+                // 끊김이면 그 콜백이 판정을 다시 깨운다.
+                isNear = (g_proxState == ProxState::Near);
             } else {
                 // 히스테리시스: 잠금은 임계값 미만, 해제는 임계값+4 이상 (경계에서 깜빡임 방지)
                 int thr = g_gattRssiThreshold + (g_proxState == ProxState::Near ? 0 : 4);
