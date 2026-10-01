@@ -372,7 +372,7 @@ final class AppController: NSObject, GuardEngineHost {
             c.authEmail = authSave.email
             if !authSave.phoneToken.isEmpty {
                 c.phoneToken = authSave.phoneToken
-                c.phoneOvfBit = -1   // 비트는 잠긴 폰을 처음 탐색할 때 배운다 (Mac 은 늘 -1)
+                c.phoneOvfBit = -1   // 비트는 잠긴 폰을 처음 탐색할 때 배운다 (직접 읽기 스캔이 읽는다)
             }
         }
         if !authSave.refresh.isEmpty { c.authRefresh = authSave.refresh }
@@ -652,8 +652,19 @@ final class AppController: NSObject, GuardEngineHost {
 
     private func countdownTick() {
         guard monitoring else { return }
-        // (Windows 는 여기서 스캐너가 배운 overflow 비트를 저장한다. CoreBluetooth 는 그 비트를
-        //  보여 주지 않으므로 Mac 에는 저장할 것이 없다 - phoneOvfBit 는 늘 -1.)
+        // 프로버가 잠긴 폰을 찾아내면서 overflow 비트를 새로 배웠으면 저장한다 (Windows IDT_COUNTDOWN).
+        // 다음 실행 때 후보를 훨씬 빨리 좁힌다 (없어도 동작은 한다). 비트는 직접 읽기 스캔(R)이
+        // 제조사 데이터에서 읽은 것이고 번호는 Windows 와 같다 - 같은 config.ini 를 옮겨도 뜻이 같다.
+        let learned = AdvScanner.shared.takeLearnedOverflowBit()
+        if learned >= 0 {
+            var c = ConfigStore.load()
+            c.phoneOvfBit = learned
+            // 못 읽은 config 는 save 가 거절한다 (그 사유는 ConfigStore 가 적는다). 다시 걸지 않는다:
+            // 스캐너는 이미 이 비트로 고르고 있고, 다음 실행에서 처음 묶을 때 또 배운다.
+            if !ConfigStore.save(c) {
+                EventLog.write("ident: overflow bit \(learned) NOT saved (it will be learned again on a later run)")
+            }
+        }
         if !bluetoothDeniedShown && AdvScanner.shared.bluetoothDenied {
             EventLog.write("start: Bluetooth permission denied")
             noteBluetoothDenied()
@@ -1279,7 +1290,7 @@ final class AppController: NSObject, GuardEngineHost {
         if !viaLogin {
             var c = ConfigStore.load()
             c.phoneToken = token
-            c.phoneOvfBit = -1   // 비트는 잠긴 폰을 처음 탐색할 때 배운다 (Mac 은 늘 -1)
+            c.phoneOvfBit = -1   // 비트는 잠긴 폰을 처음 탐색할 때 배운다 (직접 읽기 스캔이 읽는다)
             ConfigStore.save(c)
         }
         populateDevices()

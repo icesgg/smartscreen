@@ -16,10 +16,19 @@ enum RegisterOutcome {
 /// 그 뒤로는 그 기기가 조용해질 때까지 identifier 로 추적한다.
 ///
 /// Mac 에서 다른 점 (spec ble §8):
-///  - 스캔은 신원 서비스 UUID 로 필터한다. 잠긴 폰의 UUID 는 Apple overflow 영역에만 있고,
-///    그것은 "그 UUID 를 명시해서 찾는 스캐너" 에게만 보인다. 필터 없이 훑으면 잠긴 폰을 못 본다.
-///  - overflow 비트 번호는 CoreBluetooth 가 보여 주지 않으므로 배울 수 없다 (phoneOvfBit 는 늘 -1).
-///    후보 = overflow 또는 일반 서비스 목록에 신원 UUID 가 있는 기기. 남의 폰은 토큰이 걸러 낸다.
+///  - 스캔 관리자(CBCentralManager)가 둘이다. 잠긴 폰의 신원 UUID 는 Apple overflow 영역에만 있는데,
+///    macOS 가 그것을 어떻게 보여 주는지가 실기로 확인되지 않았다. 그래서 둘 중 하나만 되어도 돌게 했다:
+///      F (필터) - 신원 서비스 UUID 로 걸러 달라고 한다. iOS 는 "그 UUID 를 명시해서 찾는 스캐너" 에게
+///                 overflow 광고를 맞춰 준다 - macOS 도 그러기를 기대한다. 등록, 블루투스 상태,
+///                 권한 판단은 F 가 맡는다 (예전 그대로).
+///      R (직접 읽기) - 거르지 않고 훑어 제조사 데이터 `4C 00 01 + 16바이트` 를 Windows 처럼 직접
+///                 읽는다. 비트가 딱 하나인 광고가 후보이고 그 비트 번호를 배운다 (phoneOvfBit).
+///                 토큰이 등록돼 있고 감시 중일 때만 돈다.
+///    후보는 기기 식별자로 합친다. 두 쪽이 같은 패킷을 각각 알릴 수 있으므로 등록된 폰의 샘플은
+///    DualSourceDedupe 를 지나야 칼만/공개 상태/판정 깨우기에 닿는다 (연속 2샘플 규칙이 샘플을 센다).
+///    어느 쪽이 실제로 되는지는 `ident: bound to ... via ...` 줄과 --probe-scan 의 요약이 말한다.
+///  - CBPeripheral 객체는 그것을 준 관리자의 것이다. 연결과 끊기는 그 관리자로만 한다 (탐색이 자기
+///    관리자를 기억한다). 후보는 쪽마다 객체를 따로 들고 있다가 F 의 것이 있으면 F 로 붙는다.
 ///  - Windows 의 블로킹 프로버 스레드 대신 BLEIds.queue 위의 비동기 상태 기계로 돈다.
 ///    한 번에 탐색 하나, 단계마다 자체 시간 제한, 끝나면 반드시 연결을 끊는다.
 final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
@@ -37,7 +46,9 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     // 이 시간 동안 수신 없으면 "끊김" (iOS 백그라운드 광고는 간격이 수십 초까지 벌어짐)
     private var pubTimeoutMs: UInt64 = 90_000
     private var pubBound = false
-    private var pubCentralState: CBManagerState = .unknown
+    private var pubCentralState: CBManagerState = .unknown       // F 의 상태 (화면과 판단은 이것만 본다)
+    private var pubRawCentralState: CBManagerState = .unknown    // R 의 상태 (권한 거부만 본다)
+    private var pubLearnedBit = -1   // 새로 배워서 저장해야 할 overflow 비트 (Windows identBitLearned)
     // 최근 수신 시각 링버퍼 (초당 수신 건수 계산용)
     private static let rateSlots = 256
     private var rateTicks = [UInt64](repeating: 0, count: AdvScanner.rateSlots)
@@ -60,24 +71,30 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
     // MARK: - BLEIds.queue 전용 상태
 
-    private var central: CBCentralManager?
+    private var central: CBCentralManager?      // F: 신원 서비스 UUID 로 거르는 스캔
+    private var rawCentral: CBCentralManager?   // R: 거르지 않는 스캔 (토큰이 있을 때만 만든다)
     private var running = false
     private var targetName = ""
     private var kalman = KalmanFilter(processNoise: 1.0, measureNoise: 10.0)   // Q=초당 1.0, R=10.0
+    private var dedupe = DualSourceDedupe()     // F 와 R 이 같은 패킷을 두 번 세지 않게
     private var logPath = ""
     private var csv: BLEIds.CsvLog?
-    private var lastLoggedTick: [UUID: UInt64] = [:]   // 비매칭 기기는 기기별 5초에 1회만 기록
+    private var lastLoggedTick: [UUID: UInt64] = [:]   // 비매칭 기기는 기기별 5초에 1회만 기록 (두 쪽 공통)
     private var loggedCentralState: CBManagerState?
+
+    // dedupe 의 source 번호
+    private static let sourceFilter = 0
+    private static let sourceRaw = 1
 
     // ---- 연결로 확인하는 신원 (IRK 대체) ----
     // 토큰은 UI 가 바꾸고(setIdentity) 광고 콜백과 프로버가 읽는다. 모두 이 큐 위에서만
     // 일어나므로, 토큰 교체와 판정/결합 초기화가 프로버에게 한 번에 보인다.
     private var identToken = ""            // 등록된 토큰(32 hex)
     private var identOn = false            // identToken 이 비어 있지 않은지 = 이 경로 켜짐
-    private var identBit = -1              // Mac 에서는 배울 수 없다 (보관만 한다)
+    private var identBit = -1              // 학습된 overflow 비트 (-1 = 모름). R 이 읽고 배운다
     private var probeFloor = -75           // 이보다 약하면 탐색하지 않는다
     private var boundId: UUID?             // 토큰으로 확인된 현재 기기
-    private var boundSeenTick: UInt64 = 0  // 그 기기를 마지막으로 본 시각
+    private var boundSeenTick: UInt64 = 0  // 그 기기를 마지막으로 본 시각 (어느 쪽이든)
     private var cands: [UUID: Cand] = [:]
     // 기기별 재시도 금지 시각. 실패 종류에 따라 길이가 다르다 -
     // 남의 기기로 확인된 기기를 계속 다시 찌르면 맞는 기기에 쓸 시도를 낭비한다.
@@ -93,10 +110,16 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     // 어차피 새 후보로 들어온다.
     private static let retryNotOursMs: UInt64 = 600_000
 
+    /// 후보 하나. 같은 기기를 두 관리자가 다 보면 한 줄로 합친다.
     private struct Cand {
-        let peripheral: CBPeripheral   // connect 에 필요하므로 붙잡아 둔다
-        var rssi: Int                  // 마지막 원시값 (매끄럽게 하지 않은 것)
+        // connect 에 필요하므로 붙잡아 둔다. 객체는 그것을 준 관리자로만 연결할 수 있다.
+        var viaFilter: CBPeripheral?   // F 가 준 객체
+        var viaRaw: CBPeripheral?      // R 이 준 객체
+        var rssi: Int                  // 마지막 원시값 (매끄럽게 하지 않은 것, 어느 쪽이든)
         var seen: UInt64
+        var sure: Bool                 // 신원 UUID 를 직접 봤다 (F 가 줬다, 또는 R 광고의 UUID 목록)
+        var rawList: Bool              // R 광고의 UUID 목록에서 봤다 (로그용)
+        var bit: Int                   // R 이 읽은 overflow 비트 (-1 = 모름)
     }
 
     // 탐색 결과. 실패를 둘로 가르는 것이 핵심이다 -
@@ -110,7 +133,8 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     private enum Purpose {
-        case ident(rssi: Int)   // 프로버: 후보를 고를 때의 원시 RSSI (bound 로그용)
+        // 프로버: 후보를 고를 때의 원시 RSSI, overflow 비트, 찾은 경로 (bound 로그와 비트 학습용)
+        case ident(rssi: Int, bit: Int, via: String)
         case register           // BLE 직접 등록
 
         var isIdent: Bool {
@@ -124,13 +148,15 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     /// ReadPhoneToken 하나. 단계마다 타이머를 다시 건다.
     private final class Probe {
         let peripheral: CBPeripheral
+        let central: CBCentralManager   // 이 객체를 준 관리자. 연결/끊기는 이것으로만 한다
         let purpose: Purpose
         let t0: UInt64
         var stage: Stage = .connecting
         var timer: DispatchSourceTimer?
 
-        init(peripheral: CBPeripheral, purpose: Purpose, t0: UInt64) {
+        init(peripheral: CBPeripheral, central: CBCentralManager, purpose: Purpose, t0: UInt64) {
             self.peripheral = peripheral
+            self.central = central
             self.purpose = purpose
             self.t0 = t0
         }
@@ -170,6 +196,7 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             self.targetName = targetName
             resetPublished()
             kalman.reset()            // 칼만은 Start 에서만 초기화한다 (결합이 바뀌어도 그대로)
+            dedupe.reset()
             // 링버퍼는 Windows 처럼 비우지 않는다.
 
             // 진단 로그 (설정된 경우). 모니터링 중에도 다른 프로그램에서 읽을 수 있다.
@@ -181,6 +208,8 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             }
 
             running = true
+            // 어느 스캔이 도는지. 직접 읽기(R)는 토큰이 있어야 돈다 (후보를 확인할 길이 토큰뿐이다).
+            EventLog.write("scan: filter=on raw=\(identOn ? "on" : "off")")
             ensureCentral()
             updateScan()
             if identOn { ensureProber() }
@@ -210,15 +239,36 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                 let dropped = probedUntil.count
                 probedUntil.removeAll()
                 setBound(nil)
+                // 예전 폰으로 배운 비트를 새 토큰의 config 에 저장하지 않게 한다 (저장하는 쪽이 1초
+                // 틱이라, 그 사이에 등록이 바뀌면 새 토큰과 함께 적힌 -1 을 덮을 수 있다).
+                lock.lock()
+                pubLearnedBit = -1
+                lock.unlock()
                 // 등록을 바꾼 직후 폰을 못 알아보는 일이 로그에서 갈리도록 남긴다.
                 EventLog.write("ident: token \(identOn ? "set" : "cleared"), dropped \(dropped) past verdict(s) and the binding")
+                if running {
+                    EventLog.write("scan: filter=on raw=\(identOn ? "on" : "off")")
+                }
             }
 
             // 스캔이 이미 돌고 있으면 start 를 다시 지나지 않는다. 여기서 띄우지 않으면
             // 처음 등록한 경우 프로버가 아예 없어서, "등록했습니다" 라고 말한
-            // 뒤에도 폰을 끝까지 확인하지 못한다.
-            if running && identOn { ensureProber() }
+            // 뒤에도 폰을 끝까지 확인하지 못한다. 직접 읽기 스캔(R)도 여기서 켜고 끈다.
+            if running {
+                updateRawScan()
+                if identOn { ensureProber() }
+            }
         }
+    }
+
+    /// 프로버가 잠긴 폰을 묶으면서 overflow 비트를 새로 배웠으면 그 번호, 아니면 -1 (한 번 꺼내면
+    /// 지워진다). 메인의 1초 틱이 config.ini 의 phoneOvfBit 로 저장한다 (Windows IDT_COUNTDOWN).
+    func takeLearnedOverflowBit() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        let v = pubLearnedBit
+        pubLearnedBit = -1
+        return v
     }
 
     /// 수신 끊김 판정 시간(초). 5..600 으로 자른다.
@@ -262,11 +312,12 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     /// 블루투스 권한이 거부됐다 (시스템 설정 > 개인정보 보호 및 보안 > 블루투스).
+    /// 권한은 앱 단위라 두 관리자가 같은 답을 받지만, 어느 쪽이 먼저 알아채도 말하게 둘 다 본다.
     var bluetoothDenied: Bool {
         if BLEIds.authorizationDenied { return true }
         lock.lock()
         defer { lock.unlock() }
-        return pubCentralState == .unauthorized
+        return pubCentralState == .unauthorized || pubRawCentralState == .unauthorized
     }
 
     /// 등록: 앱을 화면에 띄운 폰을 찾아 토큰을 읽는다.
@@ -274,6 +325,7 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     /// 모호하지 않다. 잠긴 폰으로 등록하면 남의 폰을 집을 위험이 있어 일부러 이 조건을 쓴다.
     /// 가장 신호가 센 것 하나만 시도한다. completion 은 메인에서 불린다.
     /// "register phone: ..." 줄은 부르는 쪽(UI)이 남긴다 (Windows 와 같다).
+    /// 등록은 필터 스캔(F)만 쓴다 - 포그라운드 광고의 일반 서비스 목록은 필터가 확실히 맞춘다.
     func registerPhone(scanSec: Int, completion: @escaping (RegisterOutcome) -> Void) {
         BLEIds.queue.async { [weak self] in
             guard let self = self else { return }
@@ -337,7 +389,7 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private func stopOnQueue() {
         guard running else { return }
         running = false
-        updateScan()
+        updateScan()   // 두 스캔 모두 내린다 (등록 스캔 중이면 F 는 그대로)
         csv?.close()
         csv = nil
         // 프로버 타이머는 그대로 두고(놀게 된다) 묶인 기기만 버린다.
@@ -355,8 +407,9 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         }
     }
 
-    /// 스캔이 필요하면 (모니터링 중이거나 등록 스캔 중) 걸고, 아니면 멈춘다.
+    /// 스캔이 필요하면 (모니터링 중이거나 등록 스캔 중) 걸고, 아니면 멈춘다. 직접 읽기 스캔(R)도 같이 맞춘다.
     private func updateScan() {
+        updateRawScan()
         guard let c = central, c.state == .poweredOn else { return }
         let regScanning = registration?.scanning ?? false
         if running || regScanning {
@@ -371,6 +424,24 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             }
         } else if c.isScanning {
             c.stopScan()
+        }
+    }
+
+    /// 직접 읽기 스캔(R): 감시 중이고 토큰이 있을 때만. 관리자는 처음 필요할 때 만든다 - 권한은 앱
+    /// 단위라 두 번째 관리자가 허용 창을 다시 띄우지 않는다. 켜지기 전이면 state 콜백이 건다.
+    private func updateRawScan() {
+        let want = running && identOn
+        if want && rawCentral == nil {
+            rawCentral = CBCentralManager(delegate: self, queue: BLEIds.queue, options: nil)
+            return
+        }
+        guard let r = rawCentral, r.state == .poweredOn else { return }
+        if want {
+            // 거르지 않는다: 잠긴 폰의 overflow 광고가 필터에 안 걸려도 제조사 데이터는 온다고 본다.
+            r.scanForPeripherals(withServices: nil,
+                                 options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+        } else if r.isScanning {
+            r.stopScan()
         }
     }
 
@@ -392,6 +463,11 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     // MARK: - CBCentralManagerDelegate
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        if central === rawCentral {
+            rawCentralStateChanged(central.state)
+            return
+        }
+        guard central === self.central else { return }
         let st = central.state
         lock.lock()
         pubCentralState = st
@@ -429,9 +505,41 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         }
     }
 
+    /// R 의 상태. 화면에 보이는 상태(pubCentralState)와 등록은 F 의 것이다 - 여기서는 권한 거부를
+    /// 기록하고, 켜지면 스캔을 걸고, 꺼지면 R 의 객체를 버린다.
+    private func rawCentralStateChanged(_ st: CBManagerState) {
+        lock.lock()
+        pubRawCentralState = st
+        lock.unlock()
+        if st == .poweredOn {
+            updateRawScan()
+            return
+        }
+        // R 이 준 기기 객체는 이제 쓸 수 없다. R 에서만 본 후보는 버리고, 함께 본 후보는 F 의 것만
+        // 남긴다 (F 의 객체로 계속 붙을 수 있다). R 위에서 돌던 탐색은 결과 없이 버린다.
+        var kept: [UUID: Cand] = [:]
+        for (id, c) in cands where c.viaFilter != nil {
+            var k = c
+            k.viaRaw = nil
+            kept[id] = k
+        }
+        cands = kept
+        if let pr = probe, pr.central === rawCentral { abortProbe() }
+    }
+
     /// 광고 하나 = 패킷 하나 (뜨거운 경로). 가볍게, 기다리지 않게.
+    /// 직접 읽기(R)는 주변의 모든 광고를 받으므로 특히 그렇다 - 후보도 내 폰도 아니고 진단 로그도
+    /// 꺼져 있으면 사전 몇 번 보고 돌아간다.
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
                         advertisementData: [String: Any], rssi RSSI: NSNumber) {
+        let fromRaw: Bool
+        if central === self.central {
+            fromRaw = false
+        } else if central === rawCentral {
+            fromRaw = true
+        } else {
+            return
+        }
         let rssi = RSSI.intValue
         let plainList = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
         let overflowList = (advertisementData[CBAdvertisementDataOverflowServiceUUIDsKey] as? [CBUUID]) ?? []
@@ -439,9 +547,9 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         let inOverflow = overflowList.contains(BLEIds.identService)
         let valid = BLEIds.validRssi(rssi)
 
-        // 등록 스캔: 일반 서비스 목록에 신원 UUID 가 있는 것(= 앱이 화면에 떠 있는 폰)만.
+        // 등록 스캔: 일반 서비스 목록에 신원 UUID 가 있는 것(= 앱이 화면에 떠 있는 폰)만, F 에서만.
         // 잠긴 폰은 UUID 를 overflow 로 옮기므로 여기 안 걸린다 - 의도한 것.
-        if let reg = registration, reg.scanning, inPlain, valid, rssi > reg.bestRssi {
+        if !fromRaw, let reg = registration, reg.scanning, inPlain, valid, rssi > reg.bestRssi {
             reg.best = peripheral
             reg.bestRssi = rssi
         }
@@ -454,11 +562,29 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         let identMatch = boundId != nil && boundId == id
         if identMatch {
             boundSeenTick = now
-        } else if identOn && (inOverflow || inPlain) {
+        } else if identOn {
             // 아직 못 묶었으면 후보로만 쌓아 둔다. 붙는 일은 프로버가 한다.
-            // (Windows 는 overflow 모양만 후보로 삼는다. Mac 은 앱이 화면에 떠 있는 폰도 받는다 -
-            //  토큰이 가르므로 다른 것은 바뀌지 않는다.)
-            cands[id] = Cand(peripheral: peripheral, rssi: valid ? rssi : -127, seen: now)
+            if fromRaw {
+                // Windows 와 같다: 제조사 데이터가 overflow 모양이고 비트가 딱 하나면 후보.
+                // UUID 목록에 신원 UUID 가 실려 있으면(앱이 화면에 떠 있거나 macOS 가 overflow 를 풀어
+                // 줬으면) 그것도 받는다 - 토큰이 가르므로 다른 것은 바뀌지 않는다.
+                var bit = -1
+                if let md = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,
+                   md.count == AppleOverflow.length {
+                    bit = AppleOverflow.singleBit([UInt8](md))
+                }
+                let listed = inPlain || inOverflow
+                if bit >= 0 || listed {
+                    noteCandidate(id, peripheral, fromRaw: true, rssi: valid ? rssi : -127, now: now,
+                                  sure: listed, bit: bit)
+                }
+            } else {
+                // 필터 스캔이 준 기기는 신원 UUID 가 맞은 것이다. UUID 목록이 비어 있어도 받는다 -
+                // macOS 가 overflow 해시로 맞춰 주면서 목록에는 아무것도 안 실을 수도 있다
+                // (실기 미확인. 예전에는 목록에 있는 것만 받아서 그런 경우 잠긴 폰을 영영 못 봤다).
+                noteCandidate(id, peripheral, fromRaw: false, rssi: valid ? rssi : -127, now: now,
+                              sure: true, bit: -1)
+            }
         }
 
         let advName = (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? ""
@@ -469,7 +595,14 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             || (!identOn && (inPlain || inOverflow))
 
         var smoothedInt = -100
+        var duplicate = false
         if matched && valid {
+            // 두 관리자가 같은 패킷을 각각 알렸으면 한 번만 센다 (DualSourceDedupe 주석).
+            // 판정의 연속 2샘플 규칙이 샘플 수를 세므로, 사본을 세면 페이딩 한 번이 두 샘플이 된다.
+            duplicate = !dedupe.accept(source: fromRaw ? AdvScanner.sourceRaw : AdvScanner.sourceFilter,
+                                       now: now)
+        }
+        if matched && valid && !duplicate {
             // 칼만 필터로 매끄럽게 한 뒤 공개 상태를 한 번에 바꾼다.
             // dt 는 같은 경로의 직전 틱에서 잰다 (덮어쓰기 전에).
             lock.lock()
@@ -488,15 +621,37 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             wake?()
         }
 
-        // 진단 로그: 들은 광고를 기록해 대상 기기가 어떤 모양으로 보이는지 확인
-        if let f = csv {
+        // 진단 로그: 들은 광고를 기록해 대상 기기가 어떤 모양으로 보이는지 확인.
+        // 버린 사본은 적지 않는다 - matched 줄은 판정이 실제로 쓴 샘플과 하나씩 맞아야 한다
+        // (tools/rssi-threshold.ps1 이 그 줄들로 임계값을 계산한다).
+        if let f = csv, !duplicate {
             logAdv(f, id: id, adv: advertisementData, name: advName, matched: matched,
                    raw: rssi, smoothed: smoothedInt, plainList: plainList, now: now)
         }
     }
 
+    /// 후보 표에 넣거나 합친다. sure 는 한 번 서면 후보가 사라질 때까지 남고, 비트는 R 이 새로 읽을
+    /// 때만 바뀐다 (같은 기기가 overflow 가 아닌 다른 광고도 내므로 -1 로 덮지 않는다).
+    private func noteCandidate(_ id: UUID, _ p: CBPeripheral, fromRaw: Bool, rssi: Int, now: UInt64,
+                               sure: Bool, bit: Int) {
+        var c = cands[id] ?? Cand(viaFilter: nil, viaRaw: nil, rssi: -127, seen: now,
+                                  sure: false, rawList: false, bit: -1)
+        if fromRaw {
+            c.viaRaw = p
+            if sure { c.rawList = true }
+        } else {
+            c.viaFilter = p
+        }
+        c.rssi = rssi
+        c.seen = now
+        c.sure = c.sure || sure
+        if bit >= 0 { c.bit = bit }
+        cands[id] = c
+    }
+
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        guard let pr = probe, pr.peripheral.identifier == peripheral.identifier,
+        // 다른 관리자의 콜백은 우리 탐색 것이 아니다 (같은 기기라도 객체가 다르다).
+        guard let pr = probe, central === pr.central, pr.peripheral.identifier == peripheral.identifier,
               pr.stage == .connecting else { return }
         pr.stage = .services
         peripheral.delegate = self
@@ -506,7 +661,8 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral,
                         error: Error?) {
-        guard let pr = probe, pr.peripheral.identifier == peripheral.identifier else { return }
+        guard let pr = probe, central === pr.central,
+              pr.peripheral.identifier == peripheral.identifier else { return }
         finishProbe(.unreachable, token: "", why: "Unreachable")
     }
 
@@ -514,16 +670,16 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                         error: Error?) {
         // 결과가 나기 전에 끊겼다. 끝난 탐색의 끊김(우리가 끊은 것)은 probe 가 이미 nil 이다.
         // 아직 연결 중 단계라면 이 끊김은 같은 기기의 이전 연결 것이므로 무시한다.
-        guard let pr = probe, pr.peripheral.identifier == peripheral.identifier,
+        guard let pr = probe, central === pr.central, pr.peripheral.identifier == peripheral.identifier,
               pr.stage != .connecting else { return }
         finishProbe(.unreachable, token: "", why: "Unreachable")
     }
 
     // MARK: - CBPeripheralDelegate (토큰 읽기)
+    // 탐색 중인 그 객체의 콜백만 받는다 (===). 다른 관리자가 준 같은 기기의 객체는 다른 객체다.
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        guard let pr = probe, pr.peripheral.identifier == peripheral.identifier,
-              pr.stage == .services else { return }
+        guard let pr = probe, pr.peripheral === peripheral, pr.stage == .services else { return }
         if let e = error {
             finishProbe(.unreachable, token: "", why: AdvScanner.statusText(e))
             return
@@ -540,8 +696,7 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService,
                     error: Error?) {
-        guard let pr = probe, pr.peripheral.identifier == peripheral.identifier,
-              pr.stage == .characteristics else { return }
+        guard let pr = probe, pr.peripheral === peripheral, pr.stage == .characteristics else { return }
         if let e = error {
             finishProbe(.unreachable, token: "", why: AdvScanner.statusText(e))
             return
@@ -559,7 +714,7 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic,
                     error: Error?) {
-        guard let pr = probe, pr.peripheral.identifier == peripheral.identifier,
+        guard let pr = probe, pr.peripheral === peripheral,
               pr.stage == .reading, characteristic.uuid == BLEIds.identToken else { return }
         if let e = error {
             finishProbe(.unreachable, token: "", why: AdvScanner.statusText(e))
@@ -588,11 +743,12 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
     /// 한 기기에 붙어 신원 토큰을 읽는다. 보통 1~3초, 최악 20초 (연결+서비스 10, 특성 5, 읽기 5).
     /// CoreBluetooth 의 connect 는 스스로 시간 제한이 없으므로 타이머로 끊는다.
-    private func startProbe(_ p: CBPeripheral, purpose: Purpose) {
+    /// c 는 p 를 준 관리자여야 한다 (다른 관리자의 객체로는 연결할 수 없다).
+    private func startProbe(_ p: CBPeripheral, on c: CBCentralManager, purpose: Purpose) {
         if probe != nil { abortProbe() }
-        let pr = Probe(peripheral: p, purpose: purpose, t0: Mono.now())
+        let pr = Probe(peripheral: p, central: c, purpose: purpose, t0: Mono.now())
         probe = pr
-        guard let c = central, c.state == .poweredOn else {
+        guard c.state == .poweredOn else {
             finishProbe(.unreachable, token: "", why: "Unreachable")
             return
         }
@@ -633,8 +789,9 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         // 연결을 붙잡고 있으면 폰이 광고를 멈출 수 있으니 반드시 놓아준다. 성공했든
         // 실패했든 시간이 다 됐든 (Windows: 서비스 핸들을 쥐고 있으면 LE 연결을 놓지 않아
         // 몇 대만 훑어도 연결 슬롯이 말라 이후가 전부 Unreachable 이 됐다).
-        if let c = central, c.state == .poweredOn {
-            c.cancelPeripheralConnection(pr.peripheral)
+        // 연결을 건 그 관리자로 끊는다 - 다른 관리자에게 끊으라고 하면 아무 일도 안 일어난다.
+        if pr.central.state == .poweredOn {
+            pr.central.cancelPeripheralConnection(pr.peripheral)
         }
         pr.peripheral.delegate = nil
     }
@@ -649,8 +806,9 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         releaseProbe(pr)
         let took = BLEIds.elapsed(Mono.now(), since: pr.t0)
         switch pr.purpose {
-        case .ident(let rssi):
-            identProbeDone(pr.peripheral.identifier, pickRssi: rssi, outcome, token: token, why: why, took: took)
+        case .ident(let rssi, let bit, let via):
+            identProbeDone(pr.peripheral.identifier, pickRssi: rssi, pickBit: bit, via: via,
+                           outcome, token: token, why: why, took: took)
         case .register:
             registerProbeDone(outcome, token: token, why: why)
         }
@@ -677,26 +835,46 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         // 식별자는 주기적으로 바뀌므로 그냥 두면 계속 쌓인다
         probedUntil = probedUntil.filter { !(now > $0.value + 300_000) }
 
-        // Windows 는 1차로 학습한 overflow 비트와 맞는 후보만 본다. Mac 은 비트를 볼 수 없어
-        // (CoreBluetooth 가 UUID 로만 알려 준다) 바로 2차 - 전체를 신호 순으로 - 를 한다.
-        var pickId: UUID?
-        var pickPeripheral: CBPeripheral?
-        var pickRssi = -127
+        // Windows 처럼 두 번 훑는다 (IdentCandidatePick): 1차는 신원 UUID 를 직접 본 후보와 배운
+        // 비트가 맞는 후보, 못 찾으면 2차로 전체를 신호 순으로.
+        var list: [IdentCandidate<UUID>] = []
+        list.reserveCapacity(cands.count)
         for (id, c) in cands {
-            if c.rssi < probeFloor { continue }   // 자리 판정에 쓸 수 없는 거리는 건드리지 않는다
-            if let until = probedUntil[id], now < until { continue }
-            if c.rssi > pickRssi {
-                pickId = id
-                pickPeripheral = c.peripheral
-                pickRssi = c.rssi
-            }
+            list.append(IdentCandidate(id: id, rssi: c.rssi, sure: c.sure, bit: c.bit))
         }
-        guard let id = pickId, let p = pickPeripheral else { return }
-        probedUntil[id] = now + AdvScanner.retryUnreachableMs   // 잠정 잠금
-        startProbe(p, purpose: .ident(rssi: pickRssi))
+        guard let pick = IdentCandidatePick.pick(list, learnedBit: identBit, probeFloor: probeFloor,
+                                                 probedUntil: probedUntil, now: now),
+              let c = cands[pick.id] else { return }
+        // F 의 객체가 있으면 F 로 붙는다 (원래 경로). R 에서만 본 기기는 R 로.
+        let p: CBPeripheral
+        let mgr: CBCentralManager
+        if let fp = c.viaFilter, let f = central {
+            p = fp
+            mgr = f
+        } else if let rp = c.viaRaw, let r = rawCentral {
+            p = rp
+            mgr = r
+        } else {
+            return
+        }
+        probedUntil[pick.id] = now + AdvScanner.retryUnreachableMs   // 잠정 잠금
+        startProbe(p, on: mgr, purpose: .ident(rssi: c.rssi, bit: c.bit, via: AdvScanner.pathText(c)))
     }
 
-    private func identProbeDone(_ id: UUID, pickRssi: Int, _ outcome: ProbeOutcome,
+    /// bound 줄의 "via ..." - 어느 스캔이 이 기기를 후보로 줬는지. 실기에서 어느 경로가 되는지를
+    /// events.log 만 보고 가를 수 있게 한다 (filter / raw bit N / raw list, 둘 다면 " + ").
+    private static func pathText(_ c: Cand) -> String {
+        var parts: [String] = []
+        if c.viaFilter != nil { parts.append("filter") }
+        if c.bit >= 0 {
+            parts.append("raw bit \(c.bit)")
+        } else if c.rawList {
+            parts.append("raw list")
+        }
+        return parts.joined(separator: " + ")
+    }
+
+    private func identProbeDone(_ id: UUID, pickRssi: Int, pickBit: Int, via: String, _ outcome: ProbeOutcome,
                                 token: String, why: String, took: UInt64) {
         guard running else { return }
         // 연결에 수 초가 걸리므로 등록된 값은 붙잡고 있지 않고 지금 다시 읽는다.
@@ -715,7 +893,15 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         }
         setBound(id)
         boundSeenTick = Mono.now()
-        EventLog.write("ident: bound to \(sid) (\(pickRssi) dBm, \(took)ms)")
+        // 앞부분("ident: bound to XXXX (") 은 Windows 와 같다 - grep 이 그대로 맞는다.
+        EventLog.write("ident: bound to \(sid) (\(pickRssi) dBm, \(took)ms" + (via.isEmpty ? "" : ", via \(via)") + ")")
+        if pickBit >= 0 && pickBit != identBit {
+            identBit = pickBit
+            lock.lock()
+            pubLearnedBit = pickBit   // 설정에 저장하도록 알린다 (메인의 1초 틱이 꺼내 간다)
+            lock.unlock()
+            EventLog.write("ident: overflow bit is now \(pickBit)")
+        }
     }
 
     // MARK: - 내부: BLE 직접 등록
@@ -763,12 +949,12 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         reg.timer?.cancel()
         reg.timer = nil
         updateScan()
-        guard let best = reg.best else {
+        guard let best = reg.best, let f = central else {
             finishRegistration(.failure(why: "앱을 화면에 띄운 폰을 찾지 못했습니다"))
             return
         }
         EventLog.write("register: candidate \(BLEIds.shortId(best.identifier)) rssi=\(reg.bestRssi) dBm")
-        startProbe(best, purpose: .register)
+        startProbe(best, on: f, purpose: .register)   // best 는 F 가 준 객체다
     }
 
     private func registerProbeDone(_ outcome: ProbeOutcome, token: String, why: String) {
@@ -810,6 +996,7 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
     /// ble_scan_log.csv 한 줄. 칸 위치는 Windows 와 같다 (tools/rssi-threshold.ps1 이 0, 5, 7 번 칸을 읽는다).
     /// time,address,addrType,company,name,matched,rawRssi,smoothedRssi,mfgData,svcUuid
+    /// 두 스캔의 광고가 섞여 들어온다 (어느 쪽인지는 적지 않는다 - 칸을 늘리면 그 도구가 틀린다).
     private func logAdv(_ f: BLEIds.CsvLog, id: UUID, adv: [String: Any], name: String, matched: Bool,
                         raw: Int, smoothed: Int, plainList: [CBUUID], now: UInt64) {
         if !matched {
