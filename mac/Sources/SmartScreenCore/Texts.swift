@@ -144,7 +144,8 @@ public enum Texts {
 
     /// 목록(로그 표) 한 줄, 7 칸: Time, 신호 강도, Signal, Distance, State, Timer, Event.
     /// Mac 에서 fails 는 늘 0, inWarmup 은 늘 false 다 (latency 경로가 없다).
-    public static func listRow(_ r: ProbeResult, nearThr: Int, nearLatencyMs: UInt32, inWarmup: Bool, fails: Int) -> [String] {
+    /// nearThr 는 광고 경로, gattThr 는 연결 경로의 설정값 (상태바와 같이 받는다).
+    public static func listRow(_ r: ProbeResult, nearThr: Int, gattThr: Int, nearLatencyMs: UInt32, inWarmup: Bool, fails: Int) -> [String] {
         let transition = r.state != r.prevState
         let secs = Int(r.timerRemainMs / 1000)
 
@@ -165,8 +166,12 @@ public enum Texts {
             // 등록된 폰이 첫 패킷을 받기 전에 보이는 줄이다 (err=0)
             ev = "unreachable (err=\(r.wsaError))"
         } else if r.bleAvailable {
-            // BLE RSSI 기반 이벤트 메시지. 기준은 광고 설정값이다 (GATT 행이어도, 히스테리시스 없이).
-            if r.state == .near && r.rssiDbm >= nearThr {
+            // BLE RSSI 기반 이벤트 메시지. 기준은 그 행의 경로가 실제로 쓰는 설정값이다 (광고 행은
+            // 광고 임계값, GATT 행은 광고 임계값 + gattRssiOffset 인 연결 임계값) - 판정과 상태바와
+            // 같다. NEAR 행이라 히스테리시스는 없다. 두 값이 다를 수 있으므로 GATT 행을 광고 값으로
+            // 재면 멀쩡한 연결 행이 "weak" 으로 보인다.
+            let thr = r.gatt ? gattThr : nearThr
+            if r.state == .near && r.rssiDbm >= thr {
                 ev = "near (\(r.rssiDbm) dBm, reset \(secs)s)"
             } else if r.state == .near && inWarmup {
                 ev = "near (warmup, \(r.rssiDbm) dBm)"

@@ -23,7 +23,7 @@ import Foundation
 
 /// 연결 신호를 어떻게 했는가. 광고 판정이 ok 일 때만 정해진다.
 public enum WizardGattOutcome: Equatable {
-    /// 재서 썼다: gattRssiOffset = (연결 착석 최저값 - 2) - 광고 기준
+    /// 재서 썼다: gattRssiOffset = (연결 착석 최저값 - 2) - 광고 기준, [-40, 40] 으로 자른 값
     case measured
     /// 표본이 모자랐다 (폰 앱이 이 컴퓨터에 연결돼 있지 않았다). 지금의 차이를 그대로 둔다.
     case notMeasured
@@ -165,8 +165,11 @@ public enum WizardJudge {
                                  logLine: advLog + "; 연결 겹침 (착석 \(gLo)..\(gHi), 비움 \(gaLo)..\(gaHi)) - 차이 \(signed(keep)) dB 그대로")
         }
 
+        // config.ini 를 읽을 때와 같은 [-40, 40] 으로 여기서 자른다. 안 자르면 로그에는 "차이 -45"
+        // 가 남고 저장도 -45 로 되지만, [이대로 쓰기] 바로 뒤 다시 읽을 때 -40 이 되어 실제로는
+        // -40 으로 돈다. 잰 범위는 본문과 로그에 그대로 남으니 자르기 전 값도 거기서 알 수 있다.
         let gattBase = gLo - 2
-        let offset = gattBase - base
+        let offset = min(max(gattBase - base, Choices.gattOffsetMin), Choices.gattOffsetMax)
         let body = "광고 신호\n  앉아 있을 때  \(sLo) ~ \(sHi)\n  자리 비웠을 때  \(aLo) ~ \(aHi)\n연결 신호\n  앉아 있을 때  \(gLo) ~ \(gHi)\n  자리 비웠을 때  \(gaLo) ~ \(gaHi)\n\n이 자리에 맞게 \"보통\" 을 맞췄어요. \"가까이\" 는 더 빨리 잠기고, \"멀리\" 는 더 늦게 잠깁니다."
         return WizardVerdict(ok: true, base: base, gattOffset: offset, gatt: .measured,
                              title: "다 됐어요",

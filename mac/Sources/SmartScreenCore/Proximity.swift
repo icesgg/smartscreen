@@ -164,7 +164,10 @@ public final class ProximityJudge {
             // 광고가 들리면 이쪽으로 오지 않는다. 예전에는 GATT가 끊기기만 하면
             // RSSI를 보지도 않고 부재로 단정했는데, 앱이 잠깐 떨어져 나간 것만으로
             // -46dBm 으로 들리는 폰을 두고 화면을 잠갔다.
-            // (effThr 은 Windows 처럼 광고 임계값 그대로 둔다. 두 값은 늘 같다.)
+            // (effThr 은 Windows 처럼 광고 임계값 그대로 둔다. 이 갈래는 임계값을 안 보므로 판정에는
+            // 영향이 없다. 다만 연결 임계값은 광고 임계값 + gattRssiOffset 이라, 차이가 0 이 아니면
+            // 이 STATE 줄의 thr= 는 set=(연결 설정값) 과 다르게 찍힌다. 두 플랫폼의 로그가 같아야 해서
+            // 한쪽만 바꾸지 않는다.)
             useGatt = true; bleAvail = true; reachable = true
             rssi = -100
             isNear = false

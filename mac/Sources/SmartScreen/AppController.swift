@@ -632,7 +632,8 @@ final class AppController: NSObject, GuardEngineHost {
 
         // Mac 에는 latency 경로가 없다: 실패 횟수는 늘 0, 재연결 웜업도 없다
         let nearThr = Shared.shared.nearRssiThreshold
-        let row = Texts.listRow(r, nearThr: nearThr, nearLatencyMs: AppController.fixedNearLatencyMs,
+        let gattThr = Shared.shared.gattRssiThreshold
+        let row = Texts.listRow(r, nearThr: nearThr, gattThr: gattThr, nearLatencyMs: AppController.fixedNearLatencyMs,
                                 inWarmup: false, fails: 0)
         listRows.insert(row, at: 0)
         if listRows.count > AppController.listCap {
@@ -645,7 +646,7 @@ final class AppController: NSObject, GuardEngineHost {
         let scan = AdvScanner.shared.snapshot(now: now)
         let gatt = GattServer.shared.snapshot(now: now)
         statusText = Texts.statusBar(r, targetName: targetName, packetRate: scan.packetRate,
-                                     nearThr: nearThr, gattThr: Shared.shared.gattRssiThreshold,
+                                     nearThr: nearThr, gattThr: gattThr,
                                      idSt: Texts.idStatus(hasToken: hasToken, bound: scan.bound),
                                      gattSt: Texts.gattStatus(running: gatt.running, subscribed: gatt.subscribed),
                                      countdown: guardEngine.nCountdown)

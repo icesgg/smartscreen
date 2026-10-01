@@ -257,7 +257,7 @@ final class CoreBProximityTests: XCTestCase {
         r = step(j, 2_000, s)
         XCTAssertFalse(r.reachable)
         XCTAssertEqual(r.state, .far)
-        XCTAssertEqual(Texts.listRow(r, nearThr: -65, nearLatencyMs: 200, inWarmup: false, fails: 0),
+        XCTAssertEqual(Texts.listRow(r, nearThr: -65, gattThr: -65, nearLatencyMs: 200, inWarmup: false, fails: 0),
                        ["09:00:00", "timeout", "\u{2591}\u{2591}\u{2591}\u{2591}\u{2591} 0", "-", "FAR", "-", "unreachable (err=0)"])
     }
 
@@ -285,7 +285,7 @@ final class CoreBProximityTests: XCTestCase {
         r = step(j, 4_000, CoreBFix.adv(-70, tick: 4_000))
         XCTAssertEqual(r.state, .near)
         XCTAssertEqual(r.timerRemainMs, 2_000)
-        XCTAssertEqual(Texts.listRow(r, nearThr: -65, nearLatencyMs: 200, inWarmup: false, fails: 0)[5], "2s")
+        XCTAssertEqual(Texts.listRow(r, nearThr: -65, gattThr: -65, nearLatencyMs: 200, inWarmup: false, fails: 0)[5], "2s")
     }
 
     /// 처음 구독을 본 판정만 알린다 (호출자가 저장과 로그를 한다).
@@ -689,33 +689,33 @@ final class CoreBTextsTests: XCTestCase {
     func testListRows() {
         let bar4 = "\u{2588}\u{2588}\u{2588}\u{2588}\u{2591} 4"
         XCTAssertEqual(Texts.listRow(bleResult(.near, prev: .far, rssi: -58, remainMs: 5_000),
-                                     nearThr: -65, nearLatencyMs: 200, inWarmup: false, fails: 0),
+                                     nearThr: -65, gattThr: -65, nearLatencyMs: 200, inWarmup: false, fails: 0),
                        ["14:02:03", "-58 dBm", bar4, "~2-5m", "NEAR", "5s", ">>> ENTERED NEAR (-58 dBm) <<<"])
         XCTAssertEqual(Texts.listRow(bleResult(.near, prev: .far, rssi: -44, gatt: true, remainMs: 5_000),
-                                     nearThr: -65, nearLatencyMs: 200, inWarmup: false, fails: 0),
+                                     nearThr: -65, gattThr: -65, nearLatencyMs: 200, inWarmup: false, fails: 0),
                        ["14:02:03", "-44 dBm G", "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588} 5", "< 1m", "NEAR", "5s",
                         ">>> ENTERED NEAR (-44 dBm GATT) <<<"])
-        XCTAssertEqual(Texts.listRow(bleResult(.far, prev: .near, rssi: -72), nearThr: -65, nearLatencyMs: 200,
+        XCTAssertEqual(Texts.listRow(bleResult(.far, prev: .near, rssi: -72), nearThr: -65, gattThr: -65, nearLatencyMs: 200,
                                      inWarmup: false, fails: 0)[6], "<<< LEFT NEAR ZONE >>>")
-        XCTAssertEqual(Texts.listRow(bleResult(.near, prev: .near, rssi: -60, remainMs: 3_500), nearThr: -65,
+        XCTAssertEqual(Texts.listRow(bleResult(.near, prev: .near, rssi: -60, remainMs: 3_500), nearThr: -65, gattThr: -65,
                                      nearLatencyMs: 200, inWarmup: false, fails: 0)[6], "near (-60 dBm, reset 3s)")
-        XCTAssertEqual(Texts.listRow(bleResult(.near, prev: .near, rssi: -66, remainMs: 3_500), nearThr: -65,
+        XCTAssertEqual(Texts.listRow(bleResult(.near, prev: .near, rssi: -66, remainMs: 3_500), nearThr: -65, gattThr: -65,
                                      nearLatencyMs: 200, inWarmup: false, fails: 0)[6], "near (weak -66 dBm, 3s)")
-        XCTAssertEqual(Texts.listRow(bleResult(.near, prev: .near, rssi: -70), nearThr: -65,
+        XCTAssertEqual(Texts.listRow(bleResult(.near, prev: .near, rssi: -70), nearThr: -65, gattThr: -65,
                                      nearLatencyMs: 200, inWarmup: true, fails: 0)[6], "near (warmup, -70 dBm)")
-        let lost = Texts.listRow(bleResult(.far, prev: .far, rssi: -100), nearThr: -65, nearLatencyMs: 200,
+        let lost = Texts.listRow(bleResult(.far, prev: .far, rssi: -100), nearThr: -65, gattThr: -65, nearLatencyMs: 200,
                                  inWarmup: false, fails: 0)
         XCTAssertEqual(lost, ["14:02:03", "-100 dBm", "\u{2591}\u{2591}\u{2591}\u{2591}\u{2591} 0", "> 15m", "FAR", "-",
                               "far (BLE lost)"])
-        XCTAssertEqual(Texts.listRow(bleResult(.far, prev: .far, rssi: -86), nearThr: -65, nearLatencyMs: 200,
+        XCTAssertEqual(Texts.listRow(bleResult(.far, prev: .far, rssi: -86), nearThr: -65, gattThr: -65, nearLatencyMs: 200,
                                      inWarmup: false, fails: 0)[6], "far (-86 dBm)")
 
         var u = ProbeResult()
         u.timeStr = "14:02:03"
         u.wsaError = 10060
-        XCTAssertEqual(Texts.listRow(u, nearThr: -65, nearLatencyMs: 200, inWarmup: false, fails: 5)[6],
+        XCTAssertEqual(Texts.listRow(u, nearThr: -65, gattThr: -65, nearLatencyMs: 200, inWarmup: false, fails: 5)[6],
                        "unreachable - reconnecting... (fail=5)")
-        XCTAssertEqual(Texts.listRow(u, nearThr: -65, nearLatencyMs: 200, inWarmup: false, fails: 3)[6],
+        XCTAssertEqual(Texts.listRow(u, nearThr: -65, gattThr: -65, nearLatencyMs: 200, inWarmup: false, fails: 3)[6],
                        "unreachable (fail=3, err=10060)")
 
         var lat = ProbeResult()
@@ -725,18 +725,37 @@ final class CoreBTextsTests: XCTestCase {
         lat.state = .near
         lat.prevState = .far
         lat.timerRemainMs = 5_000
-        XCTAssertEqual(Texts.listRow(lat, nearThr: -65, nearLatencyMs: 200, inWarmup: false, fails: 0),
+        XCTAssertEqual(Texts.listRow(lat, nearThr: -65, gattThr: -65, nearLatencyMs: 200, inWarmup: false, fails: 0),
                        ["14:02:03", "120 ms", bar4, "< 1m", "NEAR", "5s", ">>> ENTERED NEAR (120ms) <<<"])
         lat.prevState = .near
-        XCTAssertEqual(Texts.listRow(lat, nearThr: -65, nearLatencyMs: 200, inWarmup: false, fails: 0)[6],
+        XCTAssertEqual(Texts.listRow(lat, nearThr: -65, gattThr: -65, nearLatencyMs: 200, inWarmup: false, fails: 0)[6],
                        "near (reset 5s, 120ms)")
         lat.latencyMs = 450
-        XCTAssertEqual(Texts.listRow(lat, nearThr: -65, nearLatencyMs: 200, inWarmup: false, fails: 0)[6],
+        XCTAssertEqual(Texts.listRow(lat, nearThr: -65, gattThr: -65, nearLatencyMs: 200, inWarmup: false, fails: 0)[6],
                        "near (weak 450ms, 5s)")
         lat.state = .far
         lat.prevState = .far
-        XCTAssertEqual(Texts.listRow(lat, nearThr: -65, nearLatencyMs: 200, inWarmup: false, fails: 0),
+        XCTAssertEqual(Texts.listRow(lat, nearThr: -65, gattThr: -65, nearLatencyMs: 200, inWarmup: false, fails: 0),
                        ["14:02:03", "450 ms", "\u{2588}\u{2588}\u{2588}\u{2591}\u{2591} 3", "~2-3m", "FAR", "-", "far (450ms)"])
+    }
+
+    /// 행은 그 경로의 설정값으로 잰다: 재보기가 차이 -12 를 재서 광고 -47, 연결 -59 일 때
+    /// 연결 -55 는 멀쩡한 NEAR 이고 (판정·상태바와 같다), 같은 값의 광고 행은 "weak" 이다.
+    func testListRowUsesItsPathThreshold() {
+        let gattRow = Texts.listRow(bleResult(.near, prev: .near, rssi: -55, gatt: true, remainMs: 5_000),
+                                    nearThr: -47, gattThr: -59, nearLatencyMs: 200, inWarmup: false, fails: 0)
+        XCTAssertEqual(gattRow[1], "-55 dBm G")
+        XCTAssertEqual(gattRow[6], "near (-55 dBm, reset 5s)")
+        XCTAssertEqual(Texts.listRow(bleResult(.near, prev: .near, rssi: -55, remainMs: 5_000),
+                                     nearThr: -47, gattThr: -59, nearLatencyMs: 200, inWarmup: false, fails: 0)[6],
+                       "near (weak -55 dBm, 5s)")
+        XCTAssertEqual(Texts.listRow(bleResult(.near, prev: .near, rssi: -61, gatt: true, remainMs: 5_000),
+                                     nearThr: -47, gattThr: -59, nearLatencyMs: 200, inWarmup: false, fails: 0)[6],
+                       "near (weak -61 dBm, 5s)")
+        // 같은 숫자를 가진 상태바와 한 경로를 본다
+        XCTAssertTrue(Texts.statusBar(bleResult(.near, prev: .near, rssi: -55, gatt: true), targetName: "p", packetRate: 1,
+                                      nearThr: -47, gattThr: -59, idSt: "토큰", gattSt: "linked", countdown: 1)
+                        .contains("Near>=-59 dBm"))
     }
 
     func testLevelsAndDistances() {
@@ -1068,6 +1087,37 @@ final class CoreBWizardJudgeTests: XCTestCase {
         let near = Choices.distValue(base: v.base, step: 1)
         XCTAssertEqual(near, -47)
         XCTAssertEqual(Choices.gattThreshold(near: near, offset: v.gattOffset), -59)
+    }
+
+    func testMeasuredOffsetIsClamped() {
+        // 잰 차이가 [-40, 40] 밖이면 config.ini 를 읽을 때처럼 잘라서 로그·저장·적용이 한 값이다.
+        // 잰 범위는 그대로 적는다.
+        let advS = Array(-38 ... -30) + Array(-38 ... -30)           // 18 개, 기준 -40
+        let advA = [-60, -55, -58, -52, -57, -59, -54, -56]
+        let gS = Array(-82 ... -75) + Array(-82 ... -75)             // 16 개, 연결 기준 -84
+        let gA = [-95, -90, -88, -92, -86, -94, -89, -91]
+        let low = WizardJudge.judge(seated: advS, away: advA, gattSeated: gS, gattAway: gA, currentGattOffset: 0)
+        XCTAssertTrue(low.ok)
+        XCTAssertEqual(low.base, -40)
+        XCTAssertEqual(low.gatt, .measured)
+        XCTAssertEqual(low.gattOffset, -40)                          // (-84) - (-40) = -44 → -40
+        XCTAssertEqual(low.logLine, "재보기: 착석 -38..-30 (18개), 비움 -60..-52 (8개) -> 기준 -40 dBm; 연결 착석 -82..-75 (16개), 비움 -95..-86 (8개) -> 차이 -40 dB")
+        XCTAssertEqual(low.body, "광고 신호\n  앉아 있을 때  -38 ~ -30\n  자리 비웠을 때  -60 ~ -52\n연결 신호\n  앉아 있을 때  -82 ~ -75\n  자리 비웠을 때  -95 ~ -86\n\n이 자리에 맞게 \"보통\" 을 맞췄어요. \"가까이\" 는 더 빨리 잠기고, \"멀리\" 는 더 늦게 잠깁니다.")
+        XCTAssertEqual(Choices.gattThreshold(near: low.base, offset: low.gattOffset), -80)
+
+        // 반대쪽: 연결이 광고보다 42 dB 세다 → +40
+        let high = WizardJudge.judge(seated: gS, away: gA, gattSeated: advS, gattAway: advA, currentGattOffset: 0)
+        XCTAssertTrue(high.ok)
+        XCTAssertEqual(high.base, -84)
+        XCTAssertEqual(high.gattOffset, 40)                          // (-40) - (-84) = +44 → +40
+        XCTAssertTrue(high.logLine.hasSuffix("; 연결 착석 -38..-30 (18개), 비움 -60..-52 (8개) -> 차이 +40 dB"), high.logLine)
+
+        // 경계값은 그대로 (-40 / +40)
+        let edge = WizardJudge.judge(seated: advS, away: advA,
+                                     gattSeated: Array(-78 ... -71) + Array(-78 ... -71), gattAway: gA,
+                                     currentGattOffset: 0)
+        XCTAssertEqual(edge.gattOffset, -40)                         // (-80) - (-40)
+        XCTAssertTrue(edge.logLine.hasSuffix("-> 차이 -40 dB"), edge.logLine)
     }
 
     func testGattNotMeasuredKeepsOffset() {
