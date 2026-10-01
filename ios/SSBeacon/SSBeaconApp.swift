@@ -22,6 +22,7 @@
 
 import SwiftUI
 import UIKit
+import Combine          // ObservableObject / @Published. Xcode 26 새 프로젝트(MemberImportVisibility)는 직접 import 해야 한다
 import CoreBluetooth
 import Security
 import AuthenticationServices
