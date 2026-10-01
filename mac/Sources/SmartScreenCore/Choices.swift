@@ -54,6 +54,23 @@ public enum Choices {
         return base + distOffsets[s]
     }
 
+    /// gattRssiOffset 이 가질 수 있는 값 (dB). config.ini 를 읽을 때 이 안으로 붙인다 -
+    /// 손으로 고친 엉뚱한 숫자 하나로 연결 경로가 늘 NEAR 나 늘 FAR 가 되지 않게.
+    public static let gattOffsetMin = -40
+    public static let gattOffsetMax = 40
+
+    /// 연결(GATT) 경로 임계값 = 광고 임계값(눈에 보이는 하나의 숫자) + 재보기가 잰 두 신호의 차이,
+    /// [-100, -30] 으로 자른다 ("신호 강도" 칸과 같은 범위).
+    ///
+    /// 1.1.6 부터 두 경로가 한 값을 썼다. Windows 노트북에서는 두 경로가 2 dB 안에서 같이
+    /// 움직였지만, M1 맥북에서는 폰이 잰 연결 세기가 같은 순간의 광고 세기보다 12~15 dB 낮았다
+    /// (광고 -41 / 연결 -58). 연결로 잰 기준(-59)은 폰이 다른 PC 에 붙어 광고로 판단하는 동안
+    /// 자리를 비워도 그 위에 머물러 화면이 꺼지지 않았다. 그래서 숫자는 하나로 두고, 그 차이를
+    /// 재보기가 재서 연결 쪽이 그만큼 따라가게 한다. 차이 0 (아직 안 잼) 이면 예전과 같다.
+    public static func gattThreshold(near: Int, offset: Int) -> Int {
+        return min(max(near + offset, -100), -30)
+    }
+
     /// 장치 목록에서 등록된 폰을 고르고 시작했을 때의 g_targetName. 표시 전용이라
     /// 광고 이름과 맞춰 보는 일은 없다.
     public static let registeredPhoneName = "등록된 폰"

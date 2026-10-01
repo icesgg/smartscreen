@@ -285,6 +285,12 @@ public enum Texts {
         return v
     }
 
+    /// 간단 창 거리 슬라이더를 옮겼을 때의 events.log 줄 (SimpleApplyDist). step 은 0...2 라 1을
+    /// 더해 적는다. 괄호 안은 그 값에서 따라 정해진 연결(GATT) 경로 임계값 (Choices.gattThreshold).
+    public static func distLogLine(step: Int, near: Int, gatt: Int) -> String {
+        return "간단 화면: 거리 \(step + 1)단계 -> \(near) dBm (연결 \(gatt) dBm)"
+    }
+
     /// ComboFindValue: |v - target| 이 가장 작은 칸. 앞에서부터 엄격한 < 로 보므로 같으면 앞 칸.
     public static func comboFindValue(_ values: [Int], _ target: Int) -> Int {
         guard let first = values.first else { return 0 }

@@ -901,50 +901,249 @@ final class CoreBChoicesTests: XCTestCase {
         XCTAssertEqual(Choices.distStep(base: -67, threshold: -61), 0)
         XCTAssertEqual(Choices.distStep(base: -67, threshold: -73), 2)
     }
+
+    func testGattThresholdFollowsNearByOffset() {
+        XCTAssertEqual(Choices.gattOffsetMin, -40)
+        XCTAssertEqual(Choices.gattOffsetMax, 40)
+        // 차이 0 (예전 config, 아직 안 잼): 두 경로가 같은 값 - 1.1.6 ~ 1.1.9 와 같다
+        XCTAssertEqual(Choices.gattThreshold(near: -64, offset: 0), -64)
+        XCTAssertEqual(Choices.gattThreshold(near: -59, offset: 0), -59)
+        // M1 맥북: 광고 기준 -47, 연결이 12 dB 낮다 → 연결 -59
+        XCTAssertEqual(Choices.gattThreshold(near: -47, offset: -12), -59)
+        XCTAssertEqual(Choices.gattThreshold(near: -41, offset: -12), -53)    // 슬라이더 "가까이"
+        XCTAssertEqual(Choices.gattThreshold(near: -60, offset: 5), -55)
+        // [-100, -30] 으로 자른다 ("신호 강도" 칸과 같은 범위)
+        XCTAssertEqual(Choices.gattThreshold(near: -95, offset: -15), -100)
+        XCTAssertEqual(Choices.gattThreshold(near: -100, offset: -40), -100)
+        XCTAssertEqual(Choices.gattThreshold(near: -85, offset: -15), -100)
+        XCTAssertEqual(Choices.gattThreshold(near: -84, offset: -15), -99)
+        XCTAssertEqual(Choices.gattThreshold(near: -35, offset: 10), -30)
+        XCTAssertEqual(Choices.gattThreshold(near: -30, offset: 40), -30)
+        XCTAssertEqual(Choices.gattThreshold(near: -31, offset: 1), -30)
+        XCTAssertEqual(Choices.gattThreshold(near: -32, offset: 1), -31)
+    }
+
+    func testDistLogLine() {
+        XCTAssertEqual(Texts.distLogLine(step: 1, near: -47, gatt: -59), "간단 화면: 거리 2단계 -> -47 dBm (연결 -59 dBm)")
+        XCTAssertEqual(Texts.distLogLine(step: 0, near: -58, gatt: -58), "간단 화면: 거리 1단계 -> -58 dBm (연결 -58 dBm)")
+        XCTAssertEqual(Texts.distLogLine(step: 2, near: -70, gatt: -65), "간단 화면: 거리 3단계 -> -70 dBm (연결 -65 dBm)")
+    }
 }
 
 // MARK: - WizardJudge
 
 final class CoreBWizardJudgeTests: XCTestCase {
+    // 광고 신호가 되는 한 벌: 착석 -60..-50 (22개), 비움 -80..-63 (9개) → 기준 -62
+    private let advSeated = Array(-60 ... -50) + Array(-60 ... -50)
+    private let advAway = [-80, -70, -63, -75, -66, -71, -79, -68, -77]
+    // 연결 신호가 되는 한 벌: 착석 -75..-66 (20개), 비움 -90..-80 (8개) → 연결 기준 -77
+    private let gattSeated = Array(-75 ... -66) + Array(-75 ... -66)
+    private let gattAway = [-90, -85, -80, -88, -82, -86, -84, -81]
+
+    /// 연결 신호를 아예 못 받았을 때 (폰 앱이 다른 PC 에 붙어 있었다)
+    private func judgeAdvOnly(_ seated: [Int], _ away: [Int], offset: Int = 0) -> WizardVerdict {
+        return WizardJudge.judge(seated: seated, away: away, gattSeated: [], gattAway: [], currentGattOffset: offset)
+    }
+
+    private let doneTail = "\n\n이 자리에 맞게 \"보통\" 을 맞췄어요. \"가까이\" 는 더 빨리 잠기고, \"멀리\" 는 더 늦게 잠깁니다."
+
+    // MARK: 광고가 실패하면 연결 신호는 보지 않는다 (글과 로그는 예전 그대로)
+
     func testTooFew() {
-        let v = WizardJudge.judge(seated: Array(repeating: -55, count: 14), away: Array(repeating: -80, count: 8))
+        let v = judgeAdvOnly(Array(repeating: -55, count: 14), Array(repeating: -80, count: 8))
         XCTAssertFalse(v.ok)
         XCTAssertEqual(v.title, "신호를 거의 못 받았어요")
         XCTAssertEqual(v.body, "앉아 있을 때 14번, 비웠을 때 8번밖에 못 받았어요.\n\n폰에서 SSBeacon 앱이 켜져 있는지, 그리고 이 컴퓨터의 블루투스가 켜져 있는지 확인해 주세요.")
         XCTAssertEqual(v.logLine, "재보기: 표본 부족 (착석 14, 비움 8)")
-        let empty = WizardJudge.judge(seated: [], away: [])
+        let empty = judgeAdvOnly([], [])
         XCTAssertEqual(empty.logLine, "재보기: 표본 부족 (착석 0, 비움 0)")
+        XCTAssertEqual(judgeAdvOnly(Array(-60 ... -50) + Array(-60 ... -50), Array(repeating: -80, count: 7)).logLine,
+                       "재보기: 표본 부족 (착석 22, 비움 7)")
+
+        // 연결 신호가 아무리 좋아도 광고가 모자라면 실패다. 차이는 저장하지 않는다.
+        let g = WizardJudge.judge(seated: Array(repeating: -55, count: 14), away: Array(repeating: -80, count: 8),
+                                  gattSeated: gattSeated, gattAway: gattAway, currentGattOffset: -12)
+        XCTAssertFalse(g.ok)
+        XCTAssertNil(g.gatt)
+        XCTAssertEqual(g.gattOffset, 0)
+        XCTAssertEqual(g.base, 0)
+        XCTAssertEqual(g.title, v.title)
+        XCTAssertEqual(g.body, v.body)
+        XCTAssertEqual(g.logLine, v.logLine)
     }
 
     func testFlatAdapter() {
         var seated: [Int] = []
         for i in 0..<20 { seated.append(i % 2 == 0 ? -60 : -61) }
-        let v = WizardJudge.judge(seated: seated, away: Array(repeating: -90, count: 10))
+        let v = judgeAdvOnly(seated, Array(repeating: -90, count: 10))
         XCTAssertFalse(v.ok)
         XCTAssertEqual(v.title, "이 블루투스 장치는 세기를 못 재요")
         XCTAssertEqual(v.body, "1분 동안 20번을 받았는데 값이 -61 dBm 에서 거의 움직이지 않았어요.\n\n진짜로 재는 장치라면 가만히 있어도 값이 몇 칸은 흔들립니다. 이 장치는 신호 세기를 흉내만 내고 있어서 거리로 쓸 수 없어요.\n\n다른 블루투스 동글로 바꾸는 게 좋습니다.")
         XCTAssertEqual(v.logLine, "재보기: 어댑터가 세기를 안 낸다 (착석 20개, -61..-60 dBm)")
+
+        let g = WizardJudge.judge(seated: seated, away: Array(repeating: -90, count: 10),
+                                  gattSeated: gattSeated, gattAway: gattAway, currentGattOffset: 5)
+        XCTAssertFalse(g.ok)
+        XCTAssertNil(g.gatt)
+        XCTAssertEqual(g.gattOffset, 0)
+        XCTAssertEqual(g.title, v.title)
+        XCTAssertEqual(g.body, v.body)
+        XCTAssertEqual(g.logLine, v.logLine)
+    }
+
+    func testFlatGattIsNotAnAdapterFailure() {
+        // 연결 신호에는 어댑터 검사가 없다 - 폰이 잰 값이다. 1 dB 안에서만 흔들려도 쓴다.
+        var gs: [Int] = []
+        for i in 0..<20 { gs.append(i % 2 == 0 ? -70 : -71) }
+        let v = WizardJudge.judge(seated: advSeated, away: advAway, gattSeated: gs, gattAway: gattAway,
+                                  currentGattOffset: 0)
+        XCTAssertTrue(v.ok)
+        XCTAssertEqual(v.gatt, .measured)
+        XCTAssertEqual(v.gattOffset, -11)             // (-71 - 2) - (-62)
     }
 
     func testOverlap() {
         let seated = Array(-60 ... -50)  + Array(-60 ... -50)
         let away = [-80, -70, -62, -75, -66, -71, -79, -68]
-        let v = WizardJudge.judge(seated: seated, away: away)
+        let v = judgeAdvOnly(seated, away)
         XCTAssertFalse(v.ok)
         XCTAssertEqual(v.title, "앉아 있을 때와 비울 때가 구분되지 않아요")
         XCTAssertEqual(v.body, "앉아 있을 때 -60~-50, 비웠을 때 -80~-62 로 겹칩니다.\n\n폰을 둔 곳이 책상과 너무 가까웠어요. 더 멀리 두고 다시 해 보세요.")
         XCTAssertEqual(v.logLine, "재보기: 구간이 겹친다 (착석 -60..-50, 비움 -80..-62)")
+
+        let g = WizardJudge.judge(seated: seated, away: away,
+                                  gattSeated: gattSeated, gattAway: gattAway, currentGattOffset: -12)
+        XCTAssertFalse(g.ok)
+        XCTAssertNil(g.gatt)
+        XCTAssertEqual(g.gattOffset, 0)
+        XCTAssertEqual(g.title, v.title)
+        XCTAssertEqual(g.body, v.body)
+        XCTAssertEqual(g.logLine, v.logLine)
     }
 
-    func testDone() {
-        let seated = Array(-60 ... -50) + Array(-60 ... -50)      // 22 개
-        let away = [-80, -70, -63, -75, -66, -71, -79, -68, -77]  // 9 개
-        let v = WizardJudge.judge(seated: seated, away: away)
+    // MARK: 광고가 되면 연결 신호로 차이를 정한다
+
+    func testDoneGattMeasured() {
+        let v = WizardJudge.judge(seated: advSeated, away: advAway, gattSeated: gattSeated, gattAway: gattAway,
+                                  currentGattOffset: 7)
         XCTAssertTrue(v.ok)
         XCTAssertEqual(v.base, -62)
+        XCTAssertEqual(v.gatt, .measured)
+        XCTAssertEqual(v.gattOffset, -15)            // (-75 - 2) - (-62). 지금 값 7 은 버린다
         XCTAssertEqual(v.title, "다 됐어요")
-        XCTAssertEqual(v.body, "앉아 있을 때  -60 ~ -50\n자리 비웠을 때  -80 ~ -63\n\n이 자리에 맞게 \"보통\" 을 맞췄어요. \"가까이\" 는 더 빨리 잠기고, \"멀리\" 는 더 늦게 잠깁니다.")
-        XCTAssertEqual(v.logLine, "재보기: 착석 -60..-50 (22개), 비움 -80..-63 (9개) -> 기준 -62 dBm")
+        XCTAssertEqual(v.body, "광고 신호\n  앉아 있을 때  -60 ~ -50\n  자리 비웠을 때  -80 ~ -63\n연결 신호\n  앉아 있을 때  -75 ~ -66\n  자리 비웠을 때  -90 ~ -80\n\n이 자리에 맞게 \"보통\" 을 맞췄어요. \"가까이\" 는 더 빨리 잠기고, \"멀리\" 는 더 늦게 잠깁니다.")
+        XCTAssertEqual(v.logLine, "재보기: 착석 -60..-50 (22개), 비움 -80..-63 (9개) -> 기준 -62 dBm; 연결 착석 -75..-66 (20개), 비움 -90..-80 (8개) -> 차이 -15 dB")
+        XCTAssertTrue(v.body.hasSuffix(doneTail))
+    }
+
+    func testDoneGattMeasuredSigns() {
+        // 연결이 광고보다 세면 + 로, 같으면 +0 으로 적는다 (C 의 %+d)
+        let up = WizardJudge.judge(seated: advSeated, away: advAway,
+                                   gattSeated: Array(-55 ... -45) + Array(-55 ... -45), gattAway: gattAway,
+                                   currentGattOffset: -12)
+        XCTAssertEqual(up.gatt, .measured)
+        XCTAssertEqual(up.gattOffset, 5)
+        XCTAssertTrue(up.logLine.hasSuffix("; 연결 착석 -55..-45 (22개), 비움 -90..-80 (8개) -> 차이 +5 dB"), up.logLine)
+
+        let same = WizardJudge.judge(seated: advSeated, away: advAway, gattSeated: advSeated, gattAway: advAway,
+                                     currentGattOffset: -12)
+        XCTAssertEqual(same.gatt, .measured)
+        XCTAssertEqual(same.gattOffset, 0)
+        XCTAssertEqual(same.logLine, "재보기: 착석 -60..-50 (22개), 비움 -80..-63 (9개) -> 기준 -62 dBm; 연결 착석 -60..-50 (22개), 비움 -80..-63 (9개) -> 차이 +0 dB")
+        XCTAssertEqual(same.body, "광고 신호\n  앉아 있을 때  -60 ~ -50\n  자리 비웠을 때  -80 ~ -63\n연결 신호\n  앉아 있을 때  -60 ~ -50\n  자리 비웠을 때  -80 ~ -63\n\n이 자리에 맞게 \"보통\" 을 맞췄어요. \"가까이\" 는 더 빨리 잠기고, \"멀리\" 는 더 늦게 잠깁니다.")
+    }
+
+    func testMacBookCase() {
+        // M1 맥북에서 같은 순간 광고 -41 / 연결 -58. 연결로 잰 기준이 -59 였다 (2026-10-01).
+        let advS = Array(-45 ... -38) + Array(-45 ... -38)          // 16 개
+        let advA = [-56, -54, -50, -52, -55, -51, -53, -56]         // 8 개
+        let gS = Array(-57 ... -51) + Array(-57 ... -51) + [-55]    // 15 개
+        let gA = [-69, -67, -65, -66, -68, -69, -65, -66]           // 8 개
+        let v = WizardJudge.judge(seated: advS, away: advA, gattSeated: gS, gattAway: gA, currentGattOffset: 0)
+        XCTAssertTrue(v.ok)
+        XCTAssertEqual(v.base, -47)
+        XCTAssertEqual(v.gattOffset, -12)
+        XCTAssertEqual(v.logLine, "재보기: 착석 -45..-38 (16개), 비움 -56..-50 (8개) -> 기준 -47 dBm; 연결 착석 -57..-51 (15개), 비움 -69..-65 (8개) -> 차이 -12 dB")
+        // "보통" 을 고르면 광고 -47, 연결 -59 - 연결로 쟀던 기준과 같아진다
+        let near = Choices.distValue(base: v.base, step: 1)
+        XCTAssertEqual(near, -47)
+        XCTAssertEqual(Choices.gattThreshold(near: near, offset: v.gattOffset), -59)
+    }
+
+    func testGattNotMeasuredKeepsOffset() {
+        // 폰 앱이 다른 PC 에 붙어 있었다: 연결 표본이 없다
+        let v = WizardJudge.judge(seated: advSeated, away: advAway, gattSeated: [], gattAway: [], currentGattOffset: -12)
+        XCTAssertTrue(v.ok)
+        XCTAssertEqual(v.base, -62)
+        XCTAssertEqual(v.gatt, .notMeasured)
+        XCTAssertEqual(v.gattOffset, -12)
+        XCTAssertEqual(v.title, "다 됐어요")
+        XCTAssertEqual(v.body, "광고 신호\n  앉아 있을 때  -60 ~ -50\n  자리 비웠을 때  -80 ~ -63\n연결 신호\n  이번에는 못 쟀어요 (폰 앱이 이 컴퓨터에 연결돼 있지 않았어요)\n\n이 자리에 맞게 \"보통\" 을 맞췄어요. \"가까이\" 는 더 빨리 잠기고, \"멀리\" 는 더 늦게 잠깁니다.")
+        XCTAssertEqual(v.logLine, "재보기: 착석 -60..-50 (22개), 비움 -80..-63 (9개) -> 기준 -62 dBm; 연결 못 잼 (착석 0개, 비움 0개) - 차이 -12 dB 그대로")
+
+        // 처음 재는 사람 (차이 0)
+        let zero = judgeAdvOnly(advSeated, advAway)
+        XCTAssertEqual(zero.gatt, .notMeasured)
+        XCTAssertEqual(zero.gattOffset, 0)
+        XCTAssertTrue(zero.logLine.hasSuffix("; 연결 못 잼 (착석 0개, 비움 0개) - 차이 +0 dB 그대로"), zero.logLine)
+
+        // 도중에 붙거나 끊겨서 한쪽이 모자라도 못 잰 것이다 (15 / 8 개)
+        let fewSeated = WizardJudge.judge(seated: advSeated, away: advAway,
+                                          gattSeated: Array(gattSeated.prefix(14)), gattAway: gattAway,
+                                          currentGattOffset: 3)
+        XCTAssertEqual(fewSeated.gatt, .notMeasured)
+        XCTAssertEqual(fewSeated.gattOffset, 3)
+        XCTAssertTrue(fewSeated.logLine.hasSuffix("; 연결 못 잼 (착석 14개, 비움 8개) - 차이 +3 dB 그대로"), fewSeated.logLine)
+        let fewAway = WizardJudge.judge(seated: advSeated, away: advAway,
+                                        gattSeated: Array(gattSeated.prefix(15)), gattAway: Array(gattAway.prefix(7)),
+                                        currentGattOffset: -40)
+        XCTAssertEqual(fewAway.gatt, .notMeasured)
+        XCTAssertEqual(fewAway.gattOffset, -40)
+        XCTAssertTrue(fewAway.logLine.hasSuffix("; 연결 못 잼 (착석 15개, 비움 7개) - 차이 -40 dB 그대로"), fewAway.logLine)
+        // 딱 15 / 8 개면 잰 것이다
+        let exact = WizardJudge.judge(seated: advSeated, away: advAway,
+                                      gattSeated: Array(gattSeated.prefix(15)), gattAway: gattAway,
+                                      currentGattOffset: 3)
+        XCTAssertEqual(exact.gatt, .measured)
+    }
+
+    func testGattOverlapKeepsOffset() {
+        // 연결 착석 최저 -75 - 2 = -77 이 비움 최고 -77 보다 위가 아니다 → 겹침
+        let away = [-90, -85, -77, -88, -82, -86, -84, -81]
+        let v = WizardJudge.judge(seated: advSeated, away: advAway, gattSeated: gattSeated, gattAway: away,
+                                  currentGattOffset: 3)
+        XCTAssertTrue(v.ok)
+        XCTAssertEqual(v.base, -62)
+        XCTAssertEqual(v.gatt, .overlap)
+        XCTAssertEqual(v.gattOffset, 3)
+        XCTAssertEqual(v.title, "다 됐어요")
+        XCTAssertEqual(v.body, "광고 신호\n  앉아 있을 때  -60 ~ -50\n  자리 비웠을 때  -80 ~ -63\n연결 신호\n  앉아 있을 때 -75~-66, 비웠을 때 -90~-77 로 겹쳐서 이번 값은 쓰지 않았어요\n\n이 자리에 맞게 \"보통\" 을 맞췄어요. \"가까이\" 는 더 빨리 잠기고, \"멀리\" 는 더 늦게 잠깁니다.")
+        XCTAssertEqual(v.logLine, "재보기: 착석 -60..-50 (22개), 비움 -80..-63 (9개) -> 기준 -62 dBm; 연결 겹침 (착석 -75..-66, 비움 -90..-77) - 차이 +3 dB 그대로")
+
+        // 한 칸만 더 떨어지면 잰다 (-77 > -78)
+        let apart = [-90, -85, -78, -88, -82, -86, -84, -81]
+        let w = WizardJudge.judge(seated: advSeated, away: advAway, gattSeated: gattSeated, gattAway: apart,
+                                  currentGattOffset: 3)
+        XCTAssertEqual(w.gatt, .measured)
+        XCTAssertEqual(w.gattOffset, -15)
+    }
+
+    func testLiveLineAndHelpers() {
+        XCTAssertEqual(WizardJudge.liveLine(left: 60, adv: 0, gatt: 0), "60초 남음   ·   광고 0번   ·   연결 0번")
+        XCTAssertEqual(WizardJudge.liveLine(left: 12, adv: 31, gatt: 48), "12초 남음   ·   광고 31번   ·   연결 48번")
+        XCTAssertEqual(WizardJudge.minSeated, 15)
+        XCTAssertEqual(WizardJudge.minAway, 8)
+        // 표식 거르기: -100 이하와 0 이상은 측정값이 아니다
+        XCTAssertFalse(WizardJudge.isSample(-100))
+        XCTAssertFalse(WizardJudge.isSample(-127))
+        XCTAssertTrue(WizardJudge.isSample(-99))
+        XCTAssertTrue(WizardJudge.isSample(-1))
+        XCTAssertFalse(WizardJudge.isSample(0))
+        XCTAssertFalse(WizardJudge.isSample(127))
+        XCTAssertEqual(WizardJudge.signed(-15), "-15")
+        XCTAssertEqual(WizardJudge.signed(0), "+0")
+        XCTAssertEqual(WizardJudge.signed(3), "+3")
+        XCTAssertEqual(WizardJudge.signed(40), "+40")
     }
 
     func testPhaseTexts() {

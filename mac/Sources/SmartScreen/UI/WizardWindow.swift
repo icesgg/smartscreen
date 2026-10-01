@@ -20,18 +20,29 @@ import SmartScreenCore
 // 업데이트 재시작이 멈춘다 (수동 잠금은 된다). 어떤 길로 닫혀도 windowWillClose 가 되돌린다.
 //
 // 판정과 글은 Core 의 WizardJudge 가 한다. 여기서는 표본을 모으고 단계를 넘기고 그린다.
+// 표본은 두 갈래다: 광고 신호(사용자가 보는 숫자를 정한다)와 연결 신호(그 숫자와 연결 경로의
+// 차이 gattRssiOffset 을 정한다). 둘은 따로 모으고 따로 센다 (WizardJudge 머리 주석).
 final class WizardWindowController: NSObject {
     /// 한 번에 하나만 (Windows g_hWiz)
     private static var current: WizardWindowController?
     private static let windowTitle = "내 자리에 맞게 재보기"
 
+    /// 내용 크기. 처음에는 426x293 (Windows 440x330 창의 안쪽) 이었는데, 결과 글이 광고와 연결
+    /// 두 신호를 보여 주면서 8줄 + 두 줄로 접히는 마지막 문단이 되어 본문 칸(126pt)을 넘었다.
+    /// 높이만 늘리고 단추는 바닥에서 같은 거리(59)에 둔다. 진행 막대와 "남은 시간" 줄은 본문
+    /// 바로 아래(186, 202) 그대로 - 그 단계의 본문은 두 줄이다.
+    private static let contentW: CGFloat = 426
+    private static let contentH: CGFloat = 360
+
     private unowned let app: AppController
     private let window: NSWindow
-    private let content = WizardContentView(frame: NSRect(x: 0, y: 0, width: 426, height: 293))
+    private let content = WizardContentView(frame: NSRect(x: 0, y: 0, width: WizardWindowController.contentW,
+                                                          height: WizardWindowController.contentH))
     // 진행 막대 (26, 186, 368x8) - 1·3 단계에만 보인다
     private let progress = SSProgressBar(frame: NSRect(x: 26, y: 186, width: 368, height: 8))
-    // 다음 단추 (26, WZ_H-96=234, 368x42), 강조 타일
-    private let nextButton = SSTileButton(frame: NSRect(x: 26, y: 234, width: 368, height: 42),
+    // 다음 단추 (26, 높이-59=301, 368x42), 강조 타일. 처음 판은 Windows 의 WZ_H-96 = 234 였다.
+    private let nextButton = SSTileButton(frame: NSRect(x: 26, y: WizardWindowController.contentH - 59,
+                                                        width: 368, height: 42),
                                           title: "시작하기", style: .accent)
     // [그만두기] (WZ_W-140=300, 14, 100x30): 바탕 kPanelBg, 테두리 kTileEdge, 글 kInkSoft, 반지름 5
     private let cancelButton = SSTileButton(frame: NSRect(x: 300, y: 14, width: 100, height: 30),
@@ -44,9 +55,15 @@ final class WizardWindowController: NSObject {
     /// 타이머는 0.5초, 카운트다운은 1초. Windows 는 함수 안 static 이라 단계와 실행을 넘어
     /// 남았다(그만둔 다음 실행의 첫 1초가 0.5초가 될 수 있었다). 1·3 단계를 시작할 때 0 으로 둔다.
     private var half = 0
+    /// 광고 신호 (이 Mac 이 받은 폰의 광고 세기)
     private var seated: [Int] = []
     private var away: [Int] = []
-    private var lastTick: UInt64 = 0
+    /// 연결 신호 (폰이 잰 GATT 연결의 세기). 폰 앱이 이 Mac 에 붙어 있을 때만 쌓인다.
+    private var gattSeated: [Int] = []
+    private var gattAway: [Int] = []
+    /// 경로마다 따로: 마지막으로 센 광고 패킷 / GATT 보고의 시각
+    private var lastAdvTick: UInt64 = 0
+    private var lastGattTick: UInt64 = 0
     private var verdict: WizardVerdict?
     private var finished = false
 
@@ -94,7 +111,8 @@ final class WizardWindowController: NSObject {
 
     private init(app: AppController, parent: NSWindow?) {
         self.app = app
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 426, height: 293),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: WizardWindowController.contentW,
+                                              height: WizardWindowController.contentH),
                           styleMask: [.titled, .closable],
                           backing: .buffered, defer: false)
         super.init()
@@ -140,10 +158,10 @@ final class WizardWindowController: NSObject {
 
     private func setPhase(_ ph: Int) {
         phase = ph
-        // 스캐너에 남아 있던 직전 패킷을 새 구간의 첫 표본으로 세지 않는다.
+        // 스캐너와 GATT 서버에 남아 있던 직전 패킷을 새 구간의 첫 표본으로 세지 않는다 (두 경로 다).
         let now = Mono.now()
-        let g = GattServer.shared.snapshot(now: now)
-        lastTick = g.healthy ? g.lastReportTick : AdvScanner.shared.snapshot(now: now).lastReceivedTick
+        lastAdvTick = AdvScanner.shared.snapshot(now: now).lastReceivedTick
+        lastGattTick = GattServer.shared.snapshot(now: now).lastReportTick
 
         switch ph {
         case 1:
@@ -177,40 +195,45 @@ final class WizardWindowController: NSObject {
         updateTexts()
     }
 
-    /// WzJudge: 순서와 글은 Core (표본 부족 → 어댑터 → 겹침 → 완료). 결과 화면은 "보통 을
-    /// 맞췄어요" 라고 말하지만 [이대로 쓰기] 를 누르기 전에는 아무것도 저장하지 않는다 - 마법사는
-    /// 믿지 않는 값을 쓰지 않는다.
+    /// WzJudge: 순서와 글은 Core (광고: 표본 부족 → 어댑터 → 겹침 → 완료, 그다음 연결 신호의
+    /// 차이). 결과 화면은 "보통 을 맞췄어요" 라고 말하지만 [이대로 쓰기] 를 누르기 전에는 아무것도
+    /// 저장하지 않는다 - 마법사는 믿지 않는 값을 쓰지 않는다. 연결 신호를 못 쟀거나 겹치면 지금
+    /// config 의 gattRssiOffset 을 그대로 쓴다.
     private func judge() {
-        let v = WizardJudge.judge(seated: seated, away: away)
+        let v = WizardJudge.judge(seated: seated, away: away,
+                                  gattSeated: gattSeated, gattAway: gattAway,
+                                  currentGattOffset: ConfigStore.load().gattRssiOffset)
         verdict = v
         EventLog.write(v.logLine)
     }
 
-    /// WzCollect: 새 패킷이 왔을 때만 한 번 센다. 같은 값을 반복해서 담으면 표본이 부풀어
-    /// 어댑터가 멀쩡한 것처럼 보인다 - 바로 그걸 찾으려는 참인데.
+    /// WzCollect: 경로마다 새 패킷이 왔을 때만 한 번 센다. 같은 값을 반복해서 담으면 표본이
+    /// 부풀어 어댑터가 멀쩡한 것처럼 보인다 - 바로 그걸 찾으려는 참인데.
     ///
-    /// 0.5초마다 가장 최근 패킷 하나만 본다 (초당 많아야 2개). 광고가 올 때마다 담으면 표본 수와
-    /// 범위가 Windows 와 달라져 15/8 개, 1 dB 판정이 다르게 움직인다. 칼만으로 다듬은 값이
-    /// 아니라 날값을 쓴다. 연결(GATT)이 살아 있고 보고가 한 번이라도 왔으면 폰이 잰 값, 아니면
-    /// 이 Mac 이 받은 광고의 값 - 도중에 바뀔 수 있다 (두 값의 차이는 중앙값 2 dB).
-    /// 돌려주는 값은 새 표본, 없으면 nil. 어느 경우든 lastTick 은 앞으로 간다.
-    private func collect() -> Int? {
+    /// 0.5초마다 경로마다 가장 최근 패킷 하나만 본다 (경로마다 초당 많아야 2개). 광고가 올 때마다
+    /// 담으면 표본 수와 범위가 Windows 와 달라져 15/8 개, 1 dB 판정이 다르게 움직인다. 칼만으로
+    /// 다듬은 값이 아니라 날값을 쓴다.
+    ///  - 광고: 이 Mac 이 받은 폰의 광고. 폰 앱이 어디에 연결돼 있든 온다.
+    ///  - 연결: 폰이 잰 GATT 연결의 세기. 연결이 살아 있고 보고가 한 번이라도 왔을 때만. 폰 앱은
+    ///    PC 하나에만 붙으므로, 다른 PC 에 붙어 있으면 이 쪽은 비어 있다.
+    /// 예전에는 연결이 살아 있으면 연결 값, 아니면 광고 값을 한 줄에 담았다 - 두 값이 2 dB 안이라고
+    /// 보았기 때문인데, M1 맥북에서는 연결이 광고보다 12~15 dB 낮았다.
+    /// 돌려주는 값은 경로마다 새 표본, 없으면 nil. 새 패킷이면 표식이어도 그 경로의 틱은 앞으로 간다.
+    private func collect() -> (adv: Int?, gatt: Int?) {
         let now = Mono.now()
-        let g = GattServer.shared.snapshot(now: now)
-        let tick: UInt64
-        let rssi: Int
-        if g.healthy && g.lastReportTick != 0 {
-            tick = g.lastReportTick
-            rssi = g.rawRssi
-        } else {
-            let s = AdvScanner.shared.snapshot(now: now)
-            tick = s.lastReceivedTick
-            rssi = s.rawRssi
+        var adv: Int?
+        let s = AdvScanner.shared.snapshot(now: now)
+        if s.lastReceivedTick != 0 && s.lastReceivedTick != lastAdvTick {
+            lastAdvTick = s.lastReceivedTick
+            if WizardJudge.isSample(s.rawRssi) { adv = s.rawRssi }   // 아니면 측정값이 아니라 표식이다
         }
-        if tick == 0 || tick == lastTick { return nil }
-        lastTick = tick
-        if rssi <= -100 || rssi >= 0 { return nil }   // 측정값이 아니라 표식이다
-        return rssi
+        var gatt: Int?
+        let g = GattServer.shared.snapshot(now: now)
+        if g.healthy && g.lastReportTick != 0 && g.lastReportTick != lastGattTick {
+            lastGattTick = g.lastReportTick
+            if WizardJudge.isSample(g.rawRssi) { gatt = g.rawRssi }
+        }
+        return (adv, gatt)
     }
 
     // MARK: - 타이머 (IDT_WIZ, 500 ms)
@@ -218,11 +241,15 @@ final class WizardWindowController: NSObject {
     private func onTimer() {
         if finished { return }
         if phase == 1 {
-            if let v = collect() { seated.append(v) }
+            let c = collect()
+            if let v = c.adv { seated.append(v) }
+            if let v = c.gatt { gattSeated.append(v) }
         } else if phase == 3 {
-            if let v = collect() { away.append(v) }
+            let c = collect()
+            if let v = c.adv { away.append(v) }
+            if let v = c.gatt { gattAway.append(v) }
         } else if phase == 2 {
-            _ = collect()      // 옮기는 중: 버린다 (lastTick 만 앞으로)
+            _ = collect()      // 옮기는 중: 버린다 (두 경로의 틱만 앞으로)
         }
 
         if phase == 1 || phase == 3 {
@@ -255,11 +282,11 @@ final class WizardWindowController: NSObject {
             body = v.body
             isError = !v.ok
         }
-        // 세 칸씩 띄운 가운뎃점 (Windows 와 같은 글)
+        // 세 칸씩 띄운 가운뎃점 (Windows 와 같은 글). 받은 수는 이번 단계의 광고 / 연결 각각.
         if phase == 1 {
-            live = "\(left)초 남음   ·   \(seated.count)번 받음"
+            live = WizardJudge.liveLine(left: left, adv: seated.count, gatt: gattSeated.count)
         } else if phase == 3 {
-            live = "\(left)초 남음   ·   \(away.count)번 받음"
+            live = WizardJudge.liveLine(left: left, adv: away.count, gatt: gattAway.count)
         }
         content.update(title: title, body: body, live: live, titleIsError: isError)
     }
@@ -271,6 +298,8 @@ final class WizardWindowController: NSObject {
         case 0:
             seated.removeAll()
             away.removeAll()
+            gattSeated.removeAll()
+            gattAway.removeAll()
             setPhase(1)
         case 2:
             setPhase(3)
@@ -278,11 +307,13 @@ final class WizardWindowController: NSObject {
             if let v = verdict, v.ok {
                 var c = ConfigStore.load()
                 c.measuredBaseRssi = v.base
+                // 연결 신호를 못 쟀거나 겹쳤으면 판정이 지금 값을 그대로 돌려준다 (같은 값을 다시 쓴다)
+                c.gattRssiOffset = v.gattOffset
                 ConfigStore.save(c)
                 // 방금 잰 값이 "보통" 이다. 여기서 가장 가까운 단계(SimpleDistStep)를 쓰면 안 된다 -
                 // 그건 예전 절대 임계값에 가장 가까운 단계를 찾는데, 기준이 방금 바뀌었으니 그 비교는
                 // 뜻이 없다. 실제로 연달아 재면 "가까이" 가 잡혔고, 그 값은 착석 최저값보다 위여서
-                // 앉아 있는 사람 앞에서 화면이 꺼진다.
+                // 앉아 있는 사람 앞에서 화면이 꺼진다. 연결 임계값도 여기서 방금 저장한 차이로 맞춰진다.
                 app.simpleApplyDist(1)
                 app.simple?.refresh()
             }
@@ -355,9 +386,11 @@ private final class WizardContentView: NSView {
         // 두 줄이 되어도 본문(104) 앞까지는 그린다.
         SSDraw.text(title, in: NSRect(x: 26, y: 56, width: 368, height: 48),
                     font: SSFonts.big, color: titleIsError ? SSColors.wizardError : SSColors.ink, wrap: true)
-        // 본문 {26, 104, 394, 220}. Windows 의 116pt 칸은 긴 어댑터 문구의 마지막 줄을 자를 수
-        // 있었다 - 다음 단추(234) 바로 위 230 까지 쓴다.
-        SSDraw.text(body, in: NSRect(x: 26, y: 104, width: 368, height: 126),
+        // 본문: 다음 단추 바로 위 4pt 까지 쓴다 (처음 판 {26, 104, 394, 230} = 126pt). Windows 의
+        // 116pt 칸은 긴 어댑터 문구의 마지막 줄을 자를 수 있었다. 결과 글이 두 신호를 보여 주면서
+        // 8줄 + 접히는 마지막 문단(12pt 글꼴로 줄마다 16pt 쯤, 다 해서 10줄 안팎)이 되어 창을
+        // 늘렸다: 360 - 59 - 4 - 104 = 193pt, 12줄이 들어간다.
+        SSDraw.text(body, in: NSRect(x: 26, y: 104, width: 368, height: bounds.height - 59 - 4 - 104),
                     font: SSFonts.normal, color: SSColors.inkSoft, wrap: true)
         // "남은 시간 · 받은 수" {26, 202, 394, 226}: 1·3 단계에만, 강조색 한 줄
         if !live.isEmpty {

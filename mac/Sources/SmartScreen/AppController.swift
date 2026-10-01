@@ -273,7 +273,7 @@ final class AppController: NSObject, GuardEngineHost {
     }
 
     /// WM_CREATE 의 "Load config and apply to UI". gattRssiThreshold 는 여기서 읽지 않는다 -
-    /// [시작] 이 신호 강도 칸의 값으로 맞춘다 (config 의 값은 사본일 뿐이다).
+    /// [시작] 이 신호 강도 칸의 값 + gattRssiOffset 으로 맞춘다 (config 의 값은 사본일 뿐이다).
     private func applyConfigToModel(_ cfg: AppConfig) {
         Shared.shared.nearRssiThreshold = cfg.nearRssiThreshold
         Shared.shared.keepAliveSec = cfg.keepAliveSec
@@ -449,12 +449,17 @@ final class AppController: NSObject, GuardEngineHost {
         guard hasPhoneEntry else { return }
 
         // 신호 강도 칸: _wtoi, 양수면 음수로, [-100, -30] 으로 자른다 (빈 칸/엉뚱한 글자는 -30).
-        // 연결(GATT) 경로도 같은 값이다. 처음에는 "폰이 잰 값이라 눈금이 다르다" 고 따로 뒀지만
-        // 실측에서 두 경로는 2 dB 안에서 같이 움직였다. 따로 두었더니 광고 -67 / 연결 -61 로 갈라진
-        // 채 앉은 자리에서 잠겼다 (2026-10-01).
+        // 연결(GATT) 경로는 이 숫자를 따라간다: 이 숫자 + 재보기가 잰 차이(gattRssiOffset), [-100, -30].
+        // 처음에는 "폰이 잰 값이라 눈금이 다르다" 고 따로 뒀다가, 따로 두었더니 광고 -67 / 연결 -61 로
+        // 갈라진 채 앉은 자리에서 잠겨서 (2026-10-01) 1.1.6 부터 같은 값을 썼다. Windows 노트북에서는
+        // 두 경로가 2 dB 안에서 같이 움직였지만 M1 맥북에서는 연결이 광고보다 12~15 dB 낮았다 - 그래서
+        // 숫자는 하나로 두고 차이는 재보기가 잰다. 차이를 재지 않은 config (예전 파일 포함) 는 0 이라
+        // 두 경로가 예전처럼 같은 값을 쓴다.
         let thr = Texts.parseThresholdField(thresholdFieldText)
+        var cfg = ConfigStore.load()
+        let gattThr = Choices.gattThreshold(near: thr, offset: cfg.gattRssiOffset)
         Shared.shared.nearRssiThreshold = thr
-        Shared.shared.gattRssiThreshold = thr
+        Shared.shared.gattRssiThreshold = gattThr
         thresholdFieldText = "\(thr)"
 
         // 자리비움 콤보는 없앴다 (조작해도 아무 일이 안 일어나는 설정은 없는 것보다 나쁘다) → 늘 5 초
@@ -473,7 +478,7 @@ final class AppController: NSObject, GuardEngineHost {
         // 같은 칼만 필터에 섞여 들어온다. 이름은 표시용이다.
         targetName = Choices.registeredPhoneName
 
-        var cfg = ConfigStore.load()
+        // cfg 는 위 임계값 자리에서 읽었다.
         // Mac 은 IRK 를 쓸 수 없다 (CoreBluetooth 는 주소도 본딩 키도 내주지 않는다): irk.txt 를
         // 가져오지 않고, bleIrk 는 config 에 그대로 둔 채 irk=0 으로 적는다.
         Shared.shared.bleLostMeansFar = cfg.bleLostMeansFar
@@ -497,8 +502,9 @@ final class AppController: NSObject, GuardEngineHost {
                 ? Paths.configDir.appendingPathComponent("gatt_rssi_log.csv", isDirectory: false).path
                 : nil
             let ok = GattServer.shared.start(plain: !cfg.bleGattEncrypt, logPath: gattLog)
+            // 연결 경로의 임계값을 적는다 (Windows 는 g_gattRssiThreshold). 차이가 0 이면 위 START 의 thr 와 같다.
             EventLog.write("GATT server start: \(ok ? "OK" : "FAILED") "
-                           + "(encrypt=\(cfg.bleGattEncrypt ? 1 : 0), thr=\(thr) dBm)")
+                           + "(encrypt=\(cfg.bleGattEncrypt ? 1 : 0), thr=\(gattThr) dBm)")
         } else {
             EventLog.write("GATT server disabled by config")
         }
@@ -528,7 +534,7 @@ final class AppController: NSObject, GuardEngineHost {
         cfg.btAddress = 0
         cfg.nearLatencyMs = AppController.fixedNearLatencyMs
         cfg.nearRssiThreshold = thr
-        cfg.gattRssiThreshold = thr   // 같은 값 (위 주석)
+        cfg.gattRssiThreshold = gattThr   // 광고 값 + 차이의 사본 (위 주석)
         cfg.gattSeen = Shared.shared.gattSeen
         cfg.keepAliveSec = keepAlive
         cfg.scanIntervalSec = AppController.fixedScanIntervalSec
@@ -917,7 +923,9 @@ final class AppController: NSObject, GuardEngineHost {
         Shared.shared.measuring = on
     }
 
-    /// 간단 창 거리 슬라이더 (SimpleApplyDist). 두 경로를 따로 물어볼 화면이 아니므로 둘 다 바꾼다.
+    /// 간단 창 거리 슬라이더 (SimpleApplyDist). 두 경로를 따로 물어볼 화면이 아니므로 둘 다 바꾼다:
+    /// 광고는 이 값, 연결은 이 값 + 재보기가 잰 차이 (Choices.gattThreshold). 재보기의 [이대로 쓰기] 도
+    /// 차이를 저장한 뒤 여기로 온다.
     /// 고급 창의 "신호 강도" 칸도 같은 값으로 - 그 칸은 [시작] 때 다시 읽히므로, 안 맞춰 두면 슬라이더로
     /// 바꾼 값이 다음 [시작] 에 예전 숫자로 되돌아간다 (실제로 두 창이 다른 값을 보여 줬다, 2026-10-01).
     /// 판정 스레드는 공유값을 매번 읽으므로 바로 듣는다. 탐색 하한(threshold-10)은 다음 [시작] 까지 그대로다.
@@ -925,14 +933,15 @@ final class AppController: NSObject, GuardEngineHost {
         guard step >= 0 && step < Choices.distOffsets.count else { return }
         var c = ConfigStore.load()
         let v = Choices.distValue(base: Choices.distBase(measured: c.measuredBaseRssi), step: step)
+        let g = Choices.gattThreshold(near: v, offset: c.gattRssiOffset)
         Shared.shared.nearRssiThreshold = v
-        Shared.shared.gattRssiThreshold = v
+        Shared.shared.gattRssiThreshold = g
         thresholdFieldText = "\(v)"
         advanced?.syncFromModel()
         c.nearRssiThreshold = v
-        c.gattRssiThreshold = v
+        c.gattRssiThreshold = g
         ConfigStore.save(c)
-        EventLog.write("간단 화면: 거리 \(step + 1)단계 -> \(v) dBm")
+        EventLog.write(Texts.distLogLine(step: step, near: v, gatt: g))
     }
 
     /// 간단 창 유휴 단추. 고급 창 콤보도 가장 가까운 칸으로 옮긴다 - 두 창이 같은 선택지를 가져야

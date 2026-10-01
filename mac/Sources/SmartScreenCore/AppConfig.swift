@@ -1,7 +1,7 @@
 import Foundation
 import Darwin
 
-/// config.ini 의 내용 (Windows client/config.h 의 AppConfig 와 같은 33개 키, 같은 기본값).
+/// config.ini 의 내용 (Windows client/config.h 의 AppConfig 와 같은 34개 키, 같은 기본값).
 ///
 /// 파일은 이 Mac 하나의 것이다 (PC 사이에 나누지 않는다). 그래도 키 이름과 뜻은 Windows 와
 /// 같아야 한다 - 문서, 지원 절차, "앱 닫고 편집" 이 두 판에서 같게.
@@ -40,7 +40,12 @@ public struct AppConfig: Equatable {
     public var enterpriseRegistered: Bool = false
     /// 시작 후 앱 연결을 기다리는 시간(초)
     public var gattGraceSec: UInt32 = 90
-    /// [연결] 경로 (dBm). 1.1.6 부터 nearRssiThreshold 의 사본이다.
+    /// 재보기가 잰 연결 신호와 광고 신호의 차이 (dB, 연결 기준 - 광고 기준). [-40, 40] 으로 읽는다.
+    /// 0 = 아직 안 재 봤거나 두 신호가 같다. 이 키가 없는 예전 config.ini 는 0 으로 읽혀서,
+    /// 재보기를 다시 할 때까지 1.1.6 ~ 1.1.9 와 똑같이 동작한다 (연결 임계값 = 광고 임계값).
+    public var gattRssiOffset: Int = 0
+    /// [연결] 경로 (dBm). nearRssiThreshold + gattRssiOffset 의 사본이다 (Choices.gattThreshold).
+    /// [시작] 과 거리 슬라이더가 다시 맞추고, 그 밖에서는 읽지 않는다.
     /// -55 였는데, 실측에서 착석 분포(-62~-45) 안에 들어가 있어 자리에 앉아 있는데도 화면을 잠갔다.
     public var gattRssiThreshold: Int = -65
     /// 컴패니언 앱이 연결된 적 있음 → 이후 미연결은 "부재"로 간주
@@ -238,6 +243,11 @@ public enum ConfigStore {
         if let v = kv["gattSeen"] { cfg.gattSeen = flag(v) }
         if let v = kv["gattGraceSec"] { cfg.gattGraceSec = toUInt32(v) }
         if let v = kv["gattRssiThreshold"] { cfg.gattRssiThreshold = wtoi(v) }
+        if let v = kv["gattRssiOffset"] {
+            // 손으로 고친 값도 [-40, 40] 안으로. 없는 키는 0 (기본값) 그대로다 - 예전 파일은
+            // 재보기를 다시 할 때까지 두 경로가 같은 임계값을 쓴다.
+            cfg.gattRssiOffset = min(max(wtoi(v), Choices.gattOffsetMin), Choices.gattOffsetMax)
+        }
         if let v = kv["bleLostMeansFar"] { cfg.bleLostMeansFar = flag(v) }
         if let v = kv["keepAliveSec"] { cfg.keepAliveSec = toUInt32(v) }
         if let v = kv["scanIntervalSec"] { cfg.scanIntervalSec = toUInt32(v) }
@@ -321,7 +331,7 @@ public enum ConfigStore {
         return w.ok
     }
 
-    /// 파일 바이트: UTF-8 BOM + 정렬된 "k=v\r\n" 33줄.
+    /// 파일 바이트: UTF-8 BOM + 정렬된 "k=v\r\n" 34줄.
     ///
     /// 값의 CR/LF 는 지운다: macOS 파일 이름에는 줄바꿈이 들어갈 수 있고, 값에 줄바꿈이
     /// 섞이면 다음에 읽을 때 가짜 키가 생긴다. NUL 에서는 값이 끝난다 (Windows 의 %s 가 그렇다).
@@ -347,6 +357,7 @@ public enum ConfigStore {
             ("clipSync", bit(cfg.clipSync)),
             ("enterpriseRegistered", bit(cfg.enterpriseRegistered)),
             ("gattGraceSec", "\(cfg.gattGraceSec)"),
+            ("gattRssiOffset", "\(cfg.gattRssiOffset)"),
             ("gattRssiThreshold", "\(cfg.gattRssiThreshold)"),
             ("gattSeen", bit(cfg.gattSeen)),
             ("idleCountdownSec", "\(cfg.idleCountdownSec)"),

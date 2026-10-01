@@ -71,7 +71,7 @@ final class CoreATests: XCTestCase {
         "anonKey", "authEmail", "authRefresh", "authUserId", "bannerImagePath", "bleDebugLog",
         "bleGattEncrypt", "bleGattServer", "bleIrk", "bleLostMeansFar", "bleTimeoutSec", "btAddress",
         "centerImagePath", "clipMaxKB", "clipSync", "enterpriseRegistered", "gattGraceSec",
-        "gattRssiThreshold", "gattSeen", "idleCountdownSec", "keepAliveSec", "measuredBaseRssi",
+        "gattRssiOffset", "gattRssiThreshold", "gattSeen", "idleCountdownSec", "keepAliveSec", "measuredBaseRssi",
         "nearLatencyMs", "nearRssiThreshold", "orgId", "phoneOvfBit", "phoneToken", "scanIntervalSec",
         "serverUrl", "unlockAuto", "unlockDelaySec", "updateChannel", "updateCheck",
     ]
@@ -318,6 +318,24 @@ final class CoreATests: XCTestCase {
         }
     }
 
+    func testGattRssiOffsetReadClamp() {
+        // 키가 없는 예전 config.ini: 0 = 두 경로가 같은 임계값 (재보기를 다시 할 때까지 예전과 같다)
+        XCTAssertEqual(AppConfig().gattRssiOffset, 0)
+        var old = AppConfig()
+        ConfigStore.apply(["nearRssiThreshold": "-59", "gattRssiThreshold": "-59"], to: &old)
+        XCTAssertEqual(old.gattRssiOffset, 0)
+
+        let cases: [(String, Int)] = [
+            ("-15", -15), ("0", 0), ("12", 12), ("+7x", 7), (" -3", -3), ("abc", 0), ("", 0),
+            ("-40", -40), ("-41", -40), ("-99999", -40), ("40", 40), ("41", 40), ("99999999999", 40),
+        ]
+        for (raw, want) in cases {
+            var c = AppConfig()
+            ConfigStore.apply(["gattRssiOffset": raw], to: &c)
+            XCTAssertEqual(c.gattRssiOffset, want, "gattRssiOffset=\(raw)")
+        }
+    }
+
     func testClipMaxKBReadClamp() {
         XCTAssertEqual(AppConfig().clipMaxKB, 4096)
         let cases: [(String, UInt32)] = [
@@ -338,7 +356,7 @@ final class CoreATests: XCTestCase {
             "anonKey=", "authEmail=", "authRefresh=", "authUserId=", "bannerImagePath=", "bleDebugLog=0",
             "bleGattEncrypt=0", "bleGattServer=1", "bleIrk=", "bleLostMeansFar=1", "bleTimeoutSec=90",
             "btAddress=0", "centerImagePath=", "clipMaxKB=4096", "clipSync=0", "enterpriseRegistered=0",
-            "gattGraceSec=90", "gattRssiThreshold=-65", "gattSeen=0", "idleCountdownSec=20",
+            "gattGraceSec=90", "gattRssiOffset=0", "gattRssiThreshold=-65", "gattSeen=0", "idleCountdownSec=20",
             "keepAliveSec=5", "measuredBaseRssi=0", "nearLatencyMs=200", "nearRssiThreshold=-65",
             "orgId=", "phoneOvfBit=-1", "phoneToken=", "scanIntervalSec=2", "serverUrl=",
             "unlockAuto=1", "unlockDelaySec=0", "updateChannel=stable", "updateCheck=1",
@@ -348,8 +366,8 @@ final class CoreATests: XCTestCase {
         XCTAssertEqual([UInt8](ConfigStore.serialize(AppConfig())), want)
     }
 
-    func testSerializeWritesAll33KeysInOrdinalOrder() {
-        XCTAssertEqual(windowsKeyOrder.count, 33)
+    func testSerializeWritesAll34KeysInOrdinalOrder() {
+        XCTAssertEqual(windowsKeyOrder.count, 34)
         let ordinal = windowsKeyOrder.sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
         XCTAssertEqual(ordinal, windowsKeyOrder)
 
@@ -357,7 +375,7 @@ final class CoreATests: XCTestCase {
         let text = String(decoding: bytes.dropFirst(3), as: UTF8.self)
         XCTAssertTrue(text.hasSuffix("\r\n"))
         let lines = text.components(separatedBy: "\r\n").filter { !$0.isEmpty }
-        XCTAssertEqual(lines.count, 33)
+        XCTAssertEqual(lines.count, 34)
         let keys = lines.map { line -> String in
             if let r = line.range(of: "=") { return String(line[line.startIndex..<r.lowerBound]) }
             return line
@@ -376,12 +394,12 @@ final class CoreATests: XCTestCase {
         c.authEmail = "me@example.com\u{0}junk"
         let data = ConfigStore.serialize(c)
         let m = ConfigStore.parse(data)
-        XCTAssertEqual(m.count, 33)
+        XCTAssertEqual(m.count, 34)
         XCTAssertEqual(m["centerImagePath"], "/abc.png")
         XCTAssertEqual(m["bannerImagePath"], "/xy.png")
         XCTAssertEqual(m["authEmail"], "me@example.com")
         let text = String(decoding: [UInt8](data).dropFirst(3), as: UTF8.self)
-        XCTAssertEqual(text.components(separatedBy: "\r\n").filter { !$0.isEmpty }.count, 33)
+        XCTAssertEqual(text.components(separatedBy: "\r\n").filter { !$0.isEmpty }.count, 34)
     }
 
     // MARK: - config.ini: load / save
@@ -405,6 +423,7 @@ final class CoreATests: XCTestCase {
         c.clipSync = true
         c.enterpriseRegistered = true
         c.gattGraceSec = 30
+        c.gattRssiOffset = -15
         c.gattRssiThreshold = -70
         c.gattSeen = true
         c.idleCountdownSec = 60

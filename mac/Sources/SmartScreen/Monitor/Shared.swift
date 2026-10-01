@@ -23,7 +23,7 @@ final class Shared {
 
     // 초기값은 Windows globals.cpp 와 같다.
     private var _nearRssiThreshold = -65     // BLE RSSI 임계값 (dBm). 이 값 이상이면 NEAR
-    // v2(GATT) 임계값. Windows 초기값이 -55 다. 1.1.6 부터 StartMon 이 광고 임계값과 같은 값으로
+    // v2(GATT) 임계값. Windows 초기값이 -55 다. 1.1.6 부터 StartMon 이 광고 임계값(+ gattRssiOffset)으로
     // 덮으므로 -55 는 첫 [시작] 전에만 존재하고, 판정 스레드는 [시작] 뒤에만 돌아서 실제로는 안 쓰인다.
     private var _gattRssiThreshold = -55
     private var _gattSeen = false
@@ -52,8 +52,9 @@ final class Shared {
         set { locked { _nearRssiThreshold = newValue } }
     }
 
-    /// g_gattRssiThreshold: GATT 경로 임계값. StartMon 과 슬라이더가 광고 값과 같게 맞춘다
-    /// (두 값을 따로 두었더니 -67/-61 처럼 갈라져 앉아 있는 사람이 잠겼다).
+    /// g_gattRssiThreshold: GATT 경로 임계값. StartMon 과 슬라이더가 광고 값 + 재보기가 잰 차이로
+    /// 맞춘다 (Choices.gattThreshold). 손으로 따로 두었더니 -67/-61 처럼 갈라져 앉아 있는 사람이
+    /// 잠겼고, 같게 두었더니 연결이 광고보다 12~15 dB 낮은 맥북에서 맞지 않았다.
     var gattRssiThreshold: Int {
         get { return locked { _gattRssiThreshold } }
         set { locked { _gattRssiThreshold = newValue } }
