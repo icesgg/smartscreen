@@ -61,6 +61,9 @@ else
     echo "아이콘을 만들지 못했다 - 기본 아이콘으로 간다" >&2
 fi
 rm -rf "$ICONSET"
+# Info.plist 는 XML 로 둔다. Publish.exe 와 release.ps1 이 zip 안의 이 파일을 Windows 에서 읽어
+# 버전을 대조한다 (PlistBuddy 가 형식을 바꿔도 여기서 되돌린다).
+plutil -convert xml1 "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 # 임시(ad-hoc) 서명. 개발자 인증서가 없으므로 Gatekeeper 는 처음 한 번 막는다

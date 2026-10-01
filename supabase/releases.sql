@@ -1,4 +1,4 @@
--- SmartScreen - 프로그램 자동 업데이트를 위한 표 세 개와 버킷 하나
+-- SmartScreen - 프로그램 자동 업데이트를 위한 표 다섯 개와 버킷 하나
 --
 -- 목적: 새 버전을 서버에 올리면 모든 PC 가 스스로 알아채서 받아 간다.
 -- 개인 PC 는 사용자가 [업데이트] 를 눌러야 바뀌고, 기업 PC 는 그 조직의
@@ -6,8 +6,13 @@
 -- 설계 배경은 docs/UPDATE.md, 클라이언트는 client/update.cpp, 올리는 도구는
 -- tools/publish.cpp (publish.bat).
 --
+-- Windows 판은 releases / org_release_approvals, Mac 판은 mac_releases /
+-- org_mac_release_approvals 를 쓴다 (아래 "Mac 판"). 버킷과 release_admins 는 같이 쓴다.
+--
 -- 적용: Supabase 대시보드 > SQL Editor 에 붙여넣고 실행.
 --       맨 아래 "관리자 지정" 의 이메일을 확인하고 실행할 것.
+--       이 파일은 새 프로젝트용이다. 이미 돌고 있는 프로젝트에 Mac 표를 더하는 것은
+--       mac_releases.sql 이다 (이 파일의 Mac 부분과 releases_storage_path_windows 가 그것과 같다).
 --
 -- ============================================================
 -- 이 표들은 device_tokens / clip_items 와 방침이 다르다
@@ -57,8 +62,12 @@ create table releases (
   -- 그 조직의 beta 채널 PC 만 받는다.
   channel      text not null default 'stable' check (channel in ('stable', 'beta')),
 
-  -- 'releases' 버킷 안의 경로. 관례는 '<version>/SmartScreen.exe'.
-  storage_path text not null,
+  -- 'releases' 버킷 안의 경로. '<version>/SmartScreen.exe' 모양만 받는다 - 이 표는 Windows
+  -- exe 전용이다. 깔린 Windows PC 는 이 표의 켜진 행을 플랫폼을 묻지 않고 전부 받으므로,
+  -- Mac zip 이 여기 들어가면 Windows PC 들이 그걸 자기 exe 자리에 놓는다 (mac_releases.sql).
+  storage_path text not null
+               constraint releases_storage_path_windows
+               check (storage_path ~ '^[0-9]+\.[0-9]+\.[0-9]+/SmartScreen\.exe$'),
 
   -- 이 행의 전부다. 클라이언트는 받은 파일의 해시가 이 값과 다르면 버린다.
   -- 파일 옆에 .sha256 파일로 두면 파일을 바꿀 수 있는 사람이 해시도 바꾼다.
@@ -201,6 +210,107 @@ create policy "admins_remove_releases"
   to authenticated
   using (bucket_id = 'releases'
          and exists (select 1 from release_admins where user_id = auth.uid()));
+
+-- ============================================================
+-- Mac 판 - mac_releases / org_mac_release_approvals
+-- ============================================================
+-- 돌고 있는 프로젝트에는 mac_releases.sql 로 더한다. 이 부분은 그 파일과 같아야 한다 -
+-- 까닭도 그 파일 머리말에 있다. 줄이면: 깔린 Windows PC 는 releases 의 켜진 행을 플랫폼을
+-- 묻지 않고 전부 SmartScreen.exe 로 받으므로 Mac zip 을 같은 표에 넣을 수 없고, 두 판의 버전
+-- 번호가 같아서(client/version.h 하나) 기본키도 겹친다. 그래서 표와 승인이 플랫폼마다 따로다.
+-- 버킷은 같은 'releases' 의 mac/ 아래이고, 위의 버킷 정책이 경로를 안 보므로 그대로 맞다.
+create table mac_releases (
+  version      text primary key check (version ~ '^[0-9]+\.[0-9]+\.[0-9]+$'),
+  channel      text not null default 'stable' check (channel in ('stable', 'beta')),
+  storage_path text not null,
+  sha256       text not null check (sha256 ~ '^[0-9a-f]{64}$'),   -- SmartScreen-mac.zip 의 해시
+  size         bigint not null check (size > 0),
+  -- 이 버전이 도는 가장 낮은 macOS. 기본값은 앱의 배포 대상과 같고 Publish.exe 는 보내지 않는다.
+  min_macos    text not null default '13.0' check (min_macos ~ '^[0-9]+\.[0-9]+$'),
+  notes        text,
+  active       boolean not null default true,
+  published_by uuid references auth.users(id) default auth.uid(),
+  published_at timestamptz not null default now(),
+  -- 경로에 그 행의 버전이 들어 있어야 한다 (다른 번호의 zip 을 가리키면 Mac 마다 적용이 실패한다).
+  constraint mac_releases_storage_path_shape check (
+    storage_path ~ '^mac/[0-9]+\.[0-9]+\.[0-9]+/SmartScreen-mac\.zip$'
+    and storage_path = 'mac/' || version || '/SmartScreen-mac.zip'
+  )
+);
+
+alter table mac_releases enable row level security;
+
+create policy "anyone_reads_active_mac_releases"
+  on mac_releases for select
+  to anon, authenticated
+  using (
+    active
+    or exists (select 1 from release_admins where user_id = auth.uid())
+  );
+
+create policy "admins_insert_mac_releases"
+  on mac_releases for insert
+  to authenticated
+  with check (exists (select 1 from release_admins where user_id = auth.uid()));
+
+create policy "admins_update_mac_releases"
+  on mac_releases for update
+  to authenticated
+  using (exists (select 1 from release_admins where user_id = auth.uid()))
+  with check (exists (select 1 from release_admins where user_id = auth.uid()));
+
+create policy "admins_delete_mac_releases"
+  on mac_releases for delete
+  to authenticated
+  using (exists (select 1 from release_admins where user_id = auth.uid()));
+
+-- 기업 Mac 은 여기 있는 버전 중 가장 높은 것만 받는다. Windows 승인과 따로다.
+create table org_mac_release_approvals (
+  org_id      uuid not null references orgs(id) on delete cascade,
+  version     text not null references mac_releases(version) on delete cascade,
+  approved_by uuid not null references auth.users(id) default auth.uid(),
+  approved_at timestamptz not null default now(),
+  primary key (org_id, version)
+);
+
+alter table org_mac_release_approvals enable row level security;
+
+create policy "anyone_reads_mac_approvals"
+  on org_mac_release_approvals for select
+  to anon, authenticated
+  using (true);
+
+create policy "org_admins_approve_mac"
+  on org_mac_release_approvals for insert
+  to authenticated
+  with check (
+    approved_by = auth.uid()
+    and exists (
+      select 1 from public.org_members m
+       where m.org_id = org_mac_release_approvals.org_id
+         and m.user_id = auth.uid()
+         and m.role = 'admin'
+    )
+  );
+
+create policy "org_admins_revoke_mac"
+  on org_mac_release_approvals for delete
+  to authenticated
+  using (
+    exists (
+      select 1 from public.org_members m
+       where m.org_id = org_mac_release_approvals.org_id
+         and m.user_id = auth.uid()
+         and m.role = 'admin'
+    )
+  );
+
+-- 권한: 먼저 걷고 쓰는 것만 다시 준다 (기본으로 다 주는 프로젝트에서도 정책 하나가 잘못되면
+-- anon 이 쓰는 일이 없게). 다시 주는 것은 releases / org_release_approvals 와 같다.
+revoke all on mac_releases, org_mac_release_approvals from anon, authenticated;
+grant select on mac_releases, org_mac_release_approvals to anon, authenticated;
+grant insert, update, delete on mac_releases to authenticated;
+grant insert, delete on org_mac_release_approvals to authenticated;
 
 -- ============================================================
 -- 관리자 지정

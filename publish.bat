@@ -7,8 +7,12 @@ REM Publish.exe carries the version number it was compiled with
 REM (client/version.h) and stamps that onto whatever SmartScreen.exe it is given.
 REM
 REM Usage: publish.bat [--notes "what changed"] [--channel beta] [--force]
-REM        publish.bat --list
-REM        publish.bat --deactivate 1.2.3
+REM        publish.bat --list [--platform mac]
+REM        publish.bat --deactivate 1.2.3 [--platform mac]
+REM
+REM Mac build (the zip comes from CI, see release-mac.bat; --platform must be
+REM the first argument so build\SmartScreen.exe is not added):
+REM        publish.bat --platform mac --file SmartScreen-mac.zip [--notes "..."]
 REM
 REM ASCII only: cmd.exe reads .bat in the system codepage.
 
@@ -28,14 +32,19 @@ if not exist "%SRC%build\Publish.exe" (
     exit /b 1
 )
 
-if "%~1"=="--list" (
-    "%SRC%build\Publish.exe" --list "%SUPABASE_URL%" "%SUPABASE_ANON_KEY%"
-    exit /b %ERRORLEVEL%
-)
-if "%~1"=="--deactivate" (
-    "%SRC%build\Publish.exe" --deactivate "%SUPABASE_URL%" "%SUPABASE_ANON_KEY%" %2
-    exit /b %ERRORLEVEL%
-)
+REM One-line ifs, not ( ) blocks: inside a block %ERRORLEVEL% is expanded
+REM before Publish.exe runs, so the block always returned 0; and %* may hold
+REM notes with parentheses, which would end a block early.
+set "MODE="
+if "%~1"=="--list" set "MODE=--list"
+if "%~1"=="--deactivate" set "MODE=--deactivate"
+if defined MODE "%SRC%build\Publish.exe" %MODE% "%SUPABASE_URL%" "%SUPABASE_ANON_KEY%" %2 %3 %4
+if defined MODE exit /b %ERRORLEVEL%
+
+REM --platform first: pass everything through; the file comes from --file.
+if /i "%~1"=="--platform" set "PASSTHRU=1"
+if defined PASSTHRU "%SRC%build\Publish.exe" "%SUPABASE_URL%" "%SUPABASE_ANON_KEY%" %*
+if defined PASSTHRU exit /b %ERRORLEVEL%
 
 if not exist "%SRC%build\SmartScreen.exe" (
     echo [!] build\SmartScreen.exe not found. Run do_build.bat first.

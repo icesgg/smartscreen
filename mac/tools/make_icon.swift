@@ -60,15 +60,15 @@ func render(_ size: Int) -> Data? {
     base.fill()
 
     // 화면 가운데의 초록 점: 오버레이의 "근처 • 보호 중" 색
-    let dot = NSBezierPath(ovalIn: NSRect(x: 512 - 58, y: 570 - 58, width: 116, height: 116))
+    let dot = NSBezierPath(ovalIn: NSRect(x: 512 - 52, y: 535 - 52, width: 104, height: 104))
     rgb(60, 210, 90).setFill()
     dot.fill()
     // 점을 둘러싼 전파 고리 둘
     rgb(60, 210, 90, 0.55).setStroke()
-    for r in [100.0, 150.0] {
+    for r in [92.0, 138.0] {
         let ring = NSBezierPath()
-        ring.appendArc(withCenter: NSPoint(x: 512, y: 570), radius: CGFloat(r), startAngle: 20, endAngle: 160)
-        ring.lineWidth = 18
+        ring.appendArc(withCenter: NSPoint(x: 512, y: 535), radius: CGFloat(r), startAngle: 20, endAngle: 160)
+        ring.lineWidth = 16
         ring.lineCapStyle = .round
         ring.stroke()
     }

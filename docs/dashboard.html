@@ -407,6 +407,18 @@
       cursor: default !important;
     }
 
+    /* 프로그램 업데이트의 Windows / Mac 구획 */
+    .release-platform {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-dim);
+      padding: 18px 24px 10px 24px;
+    }
+
+    .release-platform + .section-note {
+      padding: 0 24px;
+    }
+
     .empty-msg {
       padding: 40px;
       text-align: center;
@@ -551,13 +563,19 @@
         <div id="content-list"></div>
       </div>
 
-      <!-- 프로그램 업데이트 승인 (docs/UPDATE.md) -->
+      <!-- 프로그램 업데이트 승인 (docs/UPDATE.md, docs/MAC.md) -->
       <!-- 이 조직의 PC 들은 여기서 승인된 버전 중 가장 높은 것만 받는다.
-           승인이 없으면 PC 화면에 "관리자 승인을 기다려요" 로 보이기만 한다. -->
+           승인이 없으면 PC 화면에 "관리자 승인을 기다려요" 로 보이기만 한다.
+           Windows 와 Mac 은 표도 승인도 따로다 (supabase/mac_releases.sql) - 같은 번호라도
+           각각 승인한다. -->
       <div class="content-section">
         <h3>프로그램 업데이트</h3>
+        <h4 class="release-platform">Windows</h4>
         <p class="section-note" id="release-note">불러오는 중...</p>
         <div id="release-list"></div>
+        <h4 class="release-platform">Mac</h4>
+        <p class="section-note" id="mac-release-note">불러오는 중...</p>
+        <div id="mac-release-list"></div>
       </div>
     </div>
   </div>
@@ -824,6 +842,28 @@
     // releases(누구나 읽음) 와 이 조직의 org_release_approvals 를 붙여 보여 준다.
     // 승인/취소는 admin 만 (RLS 가 한 번 더 막는다). 버전 비교는 세 숫자를 숫자로 -
     // 클라이언트(client/relver.h)와 같은 규칙이어야 "PC 들이 받을 버전" 이 맞는다.
+    //
+    // Mac 은 표가 따로다 (mac_releases / org_mac_release_approvals, supabase/mac_releases.sql).
+    // 깔린 Windows PC 는 releases 의 켜진 행을 플랫폼을 묻지 않고 전부 받으므로 Mac zip 을
+    // 거기 넣을 수 없다. 그래서 목록도 승인도 플랫폼마다 따로이고, 같은 번호(1.1.8)가 양쪽에
+    // 있어도 승인은 각각이다. 한쪽 표를 못 읽어도 다른 쪽 목록은 보여야 한다.
+    const RELEASE_PLATFORMS = [
+      {
+        name: 'Windows', table: 'releases', approvals: 'org_release_approvals',
+        noteId: 'release-note', listId: 'release-list',
+        readError: '업데이트 표를 읽지 못했습니다: ',
+        missing: null,   // 표가 없으면 위 문구 뒤에 서버 메시지 (예전 그대로)
+        pcsSubj: 'PC 들이', pcsTopic: 'PC 들은', one: 'PC', oneTopic: 'PC 는', allSubj: 'PC 가',
+      },
+      {
+        name: 'Mac', table: 'mac_releases', approvals: 'org_mac_release_approvals',
+        noteId: 'mac-release-note', listId: 'mac-release-list',
+        readError: 'Mac 업데이트 표를 읽지 못했습니다: ',
+        missing: 'Mac 업데이트 표가 아직 없습니다 (supabase/mac_releases.sql)',
+        pcsSubj: 'Mac 들이', pcsTopic: 'Mac 들은', one: 'Mac', oneTopic: 'Mac 은', allSubj: 'Mac 이',
+      },
+    ];
+
     function parseVer(v) {
       const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(v || '');
       return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
@@ -833,30 +873,49 @@
       return 0;
     }
 
+    // 표가 없을 때 PostgREST 가 주는 오류 코드 (예전 판은 Postgres 의 42P01 을 그대로 준다).
+    function isMissingTable(err) {
+      return !!err && (err.code === 'PGRST205' || err.code === '42P01');
+    }
+
     async function loadReleases() {
+      for (const p of RELEASE_PLATFORMS) {
+        try {
+          await loadPlatformReleases(p);
+        } catch (e) {
+          // 보통은 supabase-js 가 오류를 돌려주지만, 던져진 예외 하나가 다른 플랫폼 목록까지
+          // 막지 않게 한다.
+          document.getElementById(p.noteId).textContent = p.readError + ((e && e.message) || e);
+          document.getElementById(p.listId).innerHTML = '';
+        }
+      }
+    }
+
+    async function loadPlatformReleases(p) {
       if (!currentOrg) return;
-      const note = document.getElementById('release-note');
-      const container = document.getElementById('release-list');
+      const note = document.getElementById(p.noteId);
+      const container = document.getElementById(p.listId);
 
       const { data: rels, error: relErr } = await supabase
-        .from('releases')
+        .from(p.table)
         .select('version, channel, size, notes, active, published_at')
         .eq('active', true)
         .order('published_at', { ascending: false });
 
       if (relErr) {
-        // 표가 아직 없으면 여기로 온다 (supabase/releases.sql 을 안 돌렸다)
-        note.textContent = '업데이트 표를 읽지 못했습니다: ' + relErr.message;
+        // 표가 아직 없으면 여기로 온다 (supabase/releases.sql 이나 mac_releases.sql 을 안 돌렸다)
+        note.textContent = (p.missing && isMissingTable(relErr)) ? p.missing : p.readError + relErr.message;
         container.innerHTML = '';
         return;
       }
 
       const { data: apps, error: appErr } = await supabase
-        .from('org_release_approvals')
+        .from(p.approvals)
         .select('version, approved_at')
         .eq('org_id', currentOrg.id);
       if (appErr) {
-        note.textContent = '승인 목록을 읽지 못했습니다: ' + appErr.message;
+        note.textContent = (p.missing && isMissingTable(appErr))
+          ? p.missing : '승인 목록을 읽지 못했습니다: ' + appErr.message;
         container.innerHTML = '';
         return;
       }
@@ -871,8 +930,8 @@
         if (!target[r.channel] || cmpVer(v, parseVer(target[r.channel])) > 0) target[r.channel] = r.version;
       }
       const parts = [];
-      if (target.stable) parts.push(`이 조직의 PC 들이 받을 버전: <b>${escapeHtml(target.stable)}</b>`);
-      else parts.push('승인된 버전이 없습니다. PC 들은 지금 버전을 그대로 씁니다.');
+      if (target.stable) parts.push(`이 조직의 ${p.pcsSubj} 받을 버전: <b>${escapeHtml(target.stable)}</b>`);
+      else parts.push(`승인된 버전이 없습니다. ${p.pcsTopic} 지금 버전을 그대로 씁니다.`);
       if (target.beta) parts.push(`beta 채널: <b>${escapeHtml(target.beta)}</b>`);
       if (currentRole !== 'admin') parts.push('(승인은 관리자만 할 수 있습니다)');
       note.innerHTML = parts.join(' &nbsp;·&nbsp; ');
@@ -906,28 +965,30 @@
 
       if (currentRole === 'admin') {
         container.querySelectorAll('[data-ver]').forEach(b => {
-          b.addEventListener('click', () => handleApprove(b.dataset.ver, b.dataset.approved === 'true'));
+          b.addEventListener('click', () => handleApprove(p, b.dataset.ver, b.dataset.approved === 'true'));
         });
       }
     }
 
-    async function handleApprove(version, currentlyApproved) {
+    // 확인 창과 알림에 플랫폼 이름을 붙인다 - 두 목록에 같은 번호가 있으면 "1.1.8 을 승인할까요?"
+    // 만으로는 어느 쪽인지 모른다.
+    async function handleApprove(p, version, currentlyApproved) {
       if (!currentOrg) return;
       try {
         if (currentlyApproved) {
-          if (!confirm(`${version} 승인을 취소할까요?\n이미 받은 PC 는 그대로이고, 아직 안 받은 PC 만 멈춥니다.`)) return;
-          const { error } = await supabase.from('org_release_approvals')
+          if (!confirm(`${p.name} ${version} 승인을 취소할까요?\n이미 받은 ${p.oneTopic} 그대로이고, 아직 안 받은 ${p.one} 만 멈춥니다.`)) return;
+          const { error } = await supabase.from(p.approvals)
             .delete().eq('org_id', currentOrg.id).eq('version', version);
           if (error) throw error;
-          toast(`${version} 승인을 취소했습니다.`);
+          toast(`${p.name} ${version} 승인을 취소했습니다.`);
         } else {
-          if (!confirm(`${version} 을 승인할까요?\n이 조직의 모든 PC 가 한 시간 안에 묻지 않고 이 버전으로 바뀝니다.`)) return;
-          const { error } = await supabase.from('org_release_approvals')
+          if (!confirm(`${p.name} ${version} 을 승인할까요?\n이 조직의 모든 ${p.allSubj} 한 시간 안에 묻지 않고 이 버전으로 바뀝니다.`)) return;
+          const { error } = await supabase.from(p.approvals)
             .insert({ org_id: currentOrg.id, version });
           if (error) throw error;
-          toast(`${version} 을 승인했습니다.`);
+          toast(`${p.name} ${version} 을 승인했습니다.`);
         }
-        await loadReleases();
+        await loadPlatformReleases(p);
       } catch (e) {
         toast('실패: ' + e.message);
       }
