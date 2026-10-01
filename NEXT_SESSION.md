@@ -838,7 +838,16 @@ Disconnected / Closed 로 보고됐다. `GattDeviceService` 는 반드시 `Close
 
 ## 현재 기기 상태
 
-- **Mac: 맥북(M1)에 1.1.9 가 깔려 돈다** (2026-10-01 오후, 사용자). 실기로 확인된 것은 **GATT 하나**:
+- **1.1.10 이 나갔다** (사용자 release.bat, 2026-10-01 18:50 - 경로마다 따로, 아이폰 클립보드) 와 승인 (Windows,
+  Mac). 서버 Windows exe `0007a7af...`, Mac zip `47438c233f90ea7da0c8caf55a5d1cafbc934cfd48d3284f40d154e043103755`
+  (= 저장소 맨 위 `SmartScreen-mac.zip`), `SmartScreen-desktop.zip` `cda52a67dc6e4a0d0ba08d2bc707a2802a86e4365a85e99f07cb98de2c5ac9cd`.
+  노트북은 1.1.10 으로 떴고 **아직 다시 재지 않았다** (`gattRssiOffset=0`, 기준 -67)
+- **맥북은 1.1.10 으로 다시 쟀다**: 광고 기준 -53, 연결 -62 (차이 -9). **폰을 책상 위에 두고 쟀더니, 바지
+  주머니에 넣자 앉아서도 가려졌다** (연결 -58 ~ -60, 풀리려면 -58 이상 필요). 사용자 제안대로 재보기 안내를
+  "폰을 평소처럼 지닌 채 (주머니에 넣고 다니면 주머니에 넣은 채로)" 로 바꿨다 - Windows·Mac 같은 글, 두
+  README 의 문제 해결 줄도 (main `c00e63c`, Mac CI 248, Windows 별도 폴더 빌드. **아직 안 내놓음** = 다음 1.1.11).
+  사용자는 지금 버전으로도 주머니에 넣은 채 다시 재면 된다
+- **Mac: 맥북(M1)에 1.1.9 가 깔려 돈다** (2026-10-01 오후, 사용자 - 위에서 1.1.10 으로 올라갔다). 실기로 확인된 것은 **GATT 하나**:
   - 처음엔 `GATT: waiting` - 폰이 Windows 노트북에 붙어 있었다 (노트북 16:45:20 `GATT client subscribed`).
     폰 앱은 PC 하나에만 붙는다. 그때 노트북의 AdvScan 이 맥북의 PC 서비스 광고를 -51 dBm 으로 봤다
     (주소 `C889F3D41613`, Apple 대역) = Mac 의 CBPeripheralManager 광고는 된다
