@@ -14,7 +14,8 @@ import Foundation
 // 자동 잠금이 걸리지 않는 경우는 넷: 5 초 안에 입력이 있었다, 재보기 중이다, 원격 세션이다,
 // 폰이 NEAR 다.
 //
-// Windows 와 일부러 다르게 한 것 (모두 lockscreen 스펙의 권고):
+// 1.1.7 까지의 Windows 와 일부러 다르게 한 것 (모두 lockscreen 스펙의 권고). Windows 도 다음 릴리스부터
+// 같게 고쳤다 (client/main.cpp, client/blackscreen.cpp - docs/MAC.md "일부러 바꾼 것"):
 //   Q1  오버레이 셋째 줄의 잠근 시각: Windows 는 시간대만큼 틀린다. 여기는 지역 시각
 //       (지금 - 잠긴 시간) 으로 바르게 쓴다.
 //   Q2  unlockTimer 를 잠글 때마다(자동, 수동) 0 으로 지운다. Windows 는 해제 때도 잠글 때도
