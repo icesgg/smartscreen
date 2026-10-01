@@ -85,6 +85,13 @@ final class WizardWindowController: NSObject {
         wz.begin()
     }
 
+    /// 열려 있으면 초점을 빼앗지 않고 앞에 놓는다. 등록·로그인 결과 때 간단 창을 앞에 놓는 쪽
+    /// (AppController.showSimpleForResult) 이 바로 뒤에 부른다 - 이 창은 간단 창 안쪽에 겹쳐 열리므로,
+    /// 그 뒤에 깔리면 안내와 단추가 가려진 채 측정만 돈다.
+    static func raiseIfOpen() {
+        current?.window.orderFrontRegardless()
+    }
+
     private init(app: AppController, parent: NSWindow?) {
         self.app = app
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 426, height: 293),

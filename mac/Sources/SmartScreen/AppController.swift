@@ -1201,9 +1201,11 @@ final class AppController: NSObject, GuardEngineHost {
     /// 활성화를 거절하고 이 앱은 Dock 도 Cmd-Tab 도 없다. 상자는 Alerts 가 떠 있는 층으로 올리지만,
     /// 상자를 닫은 뒤 바뀐 "내 폰" 줄을 보여 줄 창도 앞에 있어야 돌아올 곳이 보인다.
     /// 부르는 곳은 모두 타이머 콜백이나 단추 동작이다 (main.async 블록 안이 아니다).
+    /// 재보기 창이 열려 있으면 (로그인을 기다리는 동안 열 수 있다) 그것을 다시 간단 창 위로 올린다.
     private func showSimpleForResult() {
         guard !isExiting, let s = simple else { return }
         s.showWithoutActivating()
+        WizardWindowController.raiseIfOpen()
     }
 
     /// WM_LOGIN_RESULT

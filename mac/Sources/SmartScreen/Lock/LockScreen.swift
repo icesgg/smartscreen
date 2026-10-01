@@ -378,6 +378,7 @@ final class LockScreen {
     /// Windows 에서는 잠금 창이 사라져도 다른 창의 z-순서가 잠그기 전 그대로다 (spec 6.5). 다른 앱
     /// 창들 위에 있던 우리 창(업데이트 띠를 보이려고 올린 간단 창 같은 것)은 건드리지 않는다.
     /// 우리 앱을 쓰던 중이었으면 예전 그대로 그 키 창을 다시 앞으로 한다.
+    /// 어느 쪽이든 잠긴 동안 열린 알림이 남아 있으면 그 상자가 앞에 보이게 한다 (raisePendingModal).
     private func restoreFrontmost() {
         let app = previousApp
         let keyWindow = previousKeyWindow
@@ -390,6 +391,7 @@ final class LockScreen {
             // 잠글 때 같이 올라왔을 수 있는 우리 창만 제자리로 돌려놓는다 (우리 앱을 쓰던 중에
             // 잠겼으면 목록이 비어 있다).
             LockScreen.restoreOrder(under)
+            LockScreen.raisePendingModal()
             return
         }
         if let app = app {
@@ -399,9 +401,26 @@ final class LockScreen {
             }
             _ = app.activate(options: [])
             LockScreen.restoreOrder(under)
+            LockScreen.raisePendingModal()
+        } else if let m = NSApp.modalWindow, m.isVisible {
+            // 잠긴 동안 열린 알림이 남아 있다. 앱 전체가 그 모달에 막혀 있으니 예전 키 창이 아니라 그것이
+            // 키 창이어야 한다 (Return 이 그 상자에 가게).
+            m.makeKeyAndOrderFront(nil)
         } else if let w = keyWindow, w.isVisible, !(w is LockWindow) {
             w.makeKeyAndOrderFront(nil)
         }
+    }
+
+    /// 잠긴 동안 열린 알림(로그인·등록 결과, 업데이트 실패...)이 남아 있으면 떠 있는 층에 올려 앞에 놓는다.
+    /// 그 알림은 커튼이 앱을 활성화해 둔 동안 열려서 Alerts.present 가 층을 올리지 않았다. 활성화를
+    /// 잠그기 전의 앱에 돌려주면 그 앱의 창이 알림 위로 올라오고, 앱 전체가 그 모달에 막혀 간단 창 단추는
+    /// 삑 소리만 낸다. Alerts.present 가 앱이 활성이 아닐 때 하는 것과 같다 (초점은 돌려준 앱에 남는다).
+    /// 같은 일을 간단 창에는 하지 않는다: 일반 층 창은 돌려준 앱의 활성화가 늦게 반영될 때 그 창들에
+    /// 다시 덮인다. 상자만 보이면 닫은 뒤 돌아갈 길(오버레이 [설정])은 있다.
+    private static func raisePendingModal() {
+        guard let m = NSApp.modalWindow, m.isVisible else { return }
+        m.level = .floating
+        m.orderFrontRegardless()
     }
 
     /// 잠글 때 적어 둔 우리 창을 각각 그 위에 겹쳐 있던 다른 앱 창 바로 아래로 놓는다. 그 창이 이제
