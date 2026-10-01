@@ -617,9 +617,13 @@ final class AppController: NSObject, GuardEngineHost {
             // 판정을 재현할 수 없다. 설정값은 지금 메인에서 읽는다 (슬라이더가 도중에 바꿀 수 있다).
             let path = r.gatt ? "GATT" : (r.bleAvailable ? "adv" : "latency")
             let setThr = r.gatt ? Shared.shared.gattRssiThreshold : Shared.shared.nearRssiThreshold
+            // 확인 연결이 돌고 있거나 막 끝났으면 꼬리에 붙인다 (", probing for 1.3s" /
+            // ", probe ended 0.4s ago", 아니면 ""). 연결을 맺는 동안 같은 라디오의 광고 수신이 줄 수 있어
+            // 그것이 전환을 불렀는지는 이 꼬리가 없으면 STATE 줄만 보고 가를 수 없다.
+            let probeTag = AdvScanner.shared.probeTagForLog(now: Mono.now())
             EventLog.write("STATE \(r.prevState.name) -> \(r.state.name)  (\(path) rssi=\(r.rssiDbm) dBm "
                            + "thr=\(r.thresholdDbm) set=\(setThr), latency=\(r.latencyMs)ms "
-                           + "reachable=\(r.reachable ? 1 : 0))")
+                           + "reachable=\(r.reachable ? 1 : 0)\(probeTag))")
         }
 
         let now = Mono.now()
@@ -919,9 +923,13 @@ final class AppController: NSObject, GuardEngineHost {
 
     /// g_measuring: 재보기 창이 열려 있는 동안. 자리를 비우는 것이 절차의 일부라 자동 잠금과
     /// 업데이트 재시작을 막는다 (직접 잠금은 그대로 된다).
+    /// 그동안 GATT TICK 은 입력과 무관하게 1 초마다 간다 (GattServer 가 Shared.measuring 을 읽는다) -
+    /// 앉아서 재는 1 분 동안 타자를 쳐도 연결 표본이 쌓이게. 스캐너는 직접 읽기 스캔(R)을 켠다 -
+    /// 광고 기준을 평소 광고 경로와 같은 조건에서 재야 한다.
     func setMeasuring(_ on: Bool) {
         guardEngine.measuring = on
         Shared.shared.measuring = on
+        AdvScanner.shared.setMeasuring(on)
     }
 
     /// 간단 창 거리 슬라이더 (SimpleApplyDist). 두 경로를 따로 물어볼 화면이 아니므로 둘 다 바꾼다:

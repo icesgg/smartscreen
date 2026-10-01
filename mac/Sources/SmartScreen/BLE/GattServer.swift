@@ -342,13 +342,12 @@ final class GattServer: NSObject, CBPeripheralManagerDelegate {
     }
 
     /// 폴링 정책: RSSI 가 필요한 건 "자리를 떴을지도 모를 때" 뿐 -> 입력 중에는 폰 앱을
-    /// 깨우지 않는다 (배터리).
+    /// 깨우지 않는다 (배터리). 순서와 숫자는 Core 의 GattPollPolicy (잠김 2000 -> 재보기 1000 ->
+    /// 입력 규칙). 세 값은 각각 Shared 의 잠금 뒤에 있어 어느 스레드에서 읽어도 된다.
     private static func desiredIntervalMs(now: UInt64) -> UInt32 {
-        if Shared.shared.blackActive { return 2000 }        // 잠김 상태: 복귀 감시
-        let idle = BLEIds.elapsed(now, since: Shared.shared.lastInputTick)
-        if idle < 5000 { return 0 }                         // 입력 중 = 자리에 있음
-        if idle < 120_000 { return 1000 }                   // 입력 멈춤 직후: 빠르게 확인
-        return 3000                                         // 오래 가만히 있음: 느리게
+        return GattPollPolicy.intervalMs(blackActive: Shared.shared.blackActive,
+                                         measuring: Shared.shared.measuring,
+                                         idleMs: BLEIds.elapsed(now, since: Shared.shared.lastInputTick))
     }
 
     /// [시작]: [중지] 동안에도 끊기지 않은 구독자가 있으면 새 구독(0 -> N)과 같은 길로 받아들인다 -
