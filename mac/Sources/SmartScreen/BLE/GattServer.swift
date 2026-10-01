@@ -370,8 +370,8 @@ final class GattServer: NSObject, CBPeripheralManagerDelegate {
         // 그러지 않으면 아래 wake 로 깨어난 판정이 "구독자 있음, 간격 0" 을 본다: 간격 0 이면
         // healthy 는 무조건 true 이고 판정은 "간격 0 = 사용자가 입력 중" 으로 읽어 NEAR 를 낸다.
         // 잠긴 화면이 자리에 아무도 없는데 한 샘플 동안 풀릴 수 있다.
-        // Windows 에는 이 경합이 아직 있다 (client/ble_gatt.cpp SubscribedClientsChanged 가
-        // reportEvent 를 먼저 깨우고 intervalMs 는 틱 스레드가 나중에 정한다).
+        // Windows(client/ble_gatt.cpp SubscribedClientsChanged)도 같은 방법으로 고쳤다: pollMutex 안에서
+        // intervalMs/pollStartTick/lastReportTick 을 subscribers 보다 먼저 쓰고, reportEvent 는 그 뒤에 깨운다.
         // Shared 의 잠금은 우리 잠금 밖에서 잡는다 (두 잠금을 겹쳐 잡지 않는다).
         let firstInterval: UInt32 = firstSub ? GattServer.desiredIntervalMs(now: now) : 0
         var lostRssi: Int?
