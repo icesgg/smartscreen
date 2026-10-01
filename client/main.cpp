@@ -3134,13 +3134,17 @@ static LRESULT CALLBACK WizProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         case 0:
             title = L"내 자리에 맞게 재보기";
             body  = L"2분쯤 걸려요. 순서는 이렇습니다.\n\n"
-                    L"1.  폰을 평소 두는 자리에 두고 1분 동안 앉아 있기\n"
+                    L"1.  폰을 평소처럼 지닌 채 1분 동안 앉아 있기\n"
+                    L"     (주머니에 넣고 다니면 주머니에 넣은 채로)\n"
                     L"2.  폰만 \"화면이 꺼지길 원하는 곳\" 에 두고 오기\n"
                     L"3.  자리에 앉아서 45초 기다리기";
             break;
         case 1:
             title = L"1/3  자리에 앉아 계세요";
-            body  = L"폰은 평소 두는 자리에 그대로 두세요.\n"
+            // 몸에 지닌 폰은 책상 위보다 약하게 잡힌다 (맥북 실측: 책상 위로 재고 주머니에 넣자
+            // 앉아서도 가려졌다, 2026-10-01). 그래서 "두는 자리" 가 아니라 "지니는 방식" 대로 잰다.
+            body  = L"폰은 평소처럼 지니고 계세요.\n"
+                    L"주머니에 넣고 다니면 주머니에 넣은 채로 앉아 계세요.\n"
                     L"컴퓨터는 건드리지 않아도 돼요.";
             swprintf_s(live, L"%d초 남음   ·   광고 %d번   ·   연결 %d번", g_wzLeft,
                        (int)g_wzSeated.size(), (int)g_wzGSeated.size());

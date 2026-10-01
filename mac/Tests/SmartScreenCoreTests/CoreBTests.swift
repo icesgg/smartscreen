@@ -1202,7 +1202,8 @@ final class CoreBWizardJudgeTests: XCTestCase {
         XCTAssertEqual(WizardJudge.phaseTitles, ["내 자리에 맞게 재보기", "1/3  자리에 앉아 계세요",
                                                  "2/3  폰을 두고 오세요", "3/3  거의 다 됐어요"])
         XCTAssertEqual(WizardJudge.phaseBodies.count, 4)
-        XCTAssertEqual(WizardJudge.phaseBodies[0], "2분쯤 걸려요. 순서는 이렇습니다.\n\n1.  폰을 평소 두는 자리에 두고 1분 동안 앉아 있기\n2.  폰만 \"화면이 꺼지길 원하는 곳\" 에 두고 오기\n3.  자리에 앉아서 45초 기다리기")
+        XCTAssertEqual(WizardJudge.phaseBodies[0], "2분쯤 걸려요. 순서는 이렇습니다.\n\n1.  폰을 평소처럼 지닌 채 1분 동안 앉아 있기\n     (주머니에 넣고 다니면 주머니에 넣은 채로)\n2.  폰만 \"화면이 꺼지길 원하는 곳\" 에 두고 오기\n3.  자리에 앉아서 45초 기다리기")
+        XCTAssertEqual(WizardJudge.phaseBodies[1], "폰은 평소처럼 지니고 계세요.\n주머니에 넣고 다니면 주머니에 넣은 채로 앉아 계세요.\n컴퓨터는 건드리지 않아도 돼요.")
         XCTAssertEqual(WizardJudge.phaseBodies[3], "그대로 기다려 주세요.\n폰을 가지러 가지 마세요.")
     }
 }
