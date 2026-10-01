@@ -479,6 +479,14 @@ try {
     Step "빌드 (do_build.bat)"
     $buildLog = Join-Path $env:TEMP 'smartscreen-release-build.log'
     if (Test-Path $buildLog) { Remove-Item $buildLog -Force }      # 지난번 로그를 증거로 삼지 않는다
+    # 내놓는 빌드는 매번 처음부터 설정한다 (do_build.bat 머리말). 헤더 의존성은 /showIncludes 접두어를
+    # 바이트로 맞추는데, 이 PC 의 cl.exe 는 VSLANG=1033 에도 한국어로 찍고 그 바이트가 콘솔 코드페이지마다
+    # 다르다 - 이 스크립트는 UTF-8, 손으로 돌린 cmd 는 CP949. 어긋난 채로 빌드하면 version.h 만 바뀐
+    # 소스가 다시 컴파일되지 않는다 (1.1.8 이 update.cpp 만 1.1.7 인 채로 나갔다). 앱은 위에서 껐다.
+    foreach ($p in 'build\CMakeFiles', 'build\CMakeCache.txt') {
+        $full = Join-Path $root $p
+        if (Test-Path $full) { Remove-Item $full -Recurse -Force }
+    }
     # PowerShell 이 직접 실행한다 (머리말 함정 3). stderr 줄은 오류 레코드로 섞여 들어오지만
     # Continue 라 멈추지 않고, 로그에 같이 남는다.
     $log = (& "$root\do_build.bat" 2>&1 | Out-String)
@@ -496,6 +504,27 @@ try {
         $f = Get-Item "$root\build\$exe" -ErrorAction SilentlyContinue
         if (-not $f) { Fail "build\$exe 가 없다 (로그: $buildLog)" }
         if ($f.LastWriteTime -lt $vhTime) { Fail "build\$exe 가 version.h 보다 낡았다 - 링크가 안 됐다 (로그: $buildLog)" }
+    }
+    # 링크가 새로 됐어도 그 안의 .obj 는 낡았을 수 있다. 헤더 의존성(.obj.d)이 비어 있으면 version.h 만
+    # 바뀐 소스는 다시 컴파일되지 않는다 - 1.1.8 이 그렇게 나가서 update.cpp 가 자기를 1.1.7 로 알았다
+    # (서버의 1.1.8 을 계속 "새 버전" 으로 본다. 기업 PC 는 승인되면 받고 다시 시작하기를 되풀이한다).
+    # 그래서 의존성 파일이 비지 않았는지, exe 안에 예전 번호(L"..." = UTF-16)가 남지 않았는지 직접 본다.
+    $depDir = Join-Path $root 'build\CMakeFiles\SmartScreen.dir'
+    $emptyDeps = @(Get-ChildItem $depDir -Recurse -Filter '*.obj.d' -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Length -eq 0 })
+    if ($emptyDeps.Count -gt 0) {
+        # -f 는 + 보다 먼저 묶인다 - 이어 붙인 뒤에 채우도록 괄호로 감싼다
+        Fail ((("헤더 의존성 파일 {0}개가 비어 있다 (예: {1}) - version.h 만 바뀐 소스가 다시 컴파일되지 않는다. " +
+                "build\CMakeCache.txt 와 build\CMakeFiles 를 지우고 다시 (do_build.bat 이 접두어가 다르면 스스로 지운다)")) -f
+              $emptyDeps.Count, $emptyDeps[0].FullName)
+    }
+    $latin1 = [Text.Encoding]::GetEncoding(28591)   # 바이트 하나 = 글자 하나: 정렬과 무관하게 찾는다
+    $exeText = $latin1.GetString([IO.File]::ReadAllBytes("$root\build\SmartScreen.exe"))
+    $wide = { param([string]$s) $exeText.Contains($latin1.GetString([Text.Encoding]::Unicode.GetBytes($s))) }
+    if (-not (& $wide $script:newVer)) { Fail "build\SmartScreen.exe 안에 새 번호 $script:newVer 이 없다 (로그: $buildLog)" }
+    if ($script:oldVer -and $script:oldVer -ne $script:newVer -and (& $wide $script:oldVer)) {
+        Fail ("build\SmartScreen.exe 안에 예전 번호 $script:oldVer 이 남아 있다 - 다시 컴파일되지 않은 소스가 있다. " +
+              "build\CMakeCache.txt 와 build\CMakeFiles 를 지우고 다시")
     }
     $built = (& "$root\build\Publish.exe" --version 2>&1 | Out-String).Trim()
     if ($built -ne $script:newVer) { Fail "새 Publish.exe 가 '$built' 이라고 한다 ($script:newVer 이어야 한다)" }

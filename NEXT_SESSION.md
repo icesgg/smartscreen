@@ -20,7 +20,8 @@ SmartScreen 프로젝트를 이어서 개발한다. 저장소: C:\work\smartscre
 사용자가 맥북 결과 칸을 **하나도 채우지 않은 채** 왔다 (`mac_releases` 를 anon 으로 읽어 보니 404 = SQL 도
 아직). 결과를 기다리지 않고, **맥북 시험 한 번으로 최대한 많이 갈리게** 준비했다. 전부 main 에 있다.
 Mac·아이폰 실기에서는 **여전히 한 번도 돌지 않았다.** Windows 6건은 사용자가 "모두 넣기" 로 정해 main 에
-합쳤고 **아직 내놓지 않았다** - 사용자가 직접 release.bat 하기로 했다 (아래 "현재 기기 상태").
+합쳤고, 세션 끝에 사용자가 직접 release.bat 으로 **1.1.8** 을 내놓았다 - 그런데 Windows exe 의 업데이트
+코드가 1.1.7 인 채로 나갔다 (함정 "헤더만 바꾸면", 아래 "현재 기기 상태"). 빌드를 고쳤고 1.1.9 가 필요하다.
 
 ### Mac: 스캔을 둘로 (필터 + 직접 읽기)
 
@@ -72,7 +73,7 @@ Mac·아이폰 실기에서는 **여전히 한 번도 돌지 않았다.** Window
   깨울 사건이 없어 감시가 못 돈다** - 앱을 열거나 링크가 끊길 때 풀린다
 - 런타임은 미확인이다. 사용자가 Xcode 로 다시 설치해야 폰에 들어간다
 
-### Windows: Mac 에서만 고쳤던 결함 6건 (main, 아직 안 내놓음)
+### Windows: Mac 에서만 고쳤던 결함 6건 (1.1.8 로 나감)
 
 - **GATT 거짓 NEAR**: 구독 콜백이 폴링 간격을 정하기 전에 판정을 깨워서 간격 0 = "입력 중" 으로 읽혔다 →
   잠긴 화면이 0~9초 풀린다. 노트북 events.log 에 BLACK ON 중 **12번** (`GATT client subscribed` 바로 뒤
@@ -452,7 +453,7 @@ A 에서 스크린캡처하면 B 에서 Ctrl+V 로 붙는다. 연결고리는 �
 release.bat 으로 내놓은 뒤 노트북에서 (데스크톱은 받은 뒤). 로그는 PowerShell 에서
 `Get-Content "$env:APPDATA\SmartScreen\events.log" -Tail 30`.
 
-- **GATT 거짓 NEAR** (가장 중요): 고급 창 "잠금 해제 지연" 을 "즉시" → [시작] → 폰을 들고 떠나 가려지게 →
+- **GATT 거짓 NEAR** (가장 중요 - 2026-10-01 13:59 에 한 번 했다, 결과와 남은 질문은 "현재 기기 상태"): 고급 창 "잠금 해제 지연" 을 "즉시" → [시작] → 폰을 들고 떠나 가려지게 →
   먼 곳에서 아이폰 블루투스를 껐다 켠다 → 아무도 PC 에 안 간 채 30초. 화면이 계속 가려져 있어야 한다.
   `Select-String -Path "$env:APPDATA\SmartScreen\events.log" -Pattern 'GATT client subscribed' -Context 0,1 | Select-Object -Last 5`
   에서 `GATT client subscribed` 바로 다음 줄이 `STATE FAR -> NEAR (GATT ... thr=X set=X` (thr = set) 면 아직
@@ -667,15 +668,27 @@ macOS 기본값은 배터리에서 2분(전원 10분) 뒤 화면을 끄고, 노�
 - 네이티브 명령의 stderr 는 오류 레코드가 되고 `ErrorActionPreference=Stop` 이면
   vcvarsall 의 잡음 한 줄에도 스크립트가 죽는다. `Continue` 로 두고 `$LASTEXITCODE`
 
-### 헤더만 바꾸면 다시 빌드되지 않을 수 있다 (do_build.bat 의 VSLANG)
+### 헤더만 바꾸면 다시 빌드되지 않는다 - 두 번 낡은 exe 가 나갔다 (1.1.0, 1.1.8)
 
 CMake 의 NMake 생성기는 cl.exe 의 `/showIncludes` 출력에서 헤더 의존성을 읽는데, 그
-접두어("참고: 포함 파일:")를 **글자로** 맞춘다. 콘솔 코드페이지가 처음 설정할 때와
-다르면 접두어가 안 맞아 `.obj.d` 가 0 바이트로 남고, 그 뒤로는 `version.h` 만 바꿔서는
-아무것도 다시 컴파일되지 않는다 - 빌드는 "성공" 하고 exe 는 낡은 채다. 실제로 그렇게
-1.1.0 이 다시 올라갔다. `do_build.bat` 이 `VSLANG=1033` 으로 영어 접두어를 강제한다.
-의심되면 `build\CMakeFiles\SmartScreen.dir\client\main.cpp.obj.d` 가 비어 있는지 보고,
-비어 있으면 `build\CMakeCache.txt` 와 `build\CMakeFiles` 를 지우고 다시.
+접두어("참고: 포함 파일:")를 **바이트로** 맞춘다. 이 PC 의 cl.exe 는 `VSLANG=1033` 에도 한국어로
+찍고(영어 언어 팩이 없다), 그 바이트는 콘솔 코드페이지마다 다르다 - **release.ps1 은 UTF-8, 손으로
+돌린 cmd 는 CP949.** 설정할 때와 다른 코드페이지로 빌드하면 그때 컴파일된 `.obj.d` 가 0 바이트가
+되고, 그 뒤로는 `version.h` 만 바꿔서는 그 소스가 다시 컴파일되지 않는다. 빌드는 "성공" 하고 exe 는
+새로 링크되므로 시각 검사도 통과한다.
+
+- 1.1.0: 낡은 exe 가 옛 번호로 다시 올라갔다 (2026-09-30). 그때 넣은 `VSLANG=1033` 은 효과가 없었다
+- **1.1.8 (2026-10-01): `update.cpp.obj` 가 08:19 의 1.1.7 빌드 것이었다.** 화면과 로그는 1.1.8 인데
+  업데이트 코드만 자기를 1.1.7 로 알아서 서버의 1.1.8 을 계속 "새 버전" 으로 본다
+  (`update: 1.1.8 exists but not approved for org (running 1.1.7)` 가 증거였다). 기업 PC 에서 1.1.8 을
+  승인하면 받고 → 다시 시작하고 → 또 받는다. 바로잡는 길은 제대로 빌드한 1.1.9 (1.1.8 PC 들도 1.1.9 >
+  "1.1.7" 이라 받는다)
+
+지금의 막이 셋이다. `do_build.bat` 은 빈 `.obj.d` 가 하나라도 있으면 캐시(`build\CMakeCache.txt`,
+`build\CMakeFiles`)를 지우고 처음부터 설정한다. `release.ps1` 은 내놓는 빌드마다 캐시를 지우고 처음부터
+빌드한다. 빌드 뒤에는 **exe 안에 새 번호가 있고 예전 번호(UTF-16)가 없는지**, `.obj.d` 가 비지 않았는지를
+직접 본다. 처음부터 빌드하면 `.obj.d` 가 전부 채워지는 것은 2026-10-01 에 별도 폴더로 확인했다
+(update.cpp.obj.d 39 KB, exe 에 1.1.7 없음).
 
 ### 인라인 파이썬에 윈도 경로를 넣지 말 것
 
@@ -804,16 +817,25 @@ Disconnected / Closed 로 보고됐다. `GattDeviceService` 는 반드시 `Close
 
 ## 현재 기기 상태
 
-- **Mac: 아직 없음.** 저장소 맨 위 `SmartScreen-mac.zip` 은 main `beb82dc` 의 CI 빌드(run 36812981415,
-  1.1.7, SHA-256 `959983ffbe8bf4a750c7ecf8d79715f53a6551cdfa1a66463ab4287c8ec3f800`) - 오전의 1.1.7 zip 과
-  코드가 다르다 (서버에 올라간 적 없는 번호라 겹치는 곳은 없다). 맥북에 깔았는지는 모른다.
-  `supabase/mac_releases.sql` 은 **적용 전** (2026-10-01 오후에도 라이브의 `mac_releases` 는 404)
-- **main 의 client/ 는 1.1.7 보다 앞서 있다** (Windows 6건, 내놓기 전). 사용자가 직접 release.bat 하기로
-  했다: mac_releases.sql 을 먼저 적용하면 같은 번호(1.1.8)로 Mac 도 나간다. 그러면 저장소 맨 위의 두 zip 이
-  1.1.8 로 바뀐다
+- **Mac: 아직 없음.** 맥북에 깔았는지는 모른다. 깔 것은 저장소 맨 위의 1.1.8 zip (아래). 이 세션 중간에
+  둔 1.1.7 CI 빌드(`959983ff...`)는 1.1.8 zip 으로 덮였다
+- **1.1.8 이 나갔다 (사용자가 release.bat, 2026-10-01 13:53~13:57).** `mac_releases.sql` 도 적용됐다
+  (`mac_releases` 에 1.1.8). 저장소 맨 위 zip 은 둘 다 1.1.8:
+  `SmartScreen-desktop.zip` `2eadabdcad364ec81ce10f91b9a023746609b3a9904f2d6b93aeac7c22cfeda1`,
+  `SmartScreen-mac.zip` `e177898e4ef32c126053dd76b26916d0e7c93a2e9eecdf73eac1f35c02940a04` (= 서버 행)
+- **Windows 1.1.8 exe 는 업데이트 코드만 1.1.7 이다** (함정 "헤더만 바꾸면"). 서버의 exe 해시
+  `237953f2...` = 노트북 `build\SmartScreen.exe`. **조직 승인(org_release_approvals)에 1.1.8 을 넣지
+  말 것** - 2026-10-01 에 anon 으로 읽었을 때 없었다. 1.1.9 를 release.bat 으로 (빌드는 고쳤다).
+  Mac 1.1.8 은 CI 가 처음부터 빌드해서 멀쩡하다
+- 노트북은 1.1.8 로 떠 있고, GATT 시험 때문에 **잠금 해제 지연이 "즉시"(unlockDelay=0)** 다 - 원래 10초
+- GATT 시험 결과 (노트북, 1.1.8, 13:59:57): 구독 직후 `STATE FAR -> NEAR (GATT rssi=-62 dBm thr=-63 set=-67)`
+  → BLACK OFF. thr = set+4 라 예전 결함(간격 0 갈래, thr = set)이 아니라 **폰의 첫 실제 보고 -62 를 판정한
+  것**이다. 그때 사용자가 어디 있었는지 묻는 중 - 멀리 있었다면 남은 약점은 "재연결 뒤 첫 보고 하나(칼만이
+  막 초기화돼 원시값 그대로)가 혼자 잠금을 푼다" 이다 (재연결 뒤에는 보고 둘을 요구하는 것이 후보).
+  같은 표의 11:50:45 / 12:47:55 쌍(thr = set)은 1.1.7 시절의 예전 결함이다 (13번째)
 - 아이폰 앱: 폰에 깔린 것은 2026-10-01 오후 전의 소스다 (`didModifyServices`·TICK 감시·`import Combine` 없음).
   사용자가 Xcode 로 다시 설치해야 들어간다
-- 노트북(LG gram 14Z990, Intel 내장): **1.1.7**, 기업 등록(`enterpriseRegistered=1`,
+- 노트북(LG gram 14Z990, Intel 내장): **1.1.8** (업데이트 코드는 1.1.7 로 안다 - 위), 기업 등록(`enterpriseRegistered=1`,
   orgId `0dca070f-…`), **`measuredBaseRssi=-67`, `nearRssiThreshold=-67` =
   `gattRssiThreshold=-67` (거리 3단계의 [보통])**, `idleCountdownSec=15`, `bleDebugLog=0`.
   IRK 와 폰 토큰 둘 다 설정돼 있다. **`centerImagePath` 는 개인 그림
@@ -822,12 +844,13 @@ Disconnected / Closed 로 보고됐다. `GattDeviceService` 는 반드시 `Close
   다시 띄운다; `dist\` 의 exe 와 같은 파일이다)
 - 데스크톱: 마지막으로 확인한 것은 **1.1.4** (1.1.5/1.1.6 을 받았는지 확인 안 됨 - 위
   "남은 작업 0"), 듀얼 모니터. 기업 등록인지 개인인지는 확인 못 했다
-- 같은 구글 계정(icesgg@gmail.com). 클립보드 공유는 노트북에서 꺼져 있다
+- 같은 구글 계정(icesgg@gmail.com). 클립보드 공유는 노트북에서 **켜졌다** (2026-10-01 13:57 `clip: started`,
+  14:00 글과 그림을 보냈다 - 맥북 쪽 시험으로 보인다)
 - Supabase: 네 스키마(`schema`/`device_tokens`/`clipboard`/`releases`) +
   `content_lockdown.sql` + `hardening.sql` 적용됨 (2026-09-30/10-01). `contents` 에 두 행
-  (png 꺼짐, mp4 켜짐). `releases` 에 1.1.0 ~ 1.1.7 (1.1.0 은 낡은 빌드가 실수로 다시
-  올라간 것 - 해는 없음; 1.1.7 은 1.1.6 과 같은 코드). `release_admins` 에
-  icesgg@gmail.com. **1.1.7 의 [승인] 을 눌렀는지 확인 안 됨** (노트북은 이미 1.1.7
-  이지만, 다른 기업 PC 는 승인이 있어야 받는다)
-- `client/version.h` = 1.1.7 = 서버의 마지막 = `build\` = `dist\` = `SmartScreen-desktop.zip`
-  (SHA-256 `2242253829ef040c2690bfb86fd7d5bf1340ad11e60ca21e7ebc245d89563e3e`). main 의 소스만 앞서 있다 (위)
+  (png 꺼짐, mp4 켜짐). `releases` 에 1.1.0 ~ 1.1.8 (1.1.0 은 낡은 빌드가 실수로 다시
+  올라간 것 - 해는 없음; 1.1.7 은 1.1.6 과 같은 코드; **1.1.8 은 update.cpp 가 낡은 빌드** - 위).
+  `mac_releases.sql` 적용됨 (`mac_releases` 에 1.1.8). `release_admins` 에 icesgg@gmail.com.
+  `org_release_approvals` 에는 1.1.1 한 줄뿐이었다 (2026-10-01 anon 으로 읽음)
+- `client/version.h` = 1.1.8 = 서버의 마지막 = `build\` = `dist\` = `SmartScreen-desktop.zip`.
+  다음은 1.1.9 (빌드 고침만, 코드 변화 없음 - GATT 첫 보고 문제를 넣을지는 사용자 답에 달렸다)
