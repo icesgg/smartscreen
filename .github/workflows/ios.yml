@@ -43,7 +43,9 @@ jobs:
           sw_vers
           xcodebuild -version
           echo "iphoneos SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
-          xcrun --sdk iphoneos swiftc --version
+          xcrun swiftc --version
+          echo "installed:"
+          ls -d /Applications/Xcode*.app
 
       # -parse-as-library: 파일이 하나면 swiftc 는 그것을 main.swift 처럼(최상위 코드 허용)
       # 읽고, 그러면 @main 이 "'main' attribute cannot be used in a module that contains
@@ -70,11 +72,77 @@ jobs:
             "${files[@]}" 2>&1 | tee ios-typecheck.log
           echo "typecheck OK: ${#files[@]} file(s), iOS ${IOS_MIN}"
 
+      # 위 검사가 헛돌지 않는다는 확인: iOS 16 API(NavigationStack)를 쓴 파일은 같은 명령에
+      # 거절돼야 한다. 통과하면 -target 이 먹지 않는 것이고, 그러면 위의 "통과" 도 믿을 수 없다.
+      - name: Canary (iOS 16 API must be rejected at iOS ${{ env.IOS_MIN }})
+        run: |
+          set -uo pipefail
+          c="$RUNNER_TEMP/Canary.swift"
+          cat > "$c" <<'EOF'
+          import SwiftUI
+          @main
+          struct Canary: App {
+              var body: some Scene { WindowGroup { NavigationStack { Text("x") } } }
+          }
+          EOF
+          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+          if xcrun --sdk iphoneos swiftc -typecheck -sdk "$sdk" \
+               -target "arm64-apple-ios${IOS_MIN}" -swift-version 5 \
+               -module-name Canary -parse-as-library "$c" > canary.log 2>&1; then
+            cat canary.log
+            echo "::error::canary passed - the typecheck does not enforce iOS ${IOS_MIN} availability"
+            exit 1
+          fi
+          cat canary.log
+          if ! grep -q "only available in iOS 16" canary.log; then
+            echo "::error::canary failed for an unexpected reason"
+            exit 1
+          fi
+          echo "canary OK: rejected as expected"
+
+      # Xcode 26 이 새 앱 프로젝트에 켜는 동시성 기본값(기본 격리 MainActor + Approachable
+      # Concurrency + MemberImportVisibility)으로 한 번 더. 사용자의 프로젝트가 어느 Xcode 로
+      # 만들어졌는지 모르므로 둘 다 통과해야 한다. 러너에 Xcode 26 이상이 없으면 건너뛴다.
+      - name: Typecheck (Xcode 26 new-project defaults)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          app="$(ls -d /Applications/Xcode_2[6-9]*.app 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -z "$app" ]; then
+            echo "::notice::no Xcode 26+ on this runner - skipped"
+            exit 0
+          fi
+          export DEVELOPER_DIR="$app/Contents/Developer"
+          xcodebuild -version
+          xcrun swiftc --version
+          files=()
+          while IFS= read -r -d '' f; do files+=("$f"); done \
+            < <(find ios/SSBeacon -name '*.swift' -print0 | sort -z)
+          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos swiftc -typecheck \
+            -sdk "$sdk" \
+            -target "arm64-apple-ios${IOS_MIN}" \
+            -swift-version 5 \
+            -module-name SSBeacon \
+            -parse-as-library \
+            -default-isolation MainActor \
+            -enable-upcoming-feature DisableOutwardActorInference \
+            -enable-upcoming-feature GlobalActorIsolatedTypesUsability \
+            -enable-upcoming-feature InferIsolatedConformances \
+            -enable-upcoming-feature InferSendableFromCaptures \
+            -enable-upcoming-feature NonisolatedNonsendingByDefault \
+            -enable-upcoming-feature MemberImportVisibility \
+            "${files[@]}" 2>&1 | tee ios-typecheck-xcode26.log
+          echo "typecheck OK (Xcode 26 defaults)"
+
       - name: Upload log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ios-typecheck-log
-          path: ios-typecheck.log
+          path: |
+            ios-typecheck.log
+            ios-typecheck-xcode26.log
+            canary.log
           if-no-files-found: ignore
           retention-days: 14
