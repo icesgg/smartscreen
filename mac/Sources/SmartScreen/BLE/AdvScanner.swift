@@ -23,7 +23,9 @@ enum RegisterOutcome {
 ///                 권한 판단은 F 가 맡는다 (예전 그대로).
 ///      R (직접 읽기) - 거르지 않고 훑어 제조사 데이터 `4C 00 01 + 16바이트` 를 Windows 처럼 직접
 ///                 읽는다. 비트가 딱 하나인 광고가 후보이고 그 비트 번호를 배운다 (phoneOvfBit).
-///                 토큰이 등록돼 있고 감시 중일 때만 돈다.
+///                 토큰이 등록돼 있고 감시 중일 때만 돈다. 이 Mac 에 폰 앱이 GATT 로 10초 넘게 건강하게
+///                 붙어 있으면 끄고, 재보기 중에는 늘 켠다 (RawScanPolicy, `scan: raw=...` 줄).
+///    F 가 멎은 것 같으면 (폰이 가까운 게 분명한데 30초 넘게 F 가 폰을 안 준다) F 를 다시 건다 (FilterScanWatch).
 ///    후보는 기기 식별자로 합친다. 두 쪽이 같은 패킷을 각각 알릴 수 있으므로 등록된 폰의 샘플은
 ///    DualSourceDedupe 를 지나야 칼만/공개 상태/판정 깨우기에 닿는다 (연속 2샘플 규칙이 샘플을 센다).
 ///    어느 쪽이 잠긴 폰을 실제로 주는지는 `ident: XXXX locked adverts via ...` 줄과 --probe-scan 의 요약이
@@ -51,6 +53,10 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private var pubCentralState: CBManagerState = .unknown       // F 의 상태 (화면과 판단은 이것만 본다)
     private var pubRawCentralState: CBManagerState = .unknown    // R 의 상태 (권한 거부만 본다)
     private var pubLearnedBit = -1   // 새로 배워서 저장해야 할 overflow 비트 (Windows identBitLearned)
+    // STATE 줄 꼬리용 (probeTagForLog 는 메인에서 부른다). 프로버의 탐색만 - 등록 탐색은 넣지 않는다
+    // (Windows 의 등록은 스캐너 밖에서 돈다 - 같은 줄이 나오게).
+    private var pubProbeSince: UInt64 = 0   // 진행 중인 탐색의 시작 (0 = 없음)
+    private var pubProbeEnded: UInt64 = 0   // 마지막 탐색이 끝난 시각 (0 = 이번 감시에 없음)
     // 최근 수신 시각 링버퍼 (초당 수신 건수 계산용)
     private static let rateSlots = 256
     private var rateTicks = [UInt64](repeating: 0, count: AdvScanner.rateSlots)
@@ -108,13 +114,20 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private var proberTimer: DispatchSourceTimer?
     private var probe: Probe?
     private var registration: Registration?
+    // 기기별 연속 실패 (Unreachable). 재시도 간격(15 -> 120초)과 "probe failed" 줄 줄이기가 이 횟수를 쓴다.
+    private var failStreaks = ProbeFailStreaks<UUID>()
+    // R 을 돌릴지 (GATT 가 10초 넘게 건강하면 끈다, 재보기 중에는 켠다). rawScanning = R 에 스캔을 걸어 뒀다
+    private var rawPolicy = RawScanPolicy()
+    private var rawScanning = false
+    // F 가 폰을 안 주는지 (폰이 가까운 게 분명한데 30초 넘게 없으면 F 를 다시 건다)
+    private var filterWatch = FilterScanWatch()
+    // 프로버 틱이 마지막으로 본 이 Mac 의 GATT 연결 상태 (nil = 이번 감시에 아직 안 봤다)
+    private var gattLinkedSeen: Bool?
 
-    // 못 붙은 것은 금방 다시 해 본다. 실측에서 맞는 주소인데도 Unreachable 이
-    // 다섯 번 연달아 났고, 60초 간격이라 4분에 다섯 번밖에 시도하지 못했다.
-    private static let retryUnreachableMs: UInt64 = 15_000
-    // 붙었는데 우리 서비스가 없던 기기는 다시 볼 이유가 없다. 주소가 바뀌면
-    // 어차피 새 후보로 들어온다.
-    private static let retryNotOursMs: UInt64 = 600_000
+    // 재시도 간격 (ProbePolicy): 못 붙은 것은 15초에서 시작해 연달아 실패하면 120초까지 늘린다.
+    // 붙었는데 우리 서비스가 없던 기기는 다시 볼 이유가 없다 (10분). 주소가 바뀌면 어차피 새 후보로 들어온다.
+    private static let retryUnreachableMs = ProbePolicy.unreachableFirstMs
+    private static let retryNotOursMs = ProbePolicy.notOursMs
 
     /// 후보 하나. 같은 기기를 두 관리자가 다 보면 한 줄로 합친다.
     private struct Cand {
@@ -213,9 +226,23 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                 csv = f
             }
 
+            // 재시도 간격은 처음부터 (지난 감시의 연속은 stopOnQueue 가 이미 끝냈다). R 정책과 F 감시도
+            // 처음부터 센다 - 멈춰 있는 동안 GATT 를 보지 않았다.
+            resetBackoffOnQueue()
+            rawPolicy.restart()
+            filterWatch.reset()
+            gattLinkedSeen = nil
+            lock.lock()
+            pubProbeSince = 0
+            pubProbeEnded = 0
+            lock.unlock()
+
             running = true
             // 어느 스캔이 도는지. 직접 읽기(R)는 토큰이 있어야 돈다 (후보를 확인할 길이 토큰뿐이다).
-            EventLog.write("scan: filter=on raw=\(identOn ? "on" : "off")")
+            // 시작할 때는 GATT 가 10초 건강한 것을 아직 못 봤으므로 토큰이 있으면 언제나 켠다.
+            let now = Mono.now()
+            EventLog.write("scan: filter=on raw=\(rawWanted(now: now) ? "on" : "off")")
+            rawPolicy.markLogged(now: now)
             ensureCentral()
             updateScan()
             if identOn { ensureProber() }
@@ -242,6 +269,9 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                 // 묶여 있던 기기도 더는 확인된 기기가 아니다 - 다른 폰을 등록했는데
                 // 예전 폰이 계속 묶여 있으면 그게 화면을 열어둔다.
                 // (후보는 지우지 않는다 - 있던 후보를 곧바로 탐색할 수 있다)
+                // 연속 실패도 예전 토큰의 것이다: 요약할 것은 남기고 재시도 간격을 처음으로 (아래에서 금지
+                // 시각을 통째로 지운다).
+                logStreakSummaries(failStreaks.endAll())
                 let dropped = probedUntil.count
                 probedUntil.removeAll()
                 setBound(nil)
@@ -252,8 +282,14 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                 lock.unlock()
                 // 등록을 바꾼 직후 폰을 못 알아보는 일이 로그에서 갈리도록 남긴다.
                 EventLog.write("ident: token \(identOn ? "set" : "cleared"), dropped \(dropped) past verdict(s) and the binding")
+                // 토큰이 없는 동안은 프로버 틱이 GATT 를 보지 않았다 - 낡은 "건강한 시각" 으로 R 을 끄지
+                // 않게 처음부터 센다 (START 와 같다).
+                rawPolicy.restart()
+                gattLinkedSeen = nil
                 if running {
-                    EventLog.write("scan: filter=on raw=\(identOn ? "on" : "off")")
+                    let now = Mono.now()
+                    EventLog.write("scan: filter=on raw=\(rawWanted(now: now) ? "on" : "off")")
+                    rawPolicy.markLogged(now: now)
                 }
             }
 
@@ -280,15 +316,32 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     // MARK: - 확인 연결 조절 (판정 쪽에서 부른다, 아무 스레드에서나)
 
     /// STATE 줄 꼬리. 탐색 중이면 ", probing for 1.3s", 끝난 지 3초 안이면 ", probe ended 0.4s ago",
-    /// 아니면 "". Windows BleRssiScanner::ProbeTagForLog 와 같은 글자. (자리만 잡아 둔다)
-    func probeTagForLog(now: UInt64) -> String { "" }
+    /// 아니면 "". Windows BleRssiScanner::ProbeTagForLog 와 같은 글자 (ProbeTag).
+    /// 메인이 부른다 - BLE 큐를 기다리지 않고 잠금 안의 시각 둘만 읽는다.
+    func probeTagForLog(now: UInt64) -> String {
+        lock.lock()
+        let since = pubProbeSince
+        let ended = pubProbeEnded
+        lock.unlock()
+        return ProbeTag.text(now: now, runningSince: since, endedAt: ended)
+    }
 
-    /// 같은 기기의 연속 실패로 늘어난 재시도 간격을 처음으로 되돌린다 (깨어남 등). (자리만 잡아 둔다)
-    func resetProbeBackoff() {}
+    /// 같은 기기의 연속 실패로 늘어난 재시도 간격을 처음으로 되돌린다 (판정 스레드가 깨어남을 알아챘을 때).
+    /// 잠든 동안의 실패는 깬 뒤의 폰에 대해 아무것도 말하지 않는다 - 120초를 기다리게 두면 깬 직후
+    /// 폰을 다시 묶는 것이 그만큼 늦는다. 판정 스레드를 기다리게 하지 않으려고 큐에 넘기기만 한다.
+    func resetProbeBackoff() {
+        BLEIds.queue.async { [weak self] in self?.resetBackoffOnQueue() }
+    }
 
-    /// 재보기 중인지. 재보기 동안은 직접 읽기 스캔(R)을 켠다 - 광고 기준을 평소 광고 경로와 같은
-    /// 조건에서 재야 한다. (자리만 잡아 둔다)
-    func setMeasuring(_ on: Bool) {}
+    /// 재보기 중인지 (메인, 재보기 창이 열리고 닫힐 때). 재보기 동안은 직접 읽기 스캔(R)을 켠다 -
+    /// 광고 기준은 평소 광고 경로가 도는 조건(R 이 켜진 채)에서 재야 한다.
+    func setMeasuring(_ on: Bool) {
+        BLEIds.queue.async { [weak self] in
+            guard let self = self, self.rawPolicy.measuring != on else { return }
+            self.rawPolicy.setMeasuring(on)
+            self.applyRawPolicy(now: Mono.now())
+        }
+    }
 
     /// 수신 끊김 판정 시간(초). 5..600 으로 자른다.
     func setTimeoutSec(_ s: UInt32) {
@@ -403,6 +456,8 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         // 잠긴 광고의 길은 결합마다 새로 센다 (다시 묶으면 "locked adverts" 줄을 다시 남긴다)
         boundLocked = ScanSourceTimes()
         lockedLog.reset()
+        // F 가 새 폰을 주는지는 지금부터 센다 (FilterScanWatch)
+        filterWatch.bindingChanged(now: Mono.now())
         lock.lock()
         pubBound = id != nil
         lock.unlock()
@@ -421,6 +476,8 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         cands.removeAll()
         probedUntil.removeAll()
         if let pr = probe, pr.purpose.isIdent { abortProbe() }
+        // 감시가 멈추면 연속 실패도 끝난다 - 줄로 안 남긴 실패가 있으면 요약한다 (프로버 틱도 멈춘다).
+        logStreakSummaries(failStreaks.endAll())
     }
 
     private func ensureCentral() {
@@ -438,7 +495,11 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             // allowDuplicates 가 없으면 기기마다 didDiscover 가 한 번뿐이라 RSSI 흐름이 없다.
             c.scanForPeripherals(withServices: [BLEIds.identService],
                                  options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
-            if running { setAvailable(true) }
+            if running {
+                setAvailable(true)
+                // 스캔을 (다시) 건 순간부터 F 의 공백을 센다 (FilterScanWatch)
+                filterWatch.scanStarted(now: Mono.now())
+            }
             // 등록 스캔의 시간은 스캔을 실제로 건 지금부터 잰다. 권한 창이나 꺼진 블루투스를
             // 기다린 시간이 스캔 시간을 먹으면 앱을 띄운 폰이 있어도 "못 찾았다" 가 된다.
             if let reg = registration, reg.scanning, reg.timer == nil {
@@ -449,22 +510,59 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         }
     }
 
-    /// 직접 읽기 스캔(R): 감시 중이고 토큰이 있을 때만. 관리자는 처음 필요할 때 만든다 - 권한은 앱
+    /// R 을 돌려야 하는지: 감시 중이고 토큰이 있고, 정책(RawScanPolicy)이 원할 때 - 이 Mac 에 폰 앱이
+    /// GATT 로 10초 넘게 건강하게 붙어 있으면 끈다, 재보기 중에는 켠다.
+    private func rawWanted(now: UInt64) -> Bool {
+        return running && identOn && rawPolicy.wantsRaw(now: now)
+    }
+
+    /// 직접 읽기 스캔(R)을 rawWanted 에 맞춘다. 관리자는 처음 필요할 때 만든다 - 권한은 앱
     /// 단위라 두 번째 관리자가 허용 창을 다시 띄우지 않는다. 켜지기 전이면 state 콜백이 건다.
-    private func updateRawScan() {
-        let want = running && identOn
+    /// reissue: 이미 걸어 둔 스캔도 다시 건다 (시작, 블루투스가 켜짐, 토큰 변경 - 예전과 같다).
+    /// 프로버 틱(applyRawPolicy)은 false 로 부른다 - 2초마다 다시 걸면 그때마다 스캔이 새로 시작된다.
+    private func updateRawScan(reissue: Bool = true) {
+        let want = rawWanted(now: Mono.now())
         if want && rawCentral == nil {
             rawCentral = CBCentralManager(delegate: self, queue: BLEIds.queue, options: nil)
             return
         }
         guard let r = rawCentral, r.state == .poweredOn else { return }
         if want {
-            // 거르지 않는다: 잠긴 폰의 overflow 광고가 필터에 안 걸려도 제조사 데이터는 온다고 본다.
-            r.scanForPeripherals(withServices: nil,
-                                 options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
-        } else if r.isScanning {
+            if reissue || !rawScanning {
+                // 거르지 않는다: 잠긴 폰의 overflow 광고가 필터에 안 걸려도 제조사 데이터는 온다고 본다.
+                r.scanForPeripherals(withServices: nil,
+                                     options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+                rawScanning = true
+            }
+        } else if rawScanning || r.isScanning {
             r.stopScan()
+            rawScanning = false
+            // R 이 꺼지면 R 에서만 본 후보와 R 위의 탐색을 버린다 (R 이 꺼졌을 때의 길과 같다)
+            dropRawPeripherals()
         }
+    }
+
+    /// R 정책을 지금 상태에 맞춘다 (프로버 틱, 재보기 시작/끝). 까닭이 바뀌었으면 한 줄 남긴다.
+    /// 감시 중이고 토큰이 있을 때만 - 그 밖에는 R 이 어차피 꺼져 있고, START / 토큰 줄이 그렇게 말한다.
+    private func applyRawPolicy(now: UInt64) {
+        guard running, identOn else { return }
+        if let line = rawPolicy.changedLine(now: now) {
+            EventLog.write(line)
+        }
+        updateRawScan(reissue: false)
+    }
+
+    /// R 이 준 기기 객체를 놓는다: R 에서만 본 후보는 버리고, 함께 본 후보는 F 의 것만 남긴다 (F 의
+    /// 객체로 계속 붙을 수 있다). R 위에서 돌던 탐색은 결과 없이 버린다.
+    private func dropRawPeripherals() {
+        var kept: [UUID: Cand] = [:]
+        for (id, c) in cands where c.viaFilter != nil {
+            var k = c
+            k.viaRaw = nil
+            kept[id] = k
+        }
+        cands = kept
+        if let pr = probe, pr.central === rawCentral { abortProbe() }
     }
 
     private func ensureProber() {
@@ -533,20 +631,14 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         lock.lock()
         pubRawCentralState = st
         lock.unlock()
+        // 켜졌다 = 새로 걸어야 한다, 꺼졌다 = 걸어 둔 스캔이 사라졌다. 어느 쪽이든 지금은 안 걸려 있다.
+        rawScanning = false
         if st == .poweredOn {
             updateRawScan()
             return
         }
-        // R 이 준 기기 객체는 이제 쓸 수 없다. R 에서만 본 후보는 버리고, 함께 본 후보는 F 의 것만
-        // 남긴다 (F 의 객체로 계속 붙을 수 있다). R 위에서 돌던 탐색은 결과 없이 버린다.
-        var kept: [UUID: Cand] = [:]
-        for (id, c) in cands where c.viaFilter != nil {
-            var k = c
-            k.viaRaw = nil
-            kept[id] = k
-        }
-        cands = kept
-        if let pr = probe, pr.central === rawCentral { abortProbe() }
+        // R 이 준 기기 객체는 이제 쓸 수 없다.
+        dropRawPeripherals()
     }
 
     /// 광고 하나 = 패킷 하나 (뜨거운 경로). 가볍게, 기다리지 않게.
@@ -582,6 +674,12 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
         // 이 광고가 "내 폰" 인지
         let identMatch = boundId != nil && boundId == id
+        // F 가 멎었는지 보려고 쪽마다 적는다 (FilterScanWatch). F 가 준 것은 모두 신원 후보다 (필터가 맞췄다).
+        if fromRaw {
+            if identMatch { filterWatch.rawDeliveredBound(now: now) }
+        } else {
+            filterWatch.filterDelivered(now: now, boundPhone: identMatch)
+        }
         if identMatch {
             boundSeenTick = now
             // 잠긴 모양의 광고(일반 목록에 신원 UUID 가 없다)를 어느 쪽이 주는지 적는다. R 은 비트 하나짜리
@@ -781,6 +879,11 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         if probe != nil { abortProbe() }
         let pr = Probe(peripheral: p, central: c, purpose: purpose, t0: Mono.now())
         probe = pr
+        if purpose.isIdent {
+            lock.lock()
+            pubProbeSince = pr.t0
+            lock.unlock()
+        }
         guard c.state == .poweredOn else {
             finishProbe(.unreachable, token: "", why: "Unreachable")
             return
@@ -819,6 +922,12 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         probe = nil
         pr.timer?.cancel()
         pr.timer = nil
+        if pr.purpose.isIdent {
+            lock.lock()
+            pubProbeSince = 0
+            pubProbeEnded = Mono.now()
+            lock.unlock()
+        }
         // 연결을 붙잡고 있으면 폰이 광고를 멈출 수 있으니 반드시 놓아준다. 성공했든
         // 실패했든 시간이 다 됐든 (Windows: 서비스 핸들을 쥐고 있으면 LE 연결을 놓지 않아
         // 몇 대만 훑어도 연결 슬롯이 말라 이후가 전부 Unreachable 이 됐다).
@@ -850,9 +959,11 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     // MARK: - 내부: 프로버 (2초마다, 한 번에 하나)
 
     private func proberTick() {
-        // 스캔이 꺼져 있거나 토큰이 없으면 논다. 탐색이 진행 중이면 끝날 때까지 기다린다.
-        guard running, identOn, probe == nil else { return }
+        // 스캔이 꺼져 있거나 토큰이 없으면 논다. 탐색이 진행 중이면 끝날 때까지 기다린다 (스캔 관리는 그래도 한다).
+        guard running, identOn else { return }
         let now = Mono.now()
+        scanHousekeeping(now: now)
+        guard probe == nil else { return }
 
         // 묶인 폰의 잠긴 광고를 어느 길이 주는지: 처음 보일 때와 그 묶음이 바뀔 때만 한 줄 (LockedPathLog).
         // 실기에서 어느 스캔을 살릴지는 bound 줄이 아니라 이 줄로 가른다.
@@ -904,6 +1015,51 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         startProbe(p, on: mgr, purpose: .ident(rssi: c.rssi, bit: c.bit, via: c.times.viaText(now: now)))
     }
 
+    /// 프로버 틱마다 (2초), 탐색과 상관없이: 이 Mac 의 GATT 연결 변화, R 정책, 오래된 연속 실패 정리,
+    /// F 다시 걸기.
+    private func scanHousekeeping(now: UInt64) {
+        // GattServer.snapshot 은 자기 잠금만 잠깐 잡는다 (BLE 큐를 기다리지 않고, 그 잠금을 쥔 채 이쪽을
+        // 부르는 일도 없다) - 이 큐에서 불러도 된다. 우리 잠금은 쥐지 않은 채로 부른다.
+        let linked = GattServer.shared.snapshot(now: now).healthy
+        // 폰 앱이 이 Mac 에 붙었다/떨어졌다: 폰의 상태가 바뀌었으니 그 전의 실패가 말해 주는 것이 없다.
+        // 재시도 간격을 처음으로 (Windows 는 SetGattLinked 의 전환에서 같은 일을 한다).
+        if let prev = gattLinkedSeen, prev != linked {
+            resetBackoffOnQueue()
+        }
+        gattLinkedSeen = linked
+        rawPolicy.observeGatt(healthy: linked, now: now)
+        applyRawPolicy(now: now)
+        // 5분 동안 다시 탐색하지 않은 주소의 연속은 끝났다 (주소가 바뀌어 후보에서 빠졌다).
+        logStreakSummaries(failStreaks.expire(now: now))
+        if let c = central, c.state == .poweredOn,
+           filterWatch.shouldRestart(now: now, bound: boundId != nil, gattHealthy: linked) {
+            // 멈췄다 같은 옵션으로 다시 건다. 연결은 스캔과 상관없으므로 진행 중인 탐색은 그대로다.
+            c.stopScan()
+            c.scanForPeripherals(withServices: [BLEIds.identService],
+                                 options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+            EventLog.write("scan: filter restarted (no phone via filter for \(FilterScanWatch.quietMs / 1000)s)")
+        }
+    }
+
+    /// 재시도 간격을 처음으로 되돌리고 연속 실패를 잊는다 (감시 시작, 깨어남, GATT 연결 변화).
+    /// 줄로 안 남긴 실패는 요약해 남긴다. 못 붙어 기다리던 주소는 마지막 실패에서 첫 간격(15초)만
+    /// 기다리게 줄인다 - 2분을 기다리던 주소가 처음 실패한 주소처럼 된다. 남의 폰의 10분은 그대로다
+    /// (토큰이 바뀔 때만 지운다 - setIdentity).
+    private func resetBackoffOnQueue() {
+        for (id, s) in failStreaks.streaks {
+            if let until = probedUntil[id] {
+                probedUntil[id] = min(until, s.lastTick + ProbePolicy.unreachableFirstMs)
+            }
+        }
+        logStreakSummaries(failStreaks.endAll())
+    }
+
+    private func logStreakSummaries(_ ended: [ProbeFailStreaks<UUID>.Ended]) {
+        for e in ended {
+            EventLog.write("ident: \(BLEIds.shortId(e.id)) \(e.streak.summaryText)")
+        }
+    }
+
     private func identProbeDone(_ id: UUID, pickRssi: Int, pickBit: Int, via: String, _ outcome: ProbeOutcome,
                                 token: String, why: String, took: UInt64) {
         guard running else { return }
@@ -912,14 +1068,37 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         let ours = outcome == .token && token.uppercased() == identToken.uppercased()
         let sid = BLEIds.shortId(id)
         if !ours {
-            // 붙었는데 아닌 것으로 확인된 기기는 한동안 접어 둔다 (토큰이 다른 것도 확정이다).
-            // 못 붙은 것은 일시적일 수 있으니 금방 다시 해 본다.
-            let settled = outcome != .unreachable
-            probedUntil[id] = Mono.now() + (settled ? AdvScanner.retryNotOursMs : AdvScanner.retryUnreachableMs)
-            let what = settled ? "is not our phone" : "probe failed"
+            let now = Mono.now()
             let reason = why.isEmpty ? "token mismatch" : why
-            EventLog.write("ident: \(sid) \(what) (\(reason), \(took)ms)")
+            if outcome != .unreachable {
+                // 붙었는데 아닌 것으로 확인된 기기는 한동안 접어 둔다 (토큰이 다른 것도 확정이다).
+                // 그 전의 연속 실패는 여기서 끝난다 - 요약이 판정 줄보다 먼저 (지난 일부터).
+                if let s = failStreaks.end(id) {
+                    EventLog.write("ident: \(sid) \(s.summaryText)")
+                }
+                probedUntil[id] = now + AdvScanner.retryNotOursMs
+                EventLog.write("ident: \(sid) is not our phone (\(reason), \(took)ms)")
+                return
+            }
+            // 못 붙은 것은 일시적일 수 있으니 금방 다시 해 보되, 같은 주소가 연달아 못 붙으면 간격을
+            // 15, 30, 60, 120초로 늘린다. 줄은 연속의 첫 실패만 그대로, 그 뒤는 10번째마다 요약한다.
+            let r = failStreaks.fail(id, why: reason, ms: took, now: now, wallClock: LocalClock.hhmmss())
+            probedUntil[id] = now + ProbePolicy.unreachableDelayMs(failures: r.n)
+            switch r.line {
+            case .first:
+                EventLog.write("ident: \(sid) probe failed (\(reason), \(took)ms)")
+            case .summary:
+                if let s = failStreaks.streaks[id] {
+                    EventLog.write("ident: \(sid) \(s.summaryText)")
+                }
+            case .silent:
+                break
+            }
             return
+        }
+        // 이 주소의 연속 실패는 여기서 끝난다 - 요약이 bound 줄보다 먼저.
+        if let s = failStreaks.end(id) {
+            EventLog.write("ident: \(sid) \(s.summaryText)")
         }
         setBound(id)
         boundSeenTick = Mono.now()
