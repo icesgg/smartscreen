@@ -303,6 +303,24 @@ static void UpdateOverlayState() {
     InvalidateRect(g_hOverlay, nullptr, TRUE);
 }
 
+// 사용자가 직접 거는 잠금 (오버레이 [잠금], 고급 창 [지금 잠금], 간단 창 [지금 가리기]).
+// 같은 코드가 두 군데에 따로 있었다. 잠금을 거는 곳은 전부 여기를 거치게 해서,
+// 새로 생기는 잠금 버튼이 아래 정리를 빠뜨리지 않게 한다.
+static void ManualLockNow() {
+    if (!g_monitoring || g_bBlackActive) return;
+    g_bBlackActive = true;
+    g_bManualLock = true;
+    // Q2: 지난 자동 잠금에서 남은 해제 카운트다운을 지운다. 남겨 두면 1초 타이머가
+    // 그 숫자를 마저 세고 [해제] 를 눌러야만 풀려야 할 이 잠금을 풀어 버린다.
+    g_unlockTimer = 0;
+    g_lockStartTick = GetTickCount64();
+    int x = GetSystemMetrics(SM_XVIRTUALSCREEN), y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int w = GetSystemMetrics(SM_CXVIRTUALSCREEN), h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    g_hBlackScreen = CreateWindowExW(WS_EX_TOPMOST, BLACKSCREEN_CLASS, L"",
+        WS_POPUP, x, y, w, h, nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
+    ShowWindow(g_hBlackScreen, SW_SHOW); SetForegroundWindow(g_hBlackScreen);
+}
+
 static LRESULT CALLBACK OverlayProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
@@ -339,16 +357,7 @@ static LRESULT CALLBACK OverlayProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             DestroyWindow(g_hWnd);
             break;
         case ID_OVL_LOCK:
-            if (g_monitoring && !g_bBlackActive) {
-                g_bBlackActive = true;
-                g_bManualLock = true;
-                g_lockStartTick = GetTickCount64();
-                int x = GetSystemMetrics(SM_XVIRTUALSCREEN), y = GetSystemMetrics(SM_YVIRTUALSCREEN);
-                int w = GetSystemMetrics(SM_CXVIRTUALSCREEN), h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-                g_hBlackScreen = CreateWindowExW(WS_EX_TOPMOST, BLACKSCREEN_CLASS, L"",
-                    WS_POPUP, x, y, w, h, nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
-                ShowWindow(g_hBlackScreen, SW_SHOW); SetForegroundWindow(g_hBlackScreen);
-            }
+            ManualLockNow();   // Q2: 남은 해제 카운트다운도 여기서 지운다
             break;
         case ID_OVL_SETTINGS:
             // 간단 창이 사용자가 보는 창이다. 고급 창은 거기서 연다.
@@ -937,6 +946,9 @@ static void StopMon() {
     EnableWindow(g_hEditLatency, TRUE); if (g_hComboAway) EnableWindow(g_hComboAway, TRUE);
     EnableWindow(g_hComboIdle, TRUE); EnableWindow(g_hComboDelay, TRUE);
     SetWindowTextW(g_hStateLabel, L"  \xC815\xC9C0\xB428");  // 정지됨
+    // Q4: 오버레이는 1초 타이머가 고쳐 그리는데 그 타이머를 위에서 껐다. 여기서 한 번
+    // 그려 두지 않으면 [중지] 뒤에도 "근처 • 보호 중" 이 그대로 남는다.
+    UpdateOverlayState();
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,6 +1032,9 @@ static void InitListView(HWND p, int y) {
 // OnResult
 // ---------------------------------------------------------------------------
 static void OnResult(ProbeResult* r) {
+    // Q6: [중지] 전에 판정 스레드가 보낸 결과가 중지 뒤에 도착할 수 있다 (PostMessage).
+    // 그 결과로 화면을 가리거나 "정지됨" 표시를 덮어쓰면 안 된다. r 은 부르는 쪽이 지운다.
+    if (!g_monitoring) return;
     g_logCount++;
     bool transition = (r->state != r->prevState);
     if (transition)
@@ -1749,21 +1764,24 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             if(g_targetAddr!=0){EnableWindow(g_hBtnReconnect,FALSE);
                 SetWindowTextW(g_hBtnReconnect,L"...");
                 CloseHandle(CreateThread(nullptr,0,ReconnectThread,nullptr,0,nullptr));}break;
-        case ID_BTN_BLACKNOW:
-            if(g_monitoring && !g_bBlackActive){
-                g_bBlackActive=true;g_bManualLock=true;g_lockStartTick=GetTickCount64();
-                int x=GetSystemMetrics(SM_XVIRTUALSCREEN),y=GetSystemMetrics(SM_YVIRTUALSCREEN);
-                int w=GetSystemMetrics(SM_CXVIRTUALSCREEN),h=GetSystemMetrics(SM_CYVIRTUALSCREEN);
-                g_hBlackScreen=CreateWindowExW(WS_EX_TOPMOST,BLACKSCREEN_CLASS,L"",
-                    WS_POPUP,x,y,w,h,nullptr,nullptr,GetModuleHandle(nullptr),nullptr);
-                ShowWindow(g_hBlackScreen,SW_SHOW);SetForegroundWindow(g_hBlackScreen);
-            }break;
+        case ID_BTN_BLACKNOW:   // 간단 창의 [지금 가리기] 도 여기로 온다
+            ManualLockNow();    // Q2: 남은 해제 카운트다운도 여기서 지운다
+            break;
         case ID_BTN_CENTER_IMG: {
             auto p = BrowseImage(hWnd);
             if (!p.empty()) {
                 g_centerImagePath = p;
                 SetWindowTextW(g_hLabelCenter, TruncPath(p).c_str());
-                FreeBlackScreenImages();
+                // 잠금 화면이 떠 있으면 보여 주던 것을 그대로 두고, 풀릴 때 버린다
+                // (ApplyEnterpriseSync 와 같은 이유).
+                if (!g_bBlackActive) FreeBlackScreenImages();
+                // Q5: 고른 그림을 바로 저장한다. 예전에는 [시작] 할 때만 저장해서,
+                // 감시 중에 고른 그림은 다시 시작하지 않으면 다음 실행에서 사라졌다.
+                // 대화상자가 닫힌 뒤에 읽는다 - 그 모달 루프 안에서 다른 저장이 돌았을
+                // 수 있다. 이 값 하나만 바꿔 쓴다.
+                AppConfig c; LoadAppConfig(c);
+                c.centerImagePath = g_centerImagePath;
+                SaveAppConfig(c);
             }
         } break;
         case ID_BTN_BANNER_IMG: {
@@ -1771,7 +1789,11 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (!p.empty()) {
                 g_bannerImagePath = p;
                 SetWindowTextW(g_hLabelBanner, TruncPath(p).c_str());
-                FreeBlackScreenImages();
+                if (!g_bBlackActive) FreeBlackScreenImages();
+                // Q5: 위 중앙 이미지와 같다 - 고른 즉시 이 값 하나만 저장한다.
+                AppConfig c; LoadAppConfig(c);
+                c.bannerImagePath = g_bannerImagePath;
+                SaveAppConfig(c);
             }
         } break;
         case ID_BTN_ENTERPRISE: {
