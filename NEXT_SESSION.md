@@ -56,7 +56,8 @@ Mac 은 세션 끝 무렵 사용자가 맥북에 깔아 **GATT 연결까지는 �
   구독자를 그대로 둔다 (`GATT client subscribed (kept across restart)`)
 - `SLEEP` / `WAKE` / `DISPLAY OFF` / `DISPLAY ON` 줄. 배터리의 맥북은 2분 뒤 화면을 끄고 잠든다 -
   그 뒤에 돌아오면 저절로 안 풀리는 것이 정상이다 (설명서에도 적었다)
-- 유니버설 클립보드(아이폰에서 복사한 것)는 다른 PC 로 보내지 않는다 (`com.apple.is-remote-clipboard`)
+- ~~유니버설 클립보드(아이폰에서 복사한 것)는 다른 PC 로 보내지 않는다~~ → **되돌렸다.** 첫 실기에서 아이폰 →
+  Mac → Windows 로 넘어가는 것을 보고 사용자가 "이게 내가 원한거다". 거르는 갈래를 뺐다 (main, 다음 릴리스)
 - 반박된 것: macOS 15.4 "붙여넣기 허용" 창 (개발자 미리보기로만 켜진다), 잠금 그림의 폴더 권한 창 (열기
   패널로 고른 파일은 `com.apple.macl` 로 다음 실행에도 열린다)
 
@@ -406,7 +407,17 @@ A 에서 스크린캡처하면 B 에서 Ctrl+V 로 붙는다. 연결고리는 �
 
 ## 남은 작업
 
-### Mac. 실기 시험 (최우선 - 한 번도 Mac 에서 돈 적이 없다)
+### Mac. 실기 시험 (2026-10-01 저녁에 대부분 됐다 - 결과는 "현재 기기 상태")
+
+**남은 것은 셋이다.**
+1. **임계값을 경로마다 따로 둘지** (사용자가 정할 것 - 아래 "현재 기기 상태" 의 Mac 임계값). Mac 에서는 폰이 잰
+   연결(GATT) 신호가 Mac 이 잰 광고 신호보다 12~15 dB 약하다. 1.1.6 부터 한 값을 두 경로에 쓰므로 광고로 맞추면
+   GATT 가 붙는 순간 앉아서도 FAR, GATT 로 맞추면 GATT 가 끊긴 동안 광고 경로가 너무 너그럽다. 제안: 재보기
+   마법사가 두 경로를 각각 재고 `gattRssiThreshold` 를 따로 저장 (Windows 도 같은 구조라 같이)
+2. 아직 결과를 못 받은 것: 재보기 마법사 문구, 로그인 결과 창 위치, 잠자기 줄, 업데이트(1.1.10 을 낸 뒤 -
+   블루투스 허용을 다시 묻는가)
+3. 직접 읽기 스캔(R)을 끌지: 잠긴 폰은 대부분 `locked adverts via filter` 로 왔고 `raw bit 31` 은 가끔이었다.
+   R 은 주변 광고를 다 받으므로 CPU 를 쓴다. 필터가 계속 되면 끄는 쪽 (끄기 전에 사용자에게 물을 것)
 
 2026-10-01 오후 세션에 사용자에게 준 절차 (명령어 그대로). 결과 줄의 뜻은 docs/MAC.md "확인하지 못한
 것" 1. 앞의 것이 안 되면 뒤는 의미가 없다.
@@ -824,8 +835,25 @@ Disconnected / Closed 로 보고됐다. `GattDeviceService` 는 반드시 `Close
     (주소 `C889F3D41613`, Apple 대역) = Mac 의 CBPeripheralManager 광고는 된다
   - 노트북 앱 [종료] → 아이폰 블루투스 껐다 켜기 → 맥북 `GATT: linked`, [중지]→[시작] 절차까지 사용자가
     "잘된다" (Mac 의 events.log 줄은 못 받았다 - `kept across restart` 였는지는 모른다)
-  - 아직 결과를 못 받은 것: `--probe-scan` 요약(어느 광고 경로인지), 계정 등록 결과 창 위치, 떠나기/돌아오기,
-    재보기, 클립보드, 업데이트. 결과 틀은 "남은 작업 Mac"
+  - **그 뒤 사용자가 맥북 events.log 를 보냈다 (16:22~17:30). 실기로 확인된 것:**
+    - **잠긴 폰을 찾는다 - 포팅의 전제가 맞았다.** `scan: filter=on raw=on`, `ident: X locked adverts via filter`
+      (여섯 번), 한 번은 `via filter + raw bit 31`. macOS 서비스 필터가 잠긴 폰의 overflow 광고를 맞춰 준다.
+      직접 읽기도 가끔 비트 **31** 을 본다 - Windows 가 배운 값과 같다 (비트는 UUID 에서 정해진다).
+      `--probe-scan` 요약은 받지 않았다 (이 로그로 답이 나왔다)
+    - 주소가 15분마다 바뀌면 `went quiet, looking again` 뒤 1~3초 안에 새 주소로 `bound to ... via filter`
+    - 잠금/해제: FAR → `BLACK ON`, 돌아오면 NEAR → `BLACK OFF`. **가림막이 스스로 풀리지 않는다** (16:47:46 ~
+      16:51:03 196초 등 오래 버틴 잠금이 여럿 - 창을 띄우는 것이 입력 유휴 시간을 되돌리지 않는다). 0~2초 만에
+      풀린 몇 번은 사용자의 입력으로 본다
+    - GATT: 16:52:35 `GATT client subscribed` → `companion app seen - GATT connection is now required for NEAR`.
+      끊겼다 다시 붙기 1초 (16:57:41 → 42, 17:13:54 → 55). 앱을 다시 띄운 뒤 7초 만에 다시 붙었다 (17:19:35)
+    - 클립보드: 양쪽으로 글·그림 (`clip: sent` / `applied`). 아이폰에서 복사한 것도 Windows 로 넘어갔다 -
+      `not sent ... Universal Clipboard` 줄이 없다 = 이 macOS 에서는 `com.apple.is-remote-clipboard` 가 안 붙었다.
+      사용자가 원하는 쓰임이라 그 갈래를 아예 뺐다 (main `ClipSync.swift`, CI 237 통과, 다음 릴리스에 들어간다)
+  - **Mac 임계값 - 앉아서도 자주 가려진다.** 16:27~16:51 `thr=-50`: 앉은 광고 신호 -35 ~ -54 라 1~2분마다 FAR.
+    16:52 GATT 가 붙자 GATT 신호 -52 ~ -65 → 거의 늘 FAR (입력 중에만 NEAR). 17:19 `thr=-56` 으로 올렸지만
+    (사용자가) GATT 가 끊긴 뒤 광고 -49 ~ -61 로 또 FAR. **Mac 에서는 폰이 잰 GATT 신호가 Mac 이 잰 광고 신호보다
+    12~15 dB 약하다** - 한 값을 두 경로에 쓰는 구조(1.1.6)와 안 맞는다 ("남은 작업 Mac" 1). 그동안의 권고:
+    `GATT: linked` 인 채로 재보기 (붙으면 GATT 가 NEAR 의 조건이 되므로 그쪽에 맞춘다)
 - **1.1.9 가 나갔다 (사용자가 release.bat, 2026-10-01 14:19~14:21, 빌드 고침만 - 코드는 1.1.8 과 같다).**
   고친 release.ps1 이 캐시를 지우고 처음부터 빌드했다. 확인: `.obj.d` 22개 중 빈 것 0, exe 안에 1.1.9 만
   있고 1.1.8 / 1.1.7 없음, 노트북 로그 `start: SmartScreen 1.1.9` → `update: up to date (1.1.9, 10 row(s))`.
