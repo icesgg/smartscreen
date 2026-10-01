@@ -131,7 +131,13 @@ final class GattServer: NSObject, CBPeripheralManagerDelegate {
                 lock.lock()
                 pubRunning = true
                 lock.unlock()
-                if m.state == .poweredOn { resumeService() }   // 아니면 켜지는 순간 state 콜백이 올린다
+                if m.state == .poweredOn {
+                    resumeService()
+                } else {
+                    // 켜지는 순간 state 콜백이 서비스를 올린다. 꺼져 있거나 재설정 중이면 연결도 남아 있을 수
+                    // 없다 - 그 콜백이 아직 큐에 있어도 이어받지 않게 여기서 비운다.
+                    subs.removeAll()
+                }
                 EventLog.write("GATT server started (\(plain ? "plain" : "encryption required"))")
                 // [중지] 동안에도 붙어 있던 폰을 새 구독처럼 받아들인 다음에 200 ms 틱을 건다. 구독자 수,
                 // 첫 간격, 기준 시각이 한 번에 게시된 뒤에 틱이 간격을 이어서 고친다 (새 구독과 같은 상태).
