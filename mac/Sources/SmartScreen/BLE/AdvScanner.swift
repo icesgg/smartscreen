@@ -26,7 +26,9 @@ enum RegisterOutcome {
 ///                 토큰이 등록돼 있고 감시 중일 때만 돈다.
 ///    후보는 기기 식별자로 합친다. 두 쪽이 같은 패킷을 각각 알릴 수 있으므로 등록된 폰의 샘플은
 ///    DualSourceDedupe 를 지나야 칼만/공개 상태/판정 깨우기에 닿는다 (연속 2샘플 규칙이 샘플을 센다).
-///    어느 쪽이 실제로 되는지는 `ident: bound to ... via ...` 줄과 --probe-scan 의 요약이 말한다.
+///    어느 쪽이 잠긴 폰을 실제로 주는지는 `ident: XXXX locked adverts via ...` 줄과 --probe-scan 의 요약이
+///    말한다 (`ident: bound to ... via ...` 는 묶기 직전 10초의 모양일 뿐이다 - 앱이 화면에 떠 있었을
+///    수도 있다).
 ///  - CBPeripheral 객체는 그것을 준 관리자의 것이다. 연결과 끊기는 그 관리자로만 한다 (탐색이 자기
 ///    관리자를 기억한다). 후보는 쪽마다 객체를 따로 들고 있다가 F 의 것이 있으면 F 로 붙는다.
 ///  - Windows 의 블로킹 프로버 스레드 대신 BLEIds.queue 위의 비동기 상태 기계로 돈다.
@@ -95,6 +97,10 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private var probeFloor = -75           // 이보다 약하면 탐색하지 않는다
     private var boundId: UUID?             // 토큰으로 확인된 현재 기기
     private var boundSeenTick: UInt64 = 0  // 그 기기를 마지막으로 본 시각 (어느 쪽이든)
+    // 묶인 기기의 잠긴 광고(일반 목록에 신원 UUID 가 없는 것)를 어느 쪽이 언제 줬는지, 그리고 마지막으로
+    // 남긴 "locked adverts via ..." 의 길. 둘 다 결합이 바뀌면 지운다 (setBound).
+    private var boundLocked = ScanSourceTimes()
+    private var lockedLog = LockedPathLog()
     private var cands: [UUID: Cand] = [:]
     // 기기별 재시도 금지 시각. 실패 종류에 따라 길이가 다르다 -
     // 남의 기기로 확인된 기기를 계속 다시 찌르면 맞는 기기에 쓸 시도를 낭비한다.
@@ -118,8 +124,8 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         var rssi: Int                  // 마지막 원시값 (매끄럽게 하지 않은 것, 어느 쪽이든)
         var seen: UInt64
         var sure: Bool                 // 신원 UUID 를 직접 봤다 (F 가 줬다, 또는 R 광고의 UUID 목록)
-        var rawList: Bool              // R 광고의 UUID 목록에서 봤다 (로그용)
-        var bit: Int                   // R 이 읽은 overflow 비트 (-1 = 모름)
+        var bit: Int                   // R 이 읽은 overflow 비트 (-1 = 모름). 고르기와 배우기용 - 한 번 서면 남는다
+        var times: ScanSourceTimes     // 쪽마다 마지막으로 준 시각 (bound 줄의 "via ..." 용)
     }
 
     // 탐색 결과. 실패를 둘로 가르는 것이 핵심이다 -
@@ -381,6 +387,9 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
     private func setBound(_ id: UUID?) {
         boundId = id
+        // 잠긴 광고의 길은 결합마다 새로 센다 (다시 묶으면 "locked adverts" 줄을 다시 남긴다)
+        boundLocked = ScanSourceTimes()
+        lockedLog.reset()
         lock.lock()
         pubBound = id != nil
         lock.unlock()
@@ -562,28 +571,31 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         let identMatch = boundId != nil && boundId == id
         if identMatch {
             boundSeenTick = now
+            // 잠긴 모양의 광고(일반 목록에 신원 UUID 가 없다)를 어느 쪽이 주는지 적는다. R 은 비트 하나짜리
+            // overflow 광고나 overflow 목록에 신원 UUID 가 실린 것만 친다 - 같은 기기의 다른 Apple 광고는
+            // 우리 신원을 싣지 않았다. 줄은 프로버 틱이 남긴다 (lockedLog).
+            if !inPlain {
+                boundLocked.note(fromRaw: fromRaw, bit: fromRaw ? AdvScanner.overflowBit(advertisementData) : -1,
+                                 listed: inOverflow, plain: false, now: now)
+            }
         } else if identOn {
             // 아직 못 묶었으면 후보로만 쌓아 둔다. 붙는 일은 프로버가 한다.
             if fromRaw {
                 // Windows 와 같다: 제조사 데이터가 overflow 모양이고 비트가 딱 하나면 후보.
                 // UUID 목록에 신원 UUID 가 실려 있으면(앱이 화면에 떠 있거나 macOS 가 overflow 를 풀어
                 // 줬으면) 그것도 받는다 - 토큰이 가르므로 다른 것은 바뀌지 않는다.
-                var bit = -1
-                if let md = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,
-                   md.count == AppleOverflow.length {
-                    bit = AppleOverflow.singleBit([UInt8](md))
-                }
+                let bit = AdvScanner.overflowBit(advertisementData)
                 let listed = inPlain || inOverflow
                 if bit >= 0 || listed {
                     noteCandidate(id, peripheral, fromRaw: true, rssi: valid ? rssi : -127, now: now,
-                                  sure: listed, bit: bit)
+                                  sure: listed, bit: bit, plain: inPlain)
                 }
             } else {
                 // 필터 스캔이 준 기기는 신원 UUID 가 맞은 것이다. UUID 목록이 비어 있어도 받는다 -
                 // macOS 가 overflow 해시로 맞춰 주면서 목록에는 아무것도 안 실을 수도 있다
                 // (실기 미확인. 예전에는 목록에 있는 것만 받아서 그런 경우 잠긴 폰을 영영 못 봤다).
                 noteCandidate(id, peripheral, fromRaw: false, rssi: valid ? rssi : -127, now: now,
-                              sure: true, bit: -1)
+                              sure: true, bit: -1, plain: inPlain)
             }
         }
 
@@ -632,13 +644,13 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
     /// 후보 표에 넣거나 합친다. sure 는 한 번 서면 후보가 사라질 때까지 남고, 비트는 R 이 새로 읽을
     /// 때만 바뀐다 (같은 기기가 overflow 가 아닌 다른 광고도 내므로 -1 로 덮지 않는다).
+    /// 쪽마다의 시각(times)은 광고마다 새로 적는다 - "via ..." 는 최근에 준 쪽만 말한다.
     private func noteCandidate(_ id: UUID, _ p: CBPeripheral, fromRaw: Bool, rssi: Int, now: UInt64,
-                               sure: Bool, bit: Int) {
+                               sure: Bool, bit: Int, plain: Bool) {
         var c = cands[id] ?? Cand(viaFilter: nil, viaRaw: nil, rssi: -127, seen: now,
-                                  sure: false, rawList: false, bit: -1)
+                                  sure: false, bit: -1, times: ScanSourceTimes())
         if fromRaw {
             c.viaRaw = p
-            if sure { c.rawList = true }
         } else {
             c.viaFilter = p
         }
@@ -646,7 +658,15 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         c.seen = now
         c.sure = c.sure || sure
         if bit >= 0 { c.bit = bit }
+        c.times.note(fromRaw: fromRaw, bit: bit, listed: fromRaw && sure, plain: plain, now: now)
         cands[id] = c
+    }
+
+    /// 제조사 데이터가 overflow 모양(`4C 00 01` + 16바이트)이고 비트가 딱 하나면 그 번호, 아니면 -1.
+    private static func overflowBit(_ adv: [String: Any]) -> Int {
+        guard let md = adv[CBAdvertisementDataManufacturerDataKey] as? Data,
+              md.count == AppleOverflow.length else { return -1 }
+        return AppleOverflow.singleBit([UInt8](md))
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
@@ -821,6 +841,12 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         guard running, identOn, probe == nil else { return }
         let now = Mono.now()
 
+        // 묶인 폰의 잠긴 광고를 어느 길이 주는지: 처음 보일 때와 그 묶음이 바뀔 때만 한 줄 (LockedPathLog).
+        // 실기에서 어느 스캔을 살릴지는 bound 줄이 아니라 이 줄로 가른다.
+        if let b = boundId, let via = lockedLog.update(boundLocked, now: now) {
+            EventLog.write("ident: \(BLEIds.shortId(b)) locked adverts via \(via)")
+        }
+
         // 묶인 기기가 아직 광고 중이면 할 일이 없다.
         // 30초로 잡은 이유: 실측 광고 간격의 최대가 19.9초였다. 20초로 두면
         // 정상적인 공백에도 결합이 풀려 헛된 탐색이 돈다. 늦게 풀어도 손해가
@@ -858,20 +884,11 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             return
         }
         probedUntil[pick.id] = now + AdvScanner.retryUnreachableMs   // 잠정 잠금
-        startProbe(p, on: mgr, purpose: .ident(rssi: c.rssi, bit: c.bit, via: AdvScanner.pathText(c)))
-    }
-
-    /// bound 줄의 "via ..." - 어느 스캔이 이 기기를 후보로 줬는지. 실기에서 어느 경로가 되는지를
-    /// events.log 만 보고 가를 수 있게 한다 (filter / raw bit N / raw list, 둘 다면 " + ").
-    private static func pathText(_ c: Cand) -> String {
-        var parts: [String] = []
-        if c.viaFilter != nil { parts.append("filter") }
-        if c.bit >= 0 {
-            parts.append("raw bit \(c.bit)")
-        } else if c.rawList {
-            parts.append("raw list")
-        }
-        return parts.joined(separator: " + ")
+        // bound 줄의 "via ...": 탐색 직전 10초 안에 이 기기를 준 쪽만 (filter / raw bit N / raw list,
+        // 여럿이면 " + "), 그동안 앱이 화면에 떠 있던 광고도 왔으면 ", app on screen" (ScanSourceTimes).
+        // 첫 판은 후보가 생긴 뒤 한 번이라도 준 쪽을 다 적어서, 앱이 떠 있을 때 필터가 준 폰을 잠근 뒤
+        // 묶어도 "via filter" 였다.
+        startProbe(p, on: mgr, purpose: .ident(rssi: c.rssi, bit: c.bit, via: c.times.viaText(now: now)))
     }
 
     private func identProbeDone(_ id: UUID, pickRssi: Int, pickBit: Int, via: String, _ outcome: ProbeOutcome,

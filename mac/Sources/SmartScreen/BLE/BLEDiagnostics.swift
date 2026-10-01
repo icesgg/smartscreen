@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 import CoreBluetooth
 import SmartScreenCore
 
@@ -83,7 +83,7 @@ enum BLEDiagnostics {
         if scanned {
             let r = DiagCentral()
             // 권한은 첫 관리자에서 이미 답했으므로 곧 켜진다
-            let rawOk = waitPoweredOn(r)
+            _ = waitPoweredOn(r)
             dR = r
             emit("세 단계로 찾습니다 (모두 \(seconds * 2 + bothPhaseSec)초쯤).")
             emit("  1 필터 스캔       \(seconds)초 - 신원 서비스 UUID 로 걸러 달라고 macOS 에 맡긴다")
@@ -94,8 +94,10 @@ enum BLEDiagnostics {
             runPhase(s1, book, filter: dF, raw: nil)
             emitFilterPhase(s1)
 
+            // 켜졌는지는 단계마다 다시 본다. 처음 기다림에서 늦었어도 1단계 뒤에는 켜져 있을 수 있고,
+            // 도중에 꺼졌으면 건너뛴다 (꺼진 관리자에 스캔을 걸면 아무것도 오지 않는데 "못 찾음" 으로 읽힌다).
             emit("\n[2/3] 직접 읽기 스캔 \(seconds)초...")
-            if rawOk {
+            if r.manager.state == .poweredOn {
                 runPhase(s2, book, filter: nil, raw: r)
                 emitRawPhase(s2, book)
             } else {
@@ -103,7 +105,8 @@ enum BLEDiagnostics {
             }
 
             emit("\n[3/3] 둘 다 동시에 \(bothPhaseSec)초...")
-            runPhase(s3, book, filter: dF, raw: rawOk ? r : nil)
+            runPhase(s3, book, filter: dF.manager.state == .poweredOn ? dF : nil,
+                     raw: r.manager.state == .poweredOn ? r : nil)
             emitBothPhase(s3)
         }
 
@@ -118,7 +121,9 @@ enum BLEDiagnostics {
 
         var discovered = 0
         var hits: [TokenHit] = []
-        for c in list {
+        // 모든 후보와 그 시도 결과 (요약의 결과 판정용 - 시도하지 않은 것도 "스캔이 봤다" 에 든다)
+        var judged: [ProbeScanResult.Candidate] = all.map { $0.judged(.notTried) }
+        for (i, c) in list.enumerated() {
             // F 의 객체가 있으면 F 의 관리자로 (앱과 같은 순서), 없으면 R 의 것으로 붙는다
             let d: DiagCentral
             let p: CBPeripheral
@@ -131,15 +136,21 @@ enum BLEDiagnostics {
             } else {
                 continue
             }
-            let r = probe(d, p, c)
-            if r.code >= 1 { discovered += 1 }
-            if r.code == 2 {
-                hits.append(TokenHit(cand: c, id: p.identifier, token: r.token))
+            let a = probe(d, p, c)
+            judged[i] = c.judged(a)
+            switch a {
+            case .noIdentService, .noToken:
+                discovered += 1
+            case .token(let tok):
+                discovered += 1
+                hits.append(TokenHit(cand: c, id: p.identifier, token: tok))
                 if !registered.isEmpty {
-                    emit(r.token == registered
+                    emit(tok == registered
                          ? "      (등록된 토큰과 같습니다)"
                          : "      (등록된 토큰과 다릅니다 - 다른 사람의 폰이거나, 앱을 다시 설치해 토큰이 바뀌었습니다)")
                 }
+            case .notTried, .unreachable:
+                break
             }
         }
 
@@ -167,7 +178,8 @@ enum BLEDiagnostics {
         }
 
         emitSummary(scanned: scanned, s1: s1, s2: s2, s3: s3, book: book, tried: list.count,
-                    discovered: discovered, hits: hits, registered: registered)
+                    discovered: discovered, hits: hits, judged: judged, skipped: all.count - list.count,
+                    registered: registered)
         return 0
     }
 
@@ -195,6 +207,10 @@ enum BLEDiagnostics {
             r.manager.stopScan()
             r.onDiscover = nil
         }
+        // 멈추기 전에 메인 큐에 쌓인 광고 콜백을 지금 흘려보낸다 - onDiscover 가 nil 이라 버려진다.
+        // 이게 없으면 2단계의 남은 콜백이 3단계의 onDiscover 를 만나 3단계 숫자에 섞인다 (콜백은 도착한
+        // 때의 onDiscover 를 읽는다).
+        _ = spin(0.5) { false }
     }
 
     /// 필터 스캔이 준 광고. 필터가 맞춘 것이므로 UUID 목록이 비어 있어도 후보다 (앱도 그렇게 한다) -
@@ -314,7 +330,7 @@ enum BLEDiagnostics {
     }
 
     private static func emitBothPhase(_ st: PhaseStats) {
-        var line = "  필터가 준 기기 \(st.filter.count)대"
+        var line = st.ranFilter ? "  필터가 준 기기 \(st.filter.count)대" : "  필터 스캔은 못 했습니다 (관리자가 꺼졌다)"
         if st.ranRaw {
             line += ", overflow 모양 \(st.overflow.count)대 (비트 하나 \(singleBitCount(st))대)"
         } else {
@@ -326,7 +342,9 @@ enum BLEDiagnostics {
     /// 붙여 넣기용 요약. 줄마다 한 가지 - 다음 세션이 이것만 보고 어느 길을 살릴지 정한다.
     private static func emitSummary(scanned: Bool, s1: PhaseStats, s2: PhaseStats, s3: PhaseStats,
                                     book: ProbeBook, tried: Int, discovered: Int, hits: [TokenHit],
-                                    registered: String) {
+                                    judged: [ProbeScanResult.Candidate], skipped: Int, registered: String) {
+        // 거르지 않은 스캔을 한 번이라도 돌렸는가. 못 돌렸으면 "직접 읽기로는 못 찾았다" 고 말할 수 없다.
+        let rawTested = s2.ranRaw || s3.ranRaw
         emit("\n=============== 요약 ===============")
         emit("(이 블록을 그대로 복사해 붙여 넣어 주세요)")
         emit("SmartScreen \(BuildInfo.version) / macOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
@@ -348,11 +366,13 @@ enum BLEDiagnostics {
             } else {
                 emit("2 직접 읽기: 못 함 (두 번째 스캔 관리자가 켜지지 않았다)")
             }
-            var l3 = "3 둘 다 \(s3.seconds)초: 필터 기기 \(s3.filter.count)대"
+            var l3 = "3 둘 다 \(s3.seconds)초: " + (s3.ranFilter ? "필터 기기 \(s3.filter.count)대" : "필터 못 함")
             l3 += s3.ranRaw ? ", overflow 모양 \(s3.overflow.count)대 (비트 하나 \(singleBitCount(s3))대)"
                             : ", 직접 읽기 못 함"
             emit(l3)
-            if book.appleKeys.isEmpty {
+            if !rawTested {
+                emit("Apple 광고 키: 시험 못 함")
+            } else if book.appleKeys.isEmpty {
                 emit("Apple 광고 키: 없음 (Apple 광고를 하나도 못 받았다)")
             } else {
                 // kCBAdvData 는 떼고 적는다 (줄이 짧아야 붙여 넣는다). 다른 접두사의 키는 그대로.
@@ -365,7 +385,7 @@ enum BLEDiagnostics {
             emit("1~3 단계: 건너뜀 (식별자를 주어 바로 붙었다)")
         }
 
-        // 결과는 토큰을 준 후보가 어느 길로 왔는지로 정한다. 등록된 토큰이 있으면 그것과 같은 것을 먼저 본다.
+        // 토큰 줄: 등록된 토큰이 있으면 그것과 같은 것을 먼저 보인다.
         let mine = registered.isEmpty ? hits : hits.filter { $0.token == registered }
         let basis = mine.isEmpty ? hits : mine
         if let h = basis.first {
@@ -383,28 +403,19 @@ enum BLEDiagnostics {
             emit("토큰: 시도할 후보가 없음")
         }
 
-        let byFilter = basis.contains { $0.cand.viaF != nil && !$0.cand.retrieved }
-        let byRaw = basis.contains { $0.cand.bit >= 0 || $0.cand.rawList }
-        if !scanned {
-            emit("결과: 식별자를 주어 스캔을 건너뛰었습니다 - 어느 길인지는 가리지 않습니다.")
-        } else if byFilter && byRaw {
-            emit("결과: 둘 다 - 필터 경로와 직접 읽기 경로가 모두 잠긴 폰을 찾았습니다.")
-        } else if byFilter {
-            emit("결과: 필터 경로 - macOS 의 서비스 필터가 잠긴 폰을 찾아 줍니다 (직접 읽기로는 못 찾았습니다).")
-        } else if byRaw {
-            emit("결과: 직접 읽기 경로 - 필터로는 못 찾고, 제조사 데이터의 overflow 비트로 찾았습니다.")
-        } else {
-            emit("결과: 둘 다 안 됨 - 광고로는 잠긴 폰을 찾지 못했습니다. 남은 길은 GATT 경로뿐입니다:")
-            emit("      SmartScreen 을 켜고 보호를 켠 뒤, 고급 창 아래 GATT 줄(linked / waiting / off)을 보세요.")
+        // 결과: 내 폰의 토큰을 준 후보가 어느 스캔에서 왔는지로 정한다. 스캔이 폰을 봤는데 토큰을 못 읽었으면
+        // "판정 못 함", 어느 스캔도 후보를 못 냈을 때만 "둘 다 안 됨" (ProbeScanResult). 등록된 토큰과 다른
+        // 토큰만 읽은 것도 판정 못 함이다 - 그 줄이 예전의 "주의: 읽은 토큰이 등록된 토큰과 다릅니다" 를 겸한다.
+        let verdict = ProbeScanResult.decide(scanned: scanned, rawTested: rawTested, registered: registered,
+                                             candidates: judged)
+        for line in ProbeScanResult.lines(verdict, rawTested: rawTested, skipped: skipped, maxProbes: maxProbes) {
+            emit(line)
         }
 
         // 결과를 그대로 믿으면 안 되는 경우
         if basis.contains(where: { $0.cand.plain }) {
             emit("주의: 토큰을 준 폰이 서비스 UUID 를 그대로 광고했습니다 (앱이 화면에 떠 있었음).")
             emit("      잠긴 상태의 결과가 아닐 수 있습니다 - 폰을 잠그고 다시 실행하세요.")
-        }
-        if !registered.isEmpty && !hits.isEmpty && mine.isEmpty {
-            emit("주의: 읽은 토큰이 등록된 토큰과 다릅니다 - 옆 사람의 폰이거나, 앱을 다시 설치한 것입니다.")
         }
         if scanned && !s1.filter.isEmpty && s3.ranFilter && s3.filter.isEmpty {
             emit("주의: 둘을 함께 돌리면 필터가 아무것도 주지 않았습니다 (1단계 \(s1.filter.count)대) - "
@@ -457,9 +468,9 @@ enum BLEDiagnostics {
     }
 
     /// 한 후보에 실제로 붙어서 서비스 목록을 받고, 우리 서비스가 있으면 토큰까지 읽는다.
-    /// code: 0 = 실패, 1 = 서비스 탐색 성공, 2 = 토큰 읽음 (token 에 대문자 hex).
+    /// 결과는 어디까지 갔는지: 못 붙음 / 신원 서비스 없음 / 신원 서비스는 있는데 토큰 없음 / 토큰 (대문자 hex).
     /// d 는 p 를 준 관리자여야 한다 (CBPeripheral 은 그것을 준 관리자로만 연결할 수 있다).
-    private static func probe(_ d: DiagCentral, _ p: CBPeripheral, _ c: UnionCand) -> (code: Int, token: String) {
+    private static func probe(_ d: DiagCentral, _ p: CBPeripheral, _ c: UnionCand) -> ProbeScanResult.Attempt {
         emit("\n-------------------------------------")
         var line = "[시도] 주소 \(BLEIds.shortId(p.identifier))  신호 \(c.rssi) dBm  경로 \(pathText(c))"
         if c.overflowKey { line += "  overflow UUID" }
@@ -470,7 +481,7 @@ enum BLEDiagnostics {
 
         guard d.manager.state == .poweredOn else {
             emit("  서비스 탐색: Unreachable (연결 실패)")
-            return (0, "")
+            return .unreachable
         }
         d.begin(p)
         // CoreBluetooth 의 connect 는 스스로 끝나지 않는다 - 시간을 재서 끊는다
@@ -480,7 +491,7 @@ enum BLEDiagnostics {
             if !settled { emit("  연결 상태: Disconnected (10초 대기 후)") }
             emit("  서비스 탐색: \(statusText(d.connectError))")
             release(d, p)
-            return (0, "")
+            return .unreachable
         }
         emit("  연결 상태: Connected")
 
@@ -488,26 +499,31 @@ enum BLEDiagnostics {
         if !spin(20, until: { d.servicesDone || d.disconnected }) {
             emit("  결과: 서비스 탐색 20초 초과 - 연결되지 않았습니다")
             release(d, p)
-            return (0, "")
+            return .unreachable
         }
         if !d.servicesDone {
             emit("  서비스 탐색: Unreachable (연결 실패)")
             release(d, p)
-            return (0, "")
+            return .unreachable
         }
         if let e = d.servicesError {
             emit("  서비스 탐색: \(statusText(e))")
             release(d, p)
-            return (0, "")
+            return .unreachable
         }
         emit("  서비스 탐색: Success")
-        var result = (code: 1, token: "")
+        var result: ProbeScanResult.Attempt = .noIdentService
         let svcs = p.services ?? []
         emit("  서비스 \(svcs.count)개:")
         for s in svcs {
             let mine = s.uuid == BLEIds.identService
             emit("    \(BLEIds.braced(s.uuid))" + (mine ? "   <<< SmartScreen 신원 서비스" : ""))
-            if mine, let tok = readToken(d, p, s) { result = (2, tok) }
+            guard mine else { continue }
+            if let tok = readToken(d, p, s) {
+                result = .token(tok)
+            } else if result == .noIdentService {
+                result = .noToken
+            }
         }
         release(d, p)
         return result
@@ -659,13 +675,16 @@ enum BLEDiagnostics {
         // 같은 권한을 쓰므로 답이 나면 곧 상태가 온다. 처음 판은 둘을 10초만 기다리고, 그때까지 창에
         // 답하지 않았으면 "어댑터를 찾을 수 없습니다" 라고 했다.
         _ = waitPoweredOn(c)
-        _ = spin(3) { p.stateKnown }
+        // 중앙 관리자의 상태가 왔으면 (권한이 정해졌으면) 주변장치 관리자도 곧 온다 - 예전처럼 10초까지 본다.
+        // 중앙도 아직이면 (허용 창에 답하지 않았다) 오래 기다려 봐야 같다.
+        _ = spin(c.stateKnown ? 10 : 3) { p.stateKnown }
         let cs = c.manager.state
         let ps = p.manager.state
         // 권한은 앱(여기서는 터미널 앱) 단위라 두 관리자가 같은 답을 받는다. 어느 쪽이 먼저 알아채도 말한다.
         let prob: BtProblem? = ps == .unauthorized ? .denied : problem(cs)
 
-        // 켜져 있거나 꺼져 있을 뿐이면 역할 지원 여부는 안다 (주변장치 관리자가 unsupported 가 아니면 지원)
+        // 켜져 있거나 꺼져 있을 뿐이면 역할 지원 여부는 안다 (주변장치 관리자가 unsupported 가 아니면 지원).
+        // 주변장치 관리자의 상태가 끝내 안 왔으면 모른다 - 처음 판은 그것을 "아니오" (미지원) 로 말했다.
         var rolesKnown = false
         var peripheral = false
         switch prob {
@@ -675,9 +694,11 @@ enum BLEDiagnostics {
         default:
             break
         }
+        let peripheralUnknown = rolesKnown && !p.stateKnown
         if rolesKnown {
             out("  저전력 블루투스(BLE) 지원 : 예")
-            out("  주변장치 역할 지원        : \(yesNo(peripheral))")
+            out("  주변장치 역할 지원        : "
+                + (peripheralUnknown ? "모름 (상태 \(BLEIds.stateName(ps)))" : yesNo(peripheral)))
             out("  중앙장치 역할 지원        : 예")
             out("  클래식 블루투스 지원      : 예")   // Mac 은 모두 지원한다
         }
@@ -700,6 +721,8 @@ enum BLEDiagnostics {
             case .notReady:
                 out("결과: 잠시 뒤 다시 실행해 주세요.")
             }
+        } else if peripheralUnknown {
+            out("결과: 주변장치 역할을 아직 알 수 없습니다. 잠시 뒤 다시 실행해 주세요.")
         } else if peripheral {
             out("결과: 빠른 모드를 쓸 수 있습니다.\n")
             out("아이폰에 컴패니언 앱(SSBeacon)을 설치하면")
@@ -738,22 +761,43 @@ enum BLEDiagnostics {
     /// 허용 창 안내는 실행마다 한 번 (--probe-scan 은 관리자를 둘 만든다).
     private static var permissionPromptAnnounced = false
 
-    /// 이 명령을 실행한 터미널 앱의 이름 (macOS 가 블루투스 권한을 묻는 이름). 모르는 앱이면 nil.
-    private static var terminalAppName: String? {
-        switch ProcessInfo.processInfo.environment["TERM_PROGRAM"] ?? "" {
+    /// 이 명령을 실행한 터미널 앱의 이름 (macOS 가 블루투스 권한을 묻는 이름). 모르면 nil.
+    ///
+    /// 먼저 `__CFBundleIdentifier` 를 본다. LaunchServices 가 앱을 띄울 때 그 앱의 번들 id 로 넣고, 그 앱의
+    /// 셸과 tmux 까지 물려받는다 - TCC 가 권한을 묻는 "책임 프로세스" 와 같은 앱이다. 이름은 그 앱의
+    /// 화면 이름(Finder 와 시스템 설정에 보이는 것)을 쓴다. 그다음이 `TERM_PROGRAM` 인데, 앱 하나만 뜻하는
+    /// 값만 믿는다: tmux 안에서는 "tmux", Cursor/VSCodium 은 "vscode" 라서 앱을 잘못 댄다 (첫 판은 그래서
+    /// Cursor 사용자에게 Visual Studio Code 를 켜라고 했다). Alacritty/kitty 는 아예 넣지 않는다.
+    private static let terminalAppName: String? = {
+        let env = ProcessInfo.processInfo.environment
+        if let bid = env["__CFBundleIdentifier"], !bid.isEmpty, bid != Bundle.main.bundleIdentifier {
+            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bid) {
+                var name = FileManager.default.displayName(atPath: url.path)
+                if name.hasSuffix(".app") { name = String(name.dropLast(4)) }
+                if !name.isEmpty { return name }
+            }
+            switch bid {
+            case "com.apple.Terminal": return "터미널"
+            case "com.googlecode.iterm2": return "iTerm"
+            default: break
+            }
+        }
+        switch env["TERM_PROGRAM"] ?? "" {
         case "Apple_Terminal": return "터미널"
         case "iTerm.app": return "iTerm"
-        case "vscode": return "Visual Studio Code"
         case "WarpTerminal": return "Warp"
+        case "WezTerm": return "WezTerm"
+        case "ghostty": return "Ghostty"
         default: return nil
         }
-    }
+    }()
 
-    /// 문장에 넣을 이름: 아는 앱은 따옴표로 ("터미널"), 모르면 풀어서 쓴다. 뒤에 조사를 붙이지 않게
-    /// 문장을 짠다 ("터미널" 을 / "Visual Studio Code" 를 처럼 이름마다 조사가 달라진다).
+    /// 문장에 넣을 이름: 아는 앱은 따옴표로 ("터미널"), 모르면 풀어서 쓴다. 이름 바로 뒤에 조사를 붙이지
+    /// 않게 문장을 짠다 ("터미널" 을 / "iTerm" 을 / "Warp" 를 처럼 이름마다 조사가 달라진다) -
+    /// "... 이름으로", "... 항목을" 처럼 뒤에 낱말을 하나 둔다.
     private static var terminalAppLabel: String {
         if let n = terminalAppName { return "\"\(n)\"" }
-        return "이 명령을 실행한 터미널 앱"
+        return "이 명령을 실행한 터미널 앱 (터미널, iTerm 등)"
     }
 
     /// 블루투스를 쓸 수 없는 이유. 세 도구가 같은 갈래, 같은 글자를 쓴다 (emitCentralFailure, --bt-check).
@@ -856,8 +900,8 @@ enum BLEDiagnostics {
         if d.manager.state != .poweredOn && CBManager.authorization == .notDetermined {
             if !permissionPromptAnnounced {
                 permissionPromptAnnounced = true
-                let whose = terminalAppName.map { "\"\($0)\" 의" } ?? "이 명령을 실행한 터미널 앱의"
-                emit("\(whose) 블루투스 허용 창에서 [허용] 을 누르세요 - 기다리는 중 (최대 \(permissionWaitSec)초)")
+                emit("\(terminalAppLabel) 이름으로 뜬 블루투스 허용 창에서 [허용] 을 누르세요 - "
+                     + "기다리는 중 (최대 \(permissionWaitSec)초)")
             }
             // 답하면 권한이 정해지고 상태가 온다 (허용 = poweredOn, 허용 안 함 = unauthorized)
             _ = spin(Double(permissionWaitSec)) {
@@ -904,6 +948,11 @@ private struct UnionCand {
 
     /// 신원 UUID 를 직접 봤다 (앱의 sure 와 같은 뜻) - 먼저 시도한다
     var sure: Bool { return viaF != nil || rawList }
+
+    /// 요약의 결과 판정에 넘길 모양 (ProbeScanResult). 식별자로 가져온 것은 필터가 준 것이 아니다.
+    func judged(_ a: ProbeScanResult.Attempt) -> ProbeScanResult.Candidate {
+        return ProbeScanResult.Candidate(byFilter: viaF != nil && !retrieved, rawList: rawList, bit: bit, attempt: a)
+    }
 }
 
 private struct FilterSeen {
