@@ -132,8 +132,10 @@ ones with no UI. Thresholds must be measured per adapter and per desk -
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `nearRssiThreshold` | -65 dBm | The threshold, both paths. The "신호 강도" box |
-| `gattRssiThreshold` | (= above) | Kept equal to `nearRssiThreshold` since 1.1.6; earlier builds used it as a separate GATT-path value |
+| `nearRssiThreshold` | -65 dBm | The one visible threshold; the advertisement path uses it as is. The "신호 강도" box / distance slider |
+| `gattRssiThreshold` | (derived) | Saved copy of clamp(`nearRssiThreshold` + `gattRssiOffset`, -100, -30), rewritten at [시작], by the distance slider and by the wizard's apply; editing it by hand does not stick. Before 1.1.6 it was a separate GATT-path value |
+| `gattRssiOffset` | 0 | GATT base minus advertisement base (dB) as measured by the wizard (재보기) when the phone app was linked to this PC; clamped to [-40, 40]. 0 = not measured, or the two paths agree - old configs without the key behave as before. About 0 on the Windows laptop, -12..-15 on the M1 Mac (`docs/PROXIMITY.md`) |
+| `measuredBaseRssi` | 0 | The wizard's advertisement base, used as "보통" by the distance slider ("가까이" +6, "멀리" -6). 0 = not measured; a built-in -64 is used |
 | `bleLostMeansFar` | 1 | Signal lost = user away. Turn off only when running without the app |
 | `bleTimeoutSec` | 90 | Silence this long counts as lost |
 | `bleIrk` | (none) | Phone's identity key. Belongs to the phone, copyable between PCs |
