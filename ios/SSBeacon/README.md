@@ -64,6 +64,12 @@ BARROT 칩 동글 2종은 "지원함"이라고 보고하고도 동작하지 않�
    - **"Acts as a Bluetooth LE accessory"**   (`bluetooth-peripheral`)
    → Info.plist `UIBackgroundModes` 에 두 값이 모두 있어야 한다
 3. Info → `Privacy - Bluetooth Always Usage Description` 추가
+4. General → Minimum Deployments 는 **iOS 15.0 이상** (새 프로젝트의 기본값은 그보다 높으니
+   그대로 두면 된다). 코드가 쓰는 가장 새 API 가 iOS 15 이고, CI(`.github/workflows/ios.yml`)가
+   이 값으로 타입 검사한다
+
+CI 는 Xcode 16 기본값과 Xcode 26 새 프로젝트 기본값(기본 격리 MainActor,
+MemberImportVisibility) 둘 다로 검사한다. 타입 검사만이고 서명·실행은 하지 않는다.
 
 계정 연동(구글 로그인)에는 **추가 설정이 없다.** `ASWebAuthenticationSession`
 이 콜백 스킴(`ssbeacon://`)을 직접 가로채므로 Info.plist 의 URL Types 에

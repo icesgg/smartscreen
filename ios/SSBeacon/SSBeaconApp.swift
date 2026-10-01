@@ -381,10 +381,13 @@ final class LinkManager: NSObject, ObservableObject,
 
     func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
         isLinked = false
-        rssiChar = nil
-        watching = false
-        softAt = nil
-        serviceGone = false
+        // 다른 PC 로 갈아탈 때 끊은 옛 PC 의 알림이면 지금 연결의 상태를 건드리지 않는다
+        if p.identifier == pc?.identifier {
+            rssiChar = nil
+            watching = false
+            softAt = nil
+            serviceGone = false
+        }
         // 건너뛰기로 표시된 PC면 재연결을 걸지 않는다 (붙었다 끊었다 반복 방지)
         if let until = skipUntil[p.identifier], until > Date() {
             linkText = "이 PC는 광고 경로 사용"
