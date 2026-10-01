@@ -19,7 +19,15 @@ struct AppConfig {
     DWORD gattGraceSec = 90;      // 시작 후 앱 연결을 기다리는 시간(초)
     // -55 였는데, 실측에서 착석 분포(-62~-45) 안에 들어가 있어 자리에 앉아 있는데도
     // 화면을 잠갔다. 연결 경로가 실제로 붙기 전에는 이 값이 쓰인 적이 없어 드러나지 않았다.
+    // 지금은 손으로 정하는 값이 아니다. nearRssiThreshold + gattRssiOffset 으로 [시작] 과
+    // 거리 막대가 다시 맞추는 사본이다 (main.cpp GattThresholdFor).
     int gattRssiThreshold = -65;  // [연결] 경로 (dBm, 폰이 측정한 연결 RSSI)
+    // 재보기가 잰 "연결 신호 - 광고 신호" (dB). 같은 순간에도 두 경로가 같은 숫자를
+    // 내지 않는다: 윈도우 노트북에서는 2dB 안이었지만 M1 맥에서는 연결 쪽이 12~15dB
+    // 낮았다. 보이는 숫자는 광고 기준 하나로 두고, 연결 임계값은 이만큼 옮겨서 쓴다.
+    // 0 = 아직 안 재 봤거나 같은 값. 이 키가 없는 예전 config.ini 는 0 으로 읽혀서
+    // 재보기를 다시 하기 전까지는 예전과 똑같이 (두 경로가 같은 값으로) 동작한다.
+    int gattRssiOffset = 0;
     bool bleLostMeansFar = true;  // BLE 끊김 = 범위 이탈. 컴패니언 앱이 상시 광고하므로 기본 켬
     std::wstring bleIrk;         // LE 본딩 기기의 IRK (32자리 hex) - iPhone 랜덤 주소 해석용
     // IRK 를 대체하는 신원 확인 (ble_ident.h 참고). 본딩도 Phone Link 도 필요 없다.
