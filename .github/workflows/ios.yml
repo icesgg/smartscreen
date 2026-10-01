@@ -2,8 +2,9 @@
 #
 # 저장소에 .xcodeproj 가 없고 앱은 사용자가 Mac 의 Xcode 에서 직접 빌드한다. 이 PC 에는
 # Swift 컴파일러가 없어서, 예전에는 SSBeaconApp.swift 를 고치고도 컴파일되는지 아무도 몰랐다
-# (NEXT_SESSION.md 의 "컴파일 검증 못 했음"). 여기서 iOS SDK 로 타입 검사만 한다 - 서명,
-# 링크, 실행은 하지 않는다. 블루투스 동작은 실기에서만 확인된다.
+# (NEXT_SESSION.md 의 "컴파일 검증 못 했음"). 여기서 iOS SDK 로 타입 검사와 SIL 진단까지만
+# 한다 - 기계어, 서명, 링크, 실행은 하지 않는다. 블루투스 동작은 실기에서만 확인된다.
+# 어느 Xcode 로 보는지는 ios/SSBeacon/README.md 의 "Xcode 설정" 끝에 적어 두었다.
 name: ios
 
 on:
@@ -15,7 +16,29 @@ on:
   pull_request:
     paths:
       - 'ios/**'
+      - '.github/workflows/ios.yml'
   workflow_dispatch:
+
+env:
+  # 최소 배포 버전. ios/ 에는 Info.plist 도 배포 대상 메모도 없으므로(Xcode 가 프로젝트를
+  # 만들 때 정한다) 코드가 쓰는 API 중 가장 새것으로 정했다:
+  #   iOS 14: SwiftUI App / @main / @StateObject
+  #   iOS 15: .textSelection(.enabled), .buttonStyle(.borderedProminent)  <- 가장 새것
+  #   (CryptoKit, ASWebAuthenticationSession.presentationContextProvider, connectedScenes 는 iOS 13)
+  # Xcode 의 새 프로젝트는 배포 대상이 SDK 버전(훨씬 높다)이라 거기서도 통과한다. 낮은 쪽으로
+  # 검사해야 iOS 15 보다 새 API 를 @available 없이 쓰는 실수가 여기서 걸린다.
+  # 이 값을 올리면 README.md 의 Xcode 설정에도 적을 것.
+  IOS_MIN: '15.0'
+  # Xcode 26 이 새 앱 프로젝트에 켜는 기본값: 기본 격리 MainActor + Approachable Concurrency +
+  # MemberImportVisibility. 따옴표 없이 $NEW_PROJECT_FLAGS 로 펼쳐 쓴다.
+  NEW_PROJECT_FLAGS: >-
+    -default-isolation MainActor
+    -enable-upcoming-feature DisableOutwardActorInference
+    -enable-upcoming-feature GlobalActorIsolatedTypesUsability
+    -enable-upcoming-feature InferIsolatedConformances
+    -enable-upcoming-feature InferSendableFromCaptures
+    -enable-upcoming-feature NonisolatedNonsendingByDefault
+    -enable-upcoming-feature MemberImportVisibility
 
 jobs:
   typecheck:
@@ -25,16 +48,6 @@ jobs:
       run:
         shell: bash
     timeout-minutes: 15
-    env:
-      # 최소 배포 버전. ios/ 에는 Info.plist 도 배포 대상 메모도 없으므로(Xcode 가 프로젝트를
-      # 만들 때 정한다) 코드가 쓰는 API 중 가장 새것으로 정했다:
-      #   iOS 14: SwiftUI App / @main / @StateObject
-      #   iOS 15: .textSelection(.enabled), .buttonStyle(.borderedProminent)  <- 가장 새것
-      #   (CryptoKit, ASWebAuthenticationSession.presentationContextProvider, connectedScenes 는 iOS 13)
-      # Xcode 의 새 프로젝트는 배포 대상이 SDK 버전(훨씬 높다)이라 거기서도 통과한다. 낮은 쪽으로
-      # 검사해야 iOS 15 보다 새 API 를 @available 없이 쓰는 실수가 여기서 걸린다.
-      # 이 값을 올리면 README.md 의 Xcode 설정에도 적을 것.
-      IOS_MIN: '15.0'
     steps:
       - uses: actions/checkout@v4
 
@@ -46,6 +59,13 @@ jobs:
           xcrun swiftc --version
           echo "installed:"
           ls -d /Applications/Xcode*.app
+          {
+            echo "### macos-15, default Xcode, plain defaults"
+            echo '```'
+            xcodebuild -version
+            xcrun swiftc --version 2>&1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # -parse-as-library: 파일이 하나면 swiftc 는 그것을 main.swift 처럼(최상위 코드 허용)
       # 읽고, 그러면 @main 이 "'main' attribute cannot be used in a module that contains
@@ -121,11 +141,12 @@ jobs:
           fi
           echo "canary OK: rejected as expected"
 
-      # Xcode 26 이 새 앱 프로젝트에 켜는 기본값(기본 격리 MainActor + Approachable Concurrency +
-      # MemberImportVisibility)으로 한 번 더. 사용자의 프로젝트가 어느 Xcode 로 만들어졌는지
-      # 모르므로 둘 다 통과해야 한다. 처음 돌렸을 때 여기서만 `import Combine` 이 없다는 오류가
-      # 났다 (MemberImportVisibility). 러너에 Xcode 26 이상이 없으면 건너뛴다.
-      - name: Typecheck (Xcode 26 new-project defaults)
+      # Xcode 26 이 새 앱 프로젝트에 켜는 기본값(NEW_PROJECT_FLAGS)으로 한 번 더, 이 러너의 가장
+      # 새 Xcode 로. 사용자의 프로젝트가 어느 Xcode 로 만들어졌는지 모르므로 둘 다 통과해야 한다.
+      # 처음 돌렸을 때 여기서만 `import Combine` 이 없다는 오류가 났다 (MemberImportVisibility).
+      # -typecheck 가 아니라 SIL 까지 만든다: 초기화 전 사용·missing return 같은 오류도 새
+      # 컴파일러로 본다. macos-15 에는 26.3 까지만 있으므로 더 새 Xcode 는 아래 newest job 이 본다.
+      - name: SIL diagnostics (newest Xcode 26+ on macos-15, new-project defaults)
         if: always()
         run: |
           set -euo pipefail
@@ -137,25 +158,27 @@ jobs:
           export DEVELOPER_DIR="$app/Contents/Developer"
           xcodebuild -version
           xcrun swiftc --version
+          {
+            echo "### macos-15, $(basename "$app"), new-project defaults"
+            echo '```'
+            xcodebuild -version
+            xcrun swiftc --version 2>&1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
           files=()
           while IFS= read -r -d '' f; do files+=("$f"); done \
             < <(find ios/SSBeacon -name '*.swift' -print0 | sort -z)
           sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
-          xcrun --sdk iphoneos swiftc -typecheck \
+          # NEW_PROJECT_FLAGS 는 따옴표 없이 낱말로 펼친다
+          xcrun --sdk iphoneos swiftc -emit-sil -wmo -o /dev/null \
             -sdk "$sdk" \
             -target "arm64-apple-ios${IOS_MIN}" \
             -swift-version 5 \
             -module-name SSBeacon \
             -parse-as-library \
-            -default-isolation MainActor \
-            -enable-upcoming-feature DisableOutwardActorInference \
-            -enable-upcoming-feature GlobalActorIsolatedTypesUsability \
-            -enable-upcoming-feature InferIsolatedConformances \
-            -enable-upcoming-feature InferSendableFromCaptures \
-            -enable-upcoming-feature NonisolatedNonsendingByDefault \
-            -enable-upcoming-feature MemberImportVisibility \
-            "${files[@]}" 2>&1 | tee ios-typecheck-xcode26.log
-          echo "typecheck OK (Xcode 26 defaults)"
+            $NEW_PROJECT_FLAGS \
+            "${files[@]}" 2>&1 | tee ios-sil-xcode26.log
+          echo "SIL OK (Xcode 26 new-project defaults)"
 
       - name: Upload log
         if: always()
@@ -165,7 +188,95 @@ jobs:
           path: |
             ios-typecheck.log
             ios-sil.log
-            ios-typecheck-xcode26.log
+            ios-sil-xcode26.log
             canary.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # macos-15 (위 job) 에는 Xcode 26.3 까지만 있는데, 사용자가 오늘 Mac 에 Xcode 를 새로 깔면 그보다
+  # 새것을 받는다. 새 러너의 기본 Xcode 로 SIL 까지 한 번 더 본다: 예전에 만든 프로젝트를 새
+  # Xcode 로 연 경우(기본값)와 새로 만든 프로젝트(NEW_PROJECT_FLAGS) 둘 다.
+  # xcode-27 은 미리보기 이미지라 실패해도 CI 를 빨갛게 만들지 않는다 - 실행 요약과 로그를 볼 것.
+  newest:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26
+            preview: false
+          - runner: xcode-27
+            preview: true
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.preview }}
+    defaults:
+      run:
+        shell: bash
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          echo "iphoneos SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+          xcrun swiftc --version
+          echo "installed:"
+          ls -d /Applications/Xcode*.app
+          {
+            echo "### ${{ matrix.runner }}, default Xcode${{ matrix.preview && ' (preview - a failure here does not fail CI)' || '' }}"
+            echo '```'
+            xcodebuild -version
+            xcrun swiftc --version 2>&1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: SIL diagnostics (plain defaults)
+        run: |
+          set -euo pipefail
+          files=()
+          while IFS= read -r -d '' f; do files+=("$f"); done \
+            < <(find ios/SSBeacon -name '*.swift' -print0 | sort -z)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::ios/SSBeacon 에 .swift 파일이 없다"
+            exit 1
+          fi
+          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos swiftc -emit-sil -wmo -o /dev/null \
+            -sdk "$sdk" \
+            -target "arm64-apple-ios${IOS_MIN}" \
+            -swift-version 5 \
+            -module-name SSBeacon \
+            -parse-as-library \
+            "${files[@]}" 2>&1 | tee ios-sil-newest.log
+          echo "SIL OK (plain defaults)"
+
+      - name: SIL diagnostics (new-project defaults)
+        if: always()
+        run: |
+          set -euo pipefail
+          files=()
+          while IFS= read -r -d '' f; do files+=("$f"); done \
+            < <(find ios/SSBeacon -name '*.swift' -print0 | sort -z)
+          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+          # NEW_PROJECT_FLAGS 는 따옴표 없이 낱말로 펼친다
+          xcrun --sdk iphoneos swiftc -emit-sil -wmo -o /dev/null \
+            -sdk "$sdk" \
+            -target "arm64-apple-ios${IOS_MIN}" \
+            -swift-version 5 \
+            -module-name SSBeacon \
+            -parse-as-library \
+            $NEW_PROJECT_FLAGS \
+            "${files[@]}" 2>&1 | tee ios-sil-newest-newproject.log
+          echo "SIL OK (new-project defaults)"
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-newest-log-${{ matrix.runner }}
+          path: |
+            ios-sil-newest.log
+            ios-sil-newest-newproject.log
           if-no-files-found: ignore
           retention-days: 14

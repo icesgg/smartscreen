@@ -88,6 +88,12 @@ final class LinkManager: NSObject, ObservableObject,
     private let hardWindowStart: TimeInterval = 60
     private let hardWindowMax: TimeInterval = 960
     private var hardWindow: TimeInterval = 60     // 1단계 뒤 끊기까지. TICK 없이 끊을 때마다 두 배
+    // checkTicks 가 마지막으로 돈 시각. 간격이 크게 벌어졌으면 앱이 멈춰 있다 깨어난 것이다
+    private var lastCheckAt = Date()
+    // hardRecover 로 끊은 PC. 다시 붙거나 recoverWindow 가 지날 때까지 이 PC 에만 붙는다
+    private var recoverId: UUID?
+    private var recoverGen = 0
+    private let recoverWindow: TimeInterval = 30
 
     private var identAdded = false
     // add() 가 실패하면 한 번만 다시 해 본다. 끝없이 돌지 않게 세어 두고, 성공하거나
@@ -110,8 +116,11 @@ final class LinkManager: NSObject, ObservableObject,
             options: [CBCentralManagerOptionRestoreIdentifierKey: kCentralRestoreId])
         peripheralMgr = CBPeripheralManager(delegate: self, queue: nil,
             options: [CBPeripheralManagerOptionRestoreIdentifierKey: kPeripheralRestoreId])
-        // TICK 감시. 앱이 백그라운드에서 멈춰 있으면 같이 멈추는데 괜찮다 - Core Bluetooth
-        // 이벤트로 깨어나거나 앱을 열면 다시 돈다. 클로저 대신 selector 를 쓰는 것은 Xcode 26 의
+        // TICK 감시. 앱이 백그라운드에서 멈춰 있으면 같이 멈추고, 앱을 열거나 다른 Core Bluetooth
+        // 이벤트(TICK, 연결·끊김, Service Changed)로 깨어났을 때만 다시 돈다. 그래서 Service
+        // Changed 를 못 받은 낡은 구독은 폰이 잠겨 있으면 여기서 못 잡는다 - 그 상태에서는 TICK 도
+        // 끊김도 없고, PC 의 토큰 읽기는 캐시가 앱 없이 답한다 ("MARK: - TICK 감시" 참고).
+        // 클로저 대신 selector 를 쓰는 것은 Xcode 26 의
         // 기본 격리(MainActor)에서도 그대로 컴파일되게 하려는 것이다. 타이머가 self 를 붙드는데,
         // 이 객체는 앱이 사는 동안 하나뿐이다.
         let t = Timer(timeInterval: 15, target: self, selector: #selector(checkTicks),
@@ -339,7 +348,7 @@ final class LinkManager: NSObject, ObservableObject,
             startScanOrConnect()
         case .poweredOff:
             isLinked = false; linkText = "Bluetooth 꺼짐"
-            rssiChar = nil; watching = false; softAt = nil; serviceGone = false
+            rssiChar = nil; watching = false; softAt = nil; serviceGone = false; recoverId = nil
         default: break
         }
     }
@@ -350,6 +359,10 @@ final class LinkManager: NSObject, ObservableObject,
             pc = p
             p.delegate = self
             isLinked = (p.state == .connected)
+            // 연결된 채로 돌아온 PC 는 우리 서비스를 내준 PC 다 - 옛 프로세스는 서비스가 없는 PC 를
+            // 몇 초 안에 끊는다. servedBy 는 메모리에만 있으므로 여기서 다시 채운다. 안 채우면
+            // 서비스를 잠시 내린 PC (Mac [보호 꺼짐]) 를 GATT 서버가 없는 PC 로 보고 10분 건너뛴다.
+            if p.state == .connected { servedBy.insert(p.identifier) }
         }
     }
 
@@ -357,8 +370,12 @@ final class LinkManager: NSObject, ObservableObject,
                         advertisementData: [String: Any], rssi RSSI: NSNumber) {
         // 서비스를 제공하지 않는다고 확인된 PC는 일정 시간 건너뛴다
         if let until = skipUntil[p.identifier], until > Date() { return }
+        // 감시가 끊은 PC 에 다시 붙는 중이면 다른 PC 로 갈아타지 않는다 (hardRecover 참고)
+        if let r = recoverId, r != p.identifier { return }
         if let old = pc, old.identifier != p.identifier {
+            // 옛 PC 의 didDisconnect 는 무시되므로 (pc 가 이미 바뀌었다) 화면은 여기서 내린다
             c.cancelPeripheralConnection(old)
+            isLinked = false
         }
         c.stopScan()
         pc = p
@@ -368,10 +385,20 @@ final class LinkManager: NSObject, ObservableObject,
     }
 
     func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
+        // 지금 PC 가 아닌 연결(갈아타기 전의 옛 PC 등)은 받지 않는다. 받으면 그 PC 의 콜백이
+        // 지금 연결의 감시 상태와 rssiChar 를 덮어쓴다.
+        guard p.identifier == pc?.identifier else {
+            c.cancelPeripheralConnection(p)
+            return
+        }
+        // 붙었으면 스캔을 멈춘다. 남겨 두면 나중에 보인 다른 SmartScreen PC 로 갈아탄다.
+        c.stopScan()
+        recoverId = nil
         isLinked = true
         linkText = "연결됨"
         discoverTries = 0
-        // 새 연결 = 새 구독. TICK 감시는 특성을 찾은 뒤부터 센다.
+        // 새 연결 = 새 구독. TICK 감시는 특성을 찾은 뒤부터 센다. 갈아타기 전 PC 의 특성도 버린다.
+        rssiChar = nil
         watching = false
         softAt = nil
         serviceGone = false
@@ -380,14 +407,15 @@ final class LinkManager: NSObject, ObservableObject,
     }
 
     func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
+        // 다른 PC 로 갈아탈 때 끊은 옛 PC 의 알림이면 아무것도 하지 않는다. 지금 연결의 상태도
+        // 화면도 건드리지 않고, 옛 PC 에 connect 를 다시 걸지도 않는다 (걸면 그 PC 가 붙는 순간
+        // 지금 연결의 상태를 덮어쓴다).
+        guard p.identifier == pc?.identifier else { return }
         isLinked = false
-        // 다른 PC 로 갈아탈 때 끊은 옛 PC 의 알림이면 지금 연결의 상태를 건드리지 않는다
-        if p.identifier == pc?.identifier {
-            rssiChar = nil
-            watching = false
-            softAt = nil
-            serviceGone = false
-        }
+        rssiChar = nil
+        watching = false
+        softAt = nil
+        serviceGone = false
         // 건너뛰기로 표시된 PC면 재연결을 걸지 않는다 (붙었다 끊었다 반복 방지)
         if let until = skipUntil[p.identifier], until > Date() {
             linkText = "이 PC는 광고 경로 사용"
@@ -395,10 +423,14 @@ final class LinkManager: NSObject, ObservableObject,
             linkText = "연결 끊김 - 재연결 대기"
             c.connect(p, options: nil)   // 타임아웃 없는 connect: 범위 안으로 오면 자동 재연결
         }
+        // 감시가 끊은 것이면 스캔을 열지 않는다 - 위의 connect 로 같은 PC 에만 다시 붙는다.
+        // recoverWindow 안에 못 붙으면 endRecover 가 스캔을 연다.
+        if recoverId == p.identifier { return }
         startScanOrConnect()
     }
 
     func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
+        guard p.identifier == pc?.identifier else { return }
         isLinked = false
         linkText = "연결 실패 - 재시도"
         startScanOrConnect()
@@ -412,20 +444,30 @@ final class LinkManager: NSObject, ObservableObject,
     // 벗어났다 돌아올 때까지 그대로다 - 노트북 events.log: 08:15·08:19 재시작 뒤 08:47 까지
     // 구독이 없었다.
     //  - iOS 가 Service Changed 를 받으면 didModifyServices 가 온다 -> 거기서 바로 다시 찾는다.
-    //  - 못 받으면 TICK 이 끊긴 것으로만 안다 -> 여기서 본다.
+    //  - 못 받으면 TICK 이 끊긴 것으로만 안다 -> 여기서 본다. 단 이 감시는 앱이 깨어 있을 때만
+    //    돈다. 폰이 잠겨 있으면 앱을 깨울 이벤트가 없어서 (TICK 도 끊김도 없고, PC 의 토큰 읽기는
+    //    CoreBluetooth 캐시가 앱 없이 답한다) 앱을 열거나 범위를 벗어났다 돌아올 때까지 그대로다.
+    //    그동안 PC 는 광고 경로를 쓴다.
     //
     // 단, PC 는 사용자가 입력하는 동안 일부러 TICK 을 보내지 않는다 (폴링 간격 0 = 자리에
     // 있음). TICK 이 한참 없는 것은 정상일 수 있으므로 두 단계로 간다:
     //  1단계: TICK 이 60초 없으면 서비스를 다시 찾는다 (discover -> 특성 -> setNotifyValue).
     //         연결이 멀쩡하면 아무 일도 없다. 몇 번을 해도 해가 없다.
     //  2단계: 그 뒤로도 TICK 없이 hardWindow 가 지나거나 1단계가 실패하면 연결을 끊는다.
-    //         didDisconnect 가 다시 붙고 새로 구독한다.
+    //         didDisconnect 가 같은 PC 에 다시 붙고 새로 구독한다 (hardRecover 참고).
     // 입력이 길게 이어지면 2단계가 되풀이되므로 TICK 없이 끊을 때마다 hardWindow 를 두 배로
     // 늘린다 (60초 -> 최대 16분). TICK 이 하나라도 오면 처음으로 돌아간다.
 
     @objc private func checkTicks() {
-        guard watching, let p = pc, p.state == .connected else { return }
         let now = Date()
+        let gap = now.timeIntervalSince(lastCheckAt)
+        lastCheckAt = now
+        // 앱이 멈춰 있다 방금 깨어났다 (타이머는 15초 간격). 밀린 타이머는 앱을 깨운 이벤트보다
+        // 먼저 돌 수 있으므로 이번에는 아무것도 하지 않는다 - 입력이 끝나 PC 가 보낸 첫 TICK 에
+        // 깨어났다면 그 TICK 이 먼저 처리돼 감시를 처음으로 되돌린다. TICK 이 없었으면 다음 차례
+        // (15초 뒤)에 그대로 판단한다. 멈춰 있던 시간도 TICK 이 없던 시간이 맞으므로 지우지 않는다.
+        if gap > 40 { return }
+        guard watching, let p = pc, p.state == .connected else { return }
         if let soft = softAt {
             if now.timeIntervalSince(soft) >= hardWindow { hardRecover(p) }
         } else if now.timeIntervalSince(lastTickAt) >= tickStall {
@@ -435,10 +477,10 @@ final class LinkManager: NSObject, ObservableObject,
         }
     }
 
-    // 쥐고 있던 특성을 버리고 서비스부터 다시 찾는다. 찾으면 didDiscoverServices ->
-    // didDiscoverCharacteristics 가 특성을 새로 잡고 TICK 을 다시 구독한다.
+    // 서비스부터 다시 찾는다. 찾으면 didDiscoverServices -> didDiscoverCharacteristics 가
+    // 특성을 새로 잡고 TICK 을 다시 구독한다. 쥐고 있던 rssiChar 는 새것을 찾을 때까지 그대로
+    // 둔다 - 그 사이에 온 TICK 의 보고를 버리지 않기 위해서다. 지워진 특성이면 쓰기가 실패할 뿐이다.
     private func rediscover(_ p: CBPeripheral) {
-        rssiChar = nil
         discoverTries = 0
         p.discoverServices(nil)
     }
@@ -448,12 +490,32 @@ final class LinkManager: NSObject, ObservableObject,
         watching = false
         hardWindow = min(hardWindow * 2, hardWindowMax)
         linkText = "TICK 없음 - 다시 연결"
+        // 입력 중이라 멀쩡한 연결을 끊는 것일 수 있다. 다시 붙는 동안 스캔을 열면 옆의 다른
+        // SmartScreen PC 로 갈아탈 수 있으므로, recoverWindow 동안은 이 PC 에만 다시 붙는다.
+        recoverId = p.identifier
+        recoverGen += 1
+        let gen = recoverGen
+        DispatchQueue.main.asyncAfter(deadline: .now() + recoverWindow) { [weak self] in
+            self?.endRecover(gen)
+        }
         central.cancelPeripheralConnection(p)    // didDisconnect 가 다시 붙는다
     }
 
+    // 감시가 끊은 PC 에 recoverWindow 안에 다시 붙지 못했다 - 정말 자리를 떴을 수 있다.
+    // 그 PC 에 걸어 둔 connect 는 그대로 두고 다른 PC 도 찾기 시작한다.
+    private func endRecover(_ gen: Int) {
+        guard recoverId != nil, gen == recoverGen else { return }
+        recoverId = nil
+        startScanOrConnect()       // 그 사이 다시 붙었으면 그냥 돌아간다
+    }
+
     // MARK: CBPeripheralDelegate
+    //
+    // 콜백마다 지금 PC(pc)의 것인지 먼저 본다. 아니면 버린다 - 다른 PC 의 결과가 지금 연결의
+    // 감시 상태와 rssiChar 를 덮어쓰면 안 된다.
 
     func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
+        guard p.identifier == pc?.identifier else { return }
         if let svc = p.services?.first(where: { $0.uuid == kServiceUUID }) {
             discoverTries = 0
             skipUntil[p.identifier] = nil
@@ -502,12 +564,15 @@ final class LinkManager: NSObject, ObservableObject,
     }
 
     func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
-        guard service.uuid == kServiceUUID else { return }
+        guard p.identifier == pc?.identifier, service.uuid == kServiceUUID else { return }
         var gotTick = false
+        var rssi: CBCharacteristic?
         for ch in service.characteristics ?? [] {
             if ch.uuid == kTickUUID { p.setNotifyValue(true, for: ch); gotTick = true }
-            if ch.uuid == kRssiUUID { rssiChar = ch }
+            if ch.uuid == kRssiUUID { rssi = ch }
         }
+        // rediscover 가 남겨 둔 옛 특성은 여기서 바꾼다. 새 서비스에 없으면 비운다.
+        rssiChar = rssi
         guard gotTick else {
             linkText = "PC 특성 찾기 실패"
             // 1단계 복구가 실패했으면 바로 끊는다. 처음 붙은 것이면 감시가 60초 뒤 다시 찾는다
@@ -524,7 +589,7 @@ final class LinkManager: NSObject, ObservableObject,
     }
 
     func peripheral(_ p: CBPeripheral, didUpdateNotificationStateFor ch: CBCharacteristic, error: Error?) {
-        guard ch.uuid == kTickUUID, let error = error else { return }
+        guard p.identifier == pc?.identifier, ch.uuid == kTickUUID, let error = error else { return }
         linkText = "TICK 구독 실패: \(error.localizedDescription)"
         if softAt != nil { hardRecover(p) }       // 1단계 복구가 실패했다 - 기다리지 않고 끊는다
     }
@@ -546,7 +611,7 @@ final class LinkManager: NSObject, ObservableObject,
 
     // PC가 보낸 TICK -> 앱이 깨어남 -> RSSI 측정 요청
     func peripheral(_ p: CBPeripheral, didUpdateValueFor ch: CBCharacteristic, error: Error?) {
-        guard ch.uuid == kTickUUID else { return }
+        guard p.identifier == pc?.identifier, ch.uuid == kTickUUID else { return }
         if let d = ch.value, d.count >= 1 { seq = d[0] }
         // TICK 이 왔다 = PC 쪽 구독이 살아 있다. 감시를 처음으로 되돌린다.
         lastTickAt = Date()
@@ -557,7 +622,10 @@ final class LinkManager: NSObject, ObservableObject,
 
     // RSSI 측정 완료 -> PC로 전송
     func peripheral(_ p: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
-        guard error == nil, let ch = rssiChar else { return }
+        guard error == nil, p.identifier == pc?.identifier, let ch = rssiChar else { return }
+        // rssiChar 는 이 PC 의 것이어야 한다. 다른 PC 의 특성에 쓰면 이 PC 는 보고를 못 받는다.
+        // (주인을 모르면 - 서비스가 지워진 옛 특성 - 그대로 쓴다. 실패할 뿐이다.)
+        if let owner = ch.service?.peripheral, owner.identifier != p.identifier { return }
         let v = RSSI.intValue
         guard v < 0, v > -127 else { return }   // 127 = 측정 불가
         var bytes = [UInt8(bitPattern: Int8(clamping: v)), seq]
