@@ -493,14 +493,7 @@ final class AppController: NSObject, GuardEngineHost {
         // 타이머로 한 번 넘겨 GCD 블록 밖에서 띄운다 (알림이 떠 있는 동안 main 큐가 멎지 않게).
         if AdvScanner.shared.bluetoothDenied {
             EventLog.write("start: Bluetooth permission denied")
-            if !bluetoothDeniedShown {
-                bluetoothDeniedShown = true
-                _ = MainTimer.once(after: 0) { [weak self] in
-                    guard let self = self, !self.isExiting else { return }
-                    Alerts.warning("블루투스 권한이 없어요. 시스템 설정 > 개인정보 보호 및 보안 > 블루투스에서 "
-                                   + "SmartScreen 을 켜 주세요.", title: "SmartScreen")
-                }
-            }
+            noteBluetoothDenied()
         }
 
         cfg.btAddress = 0
@@ -640,10 +633,27 @@ final class AppController: NSObject, GuardEngineHost {
 
     // MARK: - 1 초 틱 (IDT_COUNTDOWN)
 
+    /// 블루투스 권한이 없다고 실행마다 한 번 말한다. [시작] 에서 이미 거부돼 있을 때와, 처음 [시작]
+    /// 이 띄운 macOS 의 허용 창에서 "허용 안 함" 을 누른 뒤(그때는 [시작] 이 이미 지나갔다 - 1 초
+    /// 틱이 알아챈다) 둘 다 여기로 온다.
+    private func noteBluetoothDenied() {
+        if bluetoothDeniedShown { return }
+        bluetoothDeniedShown = true
+        _ = MainTimer.once(after: 0) { [weak self] in
+            guard let self = self, !self.isExiting else { return }
+            Alerts.warning("블루투스 권한이 없어요. 시스템 설정 > 개인정보 보호 및 보안 > 블루투스에서 "
+                           + "SmartScreen 을 켜 주세요.", title: "SmartScreen")
+        }
+    }
+
     private func countdownTick() {
         guard monitoring else { return }
         // (Windows 는 여기서 스캐너가 배운 overflow 비트를 저장한다. CoreBluetooth 는 그 비트를
         //  보여 주지 않으므로 Mac 에는 저장할 것이 없다 - phoneOvfBit 는 늘 -1.)
+        if !bluetoothDeniedShown && AdvScanner.shared.bluetoothDenied {
+            EventLog.write("start: Bluetooth permission denied")
+            noteBluetoothDenied()
+        }
         let now = Mono.now()
         guardEngine.tick(now: now)
         countdownLabelText = Texts.countdownLabel(black: guardEngine.blackActive,

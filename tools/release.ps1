@@ -3,13 +3,15 @@
 #   release.bat              패치 번호를 하나 올리고 (1.1.1 -> 1.1.2) 메모를 묻는다
 #   release.bat 1.2.0        이 번호로
 #   release.bat -NoGit       커밋·푸시는 하지 않는다 (그러면 Mac 판도 못 한다 - 아래)
+#   release.bat -NoMac       Mac 단계를 건너뛴다 (Windows 만 - 급한 고침). Mac 은 나중에 release-mac.bat x.y.z
 #   release.bat -DryRun      게시·커밋 없이 빌드까지만 돌려 본다 (번호는 되돌린다)
 #   release-mac.bat 1.2.0    Mac 판만 (-MacOnly). Mac 단계가 실패했을 때 다시 하는 명령이다.
 #                            -DryRun 을 붙이면 CI 결과물을 받아 확인까지만 한다
 #
 # 순서: .env 읽기 -> version.h 올리기 -> 메모 -> 앱 정상 종료 -> do_build.bat ->
-#       Publish.exe -> make_dist + zip -> git commit/push -> 닫았던 앱 다시 띄우기 ->
-#       Mac: 방금 푸시한 커밋의 CI(mac.yml) 를 기다려 zip 을 받고 -> Publish.exe --platform mac
+#       Publish.exe -> make_dist + zip -> git commit/push -> 닫았던 앱 다시 띄우기 -> Windows 요약 ->
+#       Mac: 서버에 mac_releases 표가 있나 -> 방금 푸시한 커밋의 CI(mac.yml) 를 기다려 zip 을 받고 ->
+#       Publish.exe --platform mac
 #
 # 왜 이 순서인가: 앱이 떠 있으면 링크가 실패하고(exe 를 못 연다), 그러면 Publish.exe
 # 가 낡은 빌드라고 거절한다 - 그래서 종료가 빌드보다 먼저다. 빌드가 실패하면
@@ -27,6 +29,10 @@
 # Mac 단계는 앱을 다시 띄운 **뒤에** 한다 - CI 는 10분 넘게 걸린다. Mac 단계가 실패해도
 # Windows 릴리스는 그대로 둔다 - 이미 서버에 있고 PC 들이 받아 가고 있다. 되돌릴 까닭이 없다.
 # 대신 다시 할 명령(release-mac.bat x.y.z)을 그대로 찍는다. 필요한 것: gh + 'gh auth login' 한 번.
+# Windows 요약(기업 PC 의 [승인] 안내까지)은 Mac 단계 **앞에** 찍는다 - CI 를 기다리다 창을 닫아도
+# 본 뒤다. Mac 단계는 CI 를 기다리기 전에 서버에 mac_releases 표가 있는지 anon 으로 한 줄 묻는다.
+# 없으면 (supabase/mac_releases.sql 을 아직 안 돌렸다) 로그인도 기다림도 없이 바로 건너뛰고, 그건
+# Windows 릴리스의 실패가 아니다 (종료 코드 0). -NoMac 이면 묻지도 않고 건너뛴다.
 #
 # PowerShell 5.1 함정 넷: (1) $null 을 string 매개변수에 넘기면 "" 가 된다 - FindWindow
 # 의 제목 인자는 IntPtr 로 받는다. (2) 네이티브 명령의 stderr 는 오류 레코드가 되고,
@@ -38,13 +44,16 @@
 # 새로 생겼는지와 Publish.exe --version 이 새 번호인지를 따로 본다. 보고를 믿지 않는다.
 # (4) 거꾸로, 네이티브 명령에 넘기는 인자 **안의** " 는 escape 하지 않는다 (따옴표 상태를
 # 제멋대로 센다). 메모에 "..." 가 있으면 Publish.exe 의 인자가 갈라져 "모르는 인자" 로 게시가
-# 멈췄다. 그래서 Publish.exe 는 명령줄을 직접 만들어 띄운다 (Invoke-Native).
+# 멈췄다. 그래서 Publish.exe 는 명령줄을 직접 만들어 띄운다 (Invoke-Native). git commit 에는
+# 메모를 인자로 넘기지 않는다 (git 도 같은 식으로 갈라 나머지를 pathspec 으로 읽고, Windows 를
+# 게시한 **뒤에** 커밋이 실패했다) - 임시 파일(UTF-8, BOM 없음)에 적어 'git commit -F' 로 준다.
 #
 # 한글이 있으므로 이 파일은 UTF-8 BOM 으로 저장돼 있어야 한다 (NEXT_SESSION.md 함정).
 param(
     [string]$Version = "",
     [string]$Notes = "",
     [switch]$NoGit,
+    [switch]$NoMac,
     [switch]$DryRun,
     [switch]$MacOnly
 )
@@ -202,6 +211,41 @@ function Get-WindowsNotes([string]$url, [string]$key, [string]$ver) {
     return ""
 }
 
+# 서버에 mac_releases 표가 있나. CI 를 기다리고 로그인하기 **전에** anon 으로 한 줄만 묻는다 -
+# 표가 없으면 그걸 Publish.exe 가 알게 되는 것은 15분 기다리고 브라우저 로그인을 한 뒤다.
+#   'present'  있다 (200 - 행이 없거나 안 보여도 [] 다)
+#   'missing'  없다: 404, 또는 PGRST205 (schema cache 에 없다) / 42P01 (relation 이 없다)
+#   그 밖     "unknown: <까닭>" - 못 물었다 (네트워크, 5xx, 권한). 부르는 쪽은 Mac 단계를 그대로
+#             한다 - 표가 정말 없으면 거기서 다시 드러난다.
+function Test-MacTable([string]$url, [string]$key) {
+    try {
+        $req = @{ Method = 'Get'; TimeoutSec = 15; UseBasicParsing = $true
+                  Uri = "$url/rest/v1/mac_releases?select=version&limit=1"
+                  Headers = @{ apikey = $key; Authorization = "Bearer $key" } }
+        [void](Invoke-WebRequest @req)
+        return 'present'
+    } catch {
+        # 안쪽 try/catch 가 $_ 를 바꾸므로 먼저 잡아 둔다.
+        $err = $_
+        $status = 0; $body = ''
+        $resp = $err.Exception.Response
+        if ($resp) { try { $status = [int]$resp.StatusCode } catch { } }
+        # 5.1 은 오류 응답의 본문을 ErrorDetails 에 담는다. 없으면 스트림을 직접 읽는다.
+        if ($err.ErrorDetails -and $err.ErrorDetails.Message) { $body = [string]$err.ErrorDetails.Message }
+        elseif ($resp) {
+            try {
+                $sr = New-Object IO.StreamReader($resp.GetResponseStream())
+                try { $body = $sr.ReadToEnd() } finally { $sr.Dispose() }
+            } catch { }
+        }
+        if ($status -eq 404 -or $body -match 'PGRST205|42P01') { return 'missing' }
+        $b = ($body -replace '\s+', ' ').Trim()
+        if ($b.Length -gt 200) { $b = $b.Substring(0, 200) + '...' }
+        if ($status -gt 0) { return "unknown: HTTP $status $b".Trim() }
+        return "unknown: $($err.Exception.Message)"
+    }
+}
+
 # Mac 판 하나를 끝까지: CI 실행 찾기 -> 기다리기 -> artifact 받기 -> 번호 확인 -> 복사 -> 게시.
 # 실패는 Fail (throw) - 부르는 쪽이 "Windows 는 그대로" 와 다시 할 명령을 찍는다.
 function Invoke-MacRelease([string]$ver, [string]$notes, [string]$url, [string]$key,
@@ -307,6 +351,16 @@ if ($MacOnly) {
         if ($LASTEXITCODE -ne 0) { & "$root\build\Publish.exe" --selftest; Fail "Publish.exe --selftest 실패" }
         Ok $macVer
 
+        # 표가 없으면 CI 를 기다리고 로그인한 뒤에야 Publish.exe 가 멈춘다 - 먼저 묻는다.
+        # DryRun 은 게시하지 않으므로 표가 없어도 된다.
+        if (-not $DryRun) {
+            $tbl = Test-MacTable $url $key
+            if ($tbl -eq 'missing') {
+                Fail "서버에 mac_releases 표가 없다. supabase/mac_releases.sql 을 Supabase 대시보드 > SQL Editor 에서 한 번 돌린 뒤 다시"
+            }
+            if ($tbl -ne 'present') { Note "mac_releases 표를 확인하지 못했다 ($($tbl.Substring(9))) - 그대로 한다" }
+        }
+
         if (-not $Notes) {
             $Notes = Get-WindowsNotes $url $key $macVer
             if ($Notes) { Note ("메모: Windows $macVer 과 같은 것 - " + ($Notes -split "`n")[0]) }
@@ -343,6 +397,7 @@ $script:oldVer = ""; $script:newVer = ""
 $script:published = $false        # 게시가 됐으면 번호를 두지, 되돌리지 않는다
 $script:winPublished = $false     # Windows 판이 정말 서버에 올라갔다
 $script:pushed = $false           # 이번에 커밋을 만들어 푸시했다 (Mac CI 가 그걸로 돈다)
+$script:commitFailed = $false     # 게시 뒤 커밋이 실패했다 (마무리 명령은 그 [X] 에 이미 찍었다)
 $script:closedPath = $null        # 우리가 닫은 앱의 경로
 $script:relaunched = $false
 $exitCode = 0
@@ -477,8 +532,25 @@ try {
             if ($status) {
                 Write-Host ($status -join "`n")
                 git add -A
-                git commit -q -m "Release $script:newVer" -m $Notes
-                if ($LASTEXITCODE -ne 0) { Fail "커밋 실패" }
+                # 메모는 인자로 넘기지 않는다 (머리말 함정 4 - git 도 따옴표에서 갈라 나머지를
+                # pathspec 으로 읽는다). 파일에 UTF-8(BOM 없음)로 적어 -F 로 준다.
+                $msgFile = Join-Path $env:TEMP ("smartscreen-release-msg-$script:newVer-" + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.txt')
+                $msgText = "Release $script:newVer`n`n" + (($Notes -replace "`r`n", "`n") -replace "`r", "`n") + "`n"
+                [IO.File]::WriteAllText($msgFile, $msgText, $utf8)
+                git commit -q -F $msgFile
+                $commitRc = $LASTEXITCODE
+                if ($commitRc -ne 0) {
+                    # 메시지 파일은 남긴다 - 손으로 하는 커밋이 같은 메시지를 쓰도록 (메모를 명령줄에
+                    # 다시 적으면 같은 따옴표 문제가 난다).
+                    $script:commitFailed = $true
+                    Fail ("커밋 실패 (git exit $commitRc - 위의 git 메시지를 보라).`n" +
+                          "    Windows $script:newVer 은 이미 게시됐다 - 서버에 있고 PC 들이 받아 간다. 바뀐 것은 전부 stage 돼 있다.`n" +
+                          "    release.bat 을 다시 돌리지 말 것 (번호가 하나 더 오른다). 원인을 고친 뒤 저장소 맨 위에서 이 순서로:`n" +
+                          "      git commit -F `"$msgFile`"`n" +
+                          "      git push`n" +
+                          "      release-mac.bat $script:newVer")
+                }
+                Remove-Item -LiteralPath $msgFile -Force -ErrorAction SilentlyContinue
                 git push
                 if ($LASTEXITCODE -ne 0) { Fail "푸시 실패 (커밋은 됐다). 네트워크를 보고 'git push' 를 다시" }
                 $script:pushed = $true
@@ -511,48 +583,63 @@ finally {
     }
 }
 
-# ---------------------------------------------------------------- Mac 판
-# Windows 가 끝까지 됐을 때만 (게시 + 푸시). 앱은 위에서 이미 다시 띄웠다.
+# ---------------------------------------------------------------- Windows 요약
+# Mac 단계 **앞에** 찍는다. Mac 은 CI 를 10분 넘게 기다린다 - 그동안 창을 닫아도 [승인] 안내는
+# 이미 본 뒤다. 앱은 위에서 이미 다시 띄웠다.
 $winDone = ($exitCode -eq 0 -and -not $DryRun)
-$macState = ''
 $macCmd = "release-mac.bat $script:newVer"
+$approveWin = "기업 PC 는 대시보드 > 프로그램 업데이트 > Windows > $script:newVer [승인] 을 눌러야 받는다."
 if ($winDone) {
-    if ($NoGit) {
-        $macState = 'skipped'
-    } else {
-        try {
-            Invoke-MacRelease $script:newVer $Notes $url $key $script:pushed $false $false
-            $macState = 'ok'
-        }
-        catch {
-            $msg = "$_"
-            if ($msg -like 'RELEASE_FAIL: *') { $msg = $msg.Substring(14) }
-            Write-Host ""
-            Write-Host "[X] Mac: $msg" -ForegroundColor Red
-            Write-Host "    Windows $script:newVer 은 게시됐다 - 그대로 둔다."
-            Write-Host "    원인을 고친 뒤 Mac 만 다시:  $macCmd"
-            $macState = 'failed'
-            $exitCode = 1
-        }
-    }
-} elseif ($script:winPublished) {
+    Write-Host ""
+    Write-Host "끝 (Windows). $script:newVer 이 서버에 있다." -ForegroundColor Green
+    Write-Host "개인 PC 는 한 시간 안에 띠가 뜬다 (버전 단추를 누르면 바로)."
+    Write-Host $approveWin
+} elseif ($script:winPublished -and -not $script:commitFailed) {
     # Windows 는 서버에 올라갔는데 그 뒤(dist, 커밋, 푸시)에서 멈췄다. Mac CI 는 푸시된 커밋이 있어야 돈다.
+    # (커밋 실패는 그 [X] 에 마무리 명령을 이미 찍었다.)
     Write-Host "    Mac 판은 하지 않았다. 위를 고치고 푸시한 뒤 Mac 만:  $macCmd"
 }
 
+# ---------------------------------------------------------------- Mac 판
+# Windows 가 끝까지 됐을 때만 (게시 + 푸시). 건너뛰는 것은 실패가 아니다 (종료 코드 그대로).
 if ($winDone) {
-    Write-Host ""
-    if ($macState -eq 'ok') { Write-Host "끝. $script:newVer 이 서버에 있다 (Windows + Mac)." -ForegroundColor Green }
-    else { Write-Host "끝. $script:newVer 이 서버에 있다 (Windows)." -ForegroundColor Green }
-    Write-Host "개인 PC 는 한 시간 안에 띠가 뜬다 (버전 단추를 누르면 바로)."
-    Write-Host "기업 PC 는 대시보드 > 프로그램 업데이트 > Windows > $script:newVer [승인] 을 눌러야 받는다."
-    if ($macState -eq 'ok') {
-        Write-Host "기업 Mac 은 같은 곳의 Mac > $script:newVer [승인] 을 따로 눌러야 받는다."
-        Write-Host "새로 까는 Mac 은 저장소 맨 위의 SmartScreen-mac.zip 을 쓴다."
-    } elseif ($macState -eq 'skipped') {
+    if ($NoMac) {
+        Write-Host ""
+        Write-Host "Mac 판은 건너뛰었다 (-NoMac). 나중에 Mac 만:  $macCmd" -ForegroundColor Yellow
+    } elseif ($NoGit) {
+        Write-Host ""
         Write-Host "Mac 판은 건너뛰었다 (-NoGit: CI 는 푸시된 커밋만 빌드한다). 푸시한 뒤 Mac 만:  $macCmd" -ForegroundColor Yellow
-    } elseif ($macState -eq 'failed') {
-        Write-Host "Mac 판은 올라가지 않았다 (위의 [X] Mac). 다시:  $macCmd" -ForegroundColor Yellow
+    } else {
+        $tbl = Test-MacTable $url $key
+        if ($tbl -eq 'missing') {
+            # supabase/mac_releases.sql 을 아직 안 돌렸다. CI 를 기다리고 로그인해 봐야 Publish.exe 가
+            # 같은 것을 말하고 멈춘다 - 바로 건너뛴다. Windows 릴리스는 이것과 상관없이 끝났다.
+            Write-Host ""
+            Write-Host "Mac 판은 건너뛰었다: 서버에 mac_releases 표가 아직 없다." -ForegroundColor Yellow
+            Write-Host "  supabase/mac_releases.sql 을 Supabase 대시보드 > SQL Editor 에서 한 번 돌린 뒤 Mac 만:  $macCmd" -ForegroundColor Yellow
+        } else {
+            if ($tbl -ne 'present') { Note "mac_releases 표를 확인하지 못했다 ($($tbl.Substring(9))) - Mac 단계를 그대로 한다" }
+            Write-Host ""
+            Write-Host "Mac 판으로 넘어간다 (CI 를 기다리느라 보통 10~20분). Windows 는 위에서 끝났다 -"
+            Write-Host "여기서 창을 닫아도 Windows 는 그대로다. 그때는 나중에 Mac 만:  $macCmd"
+            try {
+                Invoke-MacRelease $script:newVer $Notes $url $key $script:pushed $false $false
+                Write-Host ""
+                Write-Host "끝. $script:newVer 이 서버에 있다 (Windows + Mac)." -ForegroundColor Green
+                Write-Host "기업 Mac 은 대시보드 > 프로그램 업데이트 > Mac > $script:newVer [승인] 을 Windows 와 따로 눌러야 받는다."
+                Write-Host "새로 까는 Mac 은 저장소 맨 위의 SmartScreen-mac.zip 을 쓴다."
+                Write-Host "(잊지 말 것) $approveWin"
+            }
+            catch {
+                $msg = "$_"
+                if ($msg -like 'RELEASE_FAIL: *') { $msg = $msg.Substring(14) }
+                Write-Host ""
+                Write-Host "[X] Mac: $msg" -ForegroundColor Red
+                Write-Host "    Windows $script:newVer 은 게시됐다 - 그대로 둔다. $approveWin"
+                Write-Host "    원인을 고친 뒤 Mac 만 다시:  $macCmd" -ForegroundColor Yellow
+                $exitCode = 1
+            }
+        }
     }
 }
 exit $exitCode

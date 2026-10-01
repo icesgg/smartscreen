@@ -37,7 +37,7 @@
 --     LSMinimumSystemVersion)과 같고, Publish.exe 는 보내지 않는다. 나중에 배포 대상을 올리면
 --     낮은 macOS 의 Mac 이 그 행을 "새 버전" 으로 보지 않게 하는 자리다. 클라이언트가 이 열을
 --     select 해도, 안 해도 된다.
---   * 권한은 필요한 것만 남긴다 (아래 "권한").
+--   * 권한은 필요한 것만 남긴다 (아래 "권한"). release_admins 의 쓰기 권한도 여기서 걷는다.
 --
 -- 버킷은 새로 만들지 않는다. 같은 'releases' 버킷의 mac/ 아래에 둔다. 버킷 정책
 -- (releases.sql 의 anyone_downloads_releases / admins_upload_releases / admins_replace_releases /
@@ -193,7 +193,13 @@ create policy "org_admins_revoke_mac"
 -- release_admins 의 select 는 releases.sql 이 이미 anon 에 줬다: 위의 select 정책이
 -- release_admins 를 하위 질의로 읽고, 그 권한 검사는 부르는 역할(anon)로 한다 - 없으면 로그인
 -- 없는 Mac 의 확인이 "permission denied for table release_admins" 로 끝난다. 한 번 더 준다 (해가 없다).
+-- release_admins 의 쓰기 권한은 걷는다. 이 표는 SQL Editor 에서(postgres 로)만 고친다 - 누가 모든
+-- PC 와 Mac 에 실행 파일을 밀어 넣을 수 있는지를 정하는 표다. RLS 에 insert / update / delete
+-- 정책이 없어서 지금도 쓸 수는 없지만, releases.sql 은 이 표의 권한을 걷지 않았고 라이브는 새 표에
+-- anon / authenticated 의 모든 권한을 준다 (schema.sql 의 같은 자리). 걷어야 아래 "확인" 의
+-- "anon 은 select 만" 이 사실이 된다. 정책이 잘못 더해져도 권한에서 한 번 더 막힌다.
 revoke all on public.mac_releases, public.org_mac_release_approvals from anon, authenticated;
+revoke insert, update, delete, truncate on public.release_admins from anon, authenticated;
 grant select on public.release_admins to anon, authenticated;
 grant select on public.mac_releases, public.org_mac_release_approvals to anon, authenticated;
 grant insert, update, delete on public.mac_releases to authenticated;
@@ -230,7 +236,10 @@ notify pgrst, 'reload schema';
 -- rls         : 두 표 다 rls_enabled = true
 -- grants      : anon 은 select 만 (mac_releases, org_mac_release_approvals, release_admins).
 --               authenticated 는 mac_releases 에 select/insert/update/delete,
---               org_mac_release_approvals 에 select/insert/delete (update 없음)
+--               org_mac_release_approvals 에 select/insert/delete (update 없음),
+--               release_admins 에 select 만 (위 3번의 revoke - 이 파일을 돌리기 전에는
+--               라이브가 준 insert/update/delete 가 true 로 보였다. 그래도 RLS 에 쓰기 정책이
+--               없어 쓸 수는 없었다)
 -- releases_bucket_policies : 넷. 조건에 bucket_id = 'releases' 와 release_admins 만 있고
 --               경로(name)는 없어야 한다 - 그래야 mac/ 아래도 같은 규칙이다
 -- releases_paths : 지금 Windows 행들. 전부 '<버전>/SmartScreen.exe'

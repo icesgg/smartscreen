@@ -360,13 +360,19 @@ final class LockScreen {
         }
     }
 
+    /// Windows 는 exe 옆의 images\ 를 본다. Mac 의 그 자리(앱 묶음 안)는 서명돼 있고 업데이트마다
+    /// 통째로 바뀌므로 사람이 그림을 넣어 둘 곳이 못 된다. 그래서 설정 폴더의 images/ 를 먼저 보고,
+    /// 그다음 묶음 안을 본다 (설치 안내.txt 9장).
     private static func fallbackImage(_ base: String) -> NSImage? {
-        guard let dir = Bundle.main.resourceURL?.appendingPathComponent("images", isDirectory: true) else {
-            return nil
+        var dirs: [URL] = [Paths.configDir.appendingPathComponent("images", isDirectory: true)]
+        if let res = Bundle.main.resourceURL {
+            dirs.append(res.appendingPathComponent("images", isDirectory: true))
         }
-        for ext in ["png", "jpg", "bmp", "jpeg"] {
-            if let img = decode(path: dir.appendingPathComponent("\(base).\(ext)").path) {
-                return img
+        for dir in dirs {
+            for ext in ["png", "jpg", "bmp", "jpeg"] {
+                if let img = decode(path: dir.appendingPathComponent("\(base).\(ext)").path) {
+                    return img
+                }
             }
         }
         return nil

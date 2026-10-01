@@ -10,10 +10,12 @@ import SmartScreenCore
 //   확인    mac_releases (+ 기업 PC 는 org_mac_release_approvals) 를 anon 키로 읽는다
 //   받기    update/SmartScreen-<버전>.zip 으로 흘려 받으며 SHA-256 을 같이 잰다. 크기와 해시가 행과
 //           같아야 한다. 맞으면 ditto 로 update/staged-<버전> 에 풀고, 풀린 SmartScreen.app 의 번들
-//           id 와 버전이 행과 같은지 본다 (Windows 에는 없는 단계 - 파일이 zip 이다)
+//           id 와 버전이 행과 같은지, 그 앱의 LSMinimumSystemVersion 이 이 macOS 이하인지 본다
+//           (Windows 에는 없는 단계 - 파일이 zip 이다). 서버 행의 min_macos 가 더 높은 버전은 확인
+//           단계에서 아예 후보가 되지 않는다.
 //   적용    자기 실행 파일을 update/updater 로 복사해 `--apply-update` 로 띄우고 정상 종료한다.
-//           복사본이 이 프로세스가 끝나기를 기다렸다가 SmartScreen.app 을 .bak 으로 옮기고 새 앱을
-//           놓고 다시 띄운다.
+//           복사본이 이 프로세스가 끝나기를 기다렸다가 새 앱을 SmartScreen.app 옆의 숨은 자리
+//           (.SmartScreen.app.incoming) 에 놓고 확인한 뒤, 한 번에 맞바꾸고 (예전 앱은 .bak) 다시 띄운다.
 //
 // 실행 중인 exe 는 자기를 덮어쓸 수 없다는 Windows 의 사정은 Mac 에는 없다 (돌고 있는 실행 파일도
 // 이름을 바꿀 수 있다). 그래도 같은 구조로 둔다: 묶음은 폴더라서 도는 중에 반쯤 바뀐 앱이 남으면
@@ -165,8 +167,9 @@ enum Updater {
             failMarked(c.version, UpdateText.noPermission)
             return (false, UpdateText.noPermission)
         }
-        // 받은 zip 은 내려받을 때 풀어서 확인해 뒀다. 그 사이 누가 지웠으면 다시 푼다.
-        if !Disk.appMatches(Disk.stagedApp(c.version), ver: c.version) {
+        // 받은 zip 은 내려받을 때 풀어서 확인해 뒀다. 그 사이 누가 지웠거나 바뀌었으면 다시 푼다.
+        // 다시 푼 것도 안 맞으면 (이 macOS 에서 못 뜨는 앱 포함) 앱을 끄기 전에 여기서 멈춘다.
+        if Disk.checkApp(Disk.stagedApp(c.version), ver: c.version) != nil {
             if let why = Disk.stage(zip: URL(fileURLWithPath: snap.zip), ver: c.version) {
                 failMarked(c.version, why)
                 return (false, why)
@@ -228,6 +231,18 @@ enum Updater {
                     EventLog.write("update: removed \(bak.path) (new build started fine)")
                 } catch {
                     // 지우지 못했으면 다음에 켤 때 다시 본다
+                }
+            }
+            // 복사본이 새 앱을 먼저 놓는 숨은 자리. 남아 있으면 끊긴 적용의 찌꺼기이거나, 맞바꾼 뒤
+            // .bak 으로 못 옮긴 예전 앱이다. 더 새 버전이 들어 있으면 둔다 (shouldRemoveIncoming).
+            let incoming = Disk.incomingURL(forApp: bundle)
+            if fm.fileExists(atPath: incoming.path)
+                && UpdateLogic.shouldRemoveIncoming(version: Disk.bundleInfo(incoming)?.version, running: running) {
+                do {
+                    try fm.removeItem(at: incoming)
+                    EventLog.write("update: removed \(incoming.path) (left over from an update)")
+                } catch {
+                    // 지우지 못했으면 다음에 켤 때, 또는 다음 적용이 쓰기 전에 다시 지운다
                 }
             }
         }
@@ -354,9 +369,13 @@ enum Updater {
             approved = UpdateLogic.approvedVersions(a.body)
         }
 
-        let scan = UpdateLogic.scan(r.body, enterprise: enterprise, approved: approved, current: cur)
+        let scan = UpdateLogic.scan(r.body, enterprise: enterprise, approved: approved, current: cur,
+                                    macOS: ProcessInfo.processInfo.operatingSystemVersion)
         for v in scan.malformed {
             EventLog.write("update: skipping malformed row (version '\(v)')")
+        }
+        for s in scan.osSkipped {
+            EventLog.write(s.logLine)                     // "update: skipping <ver> (needs macOS <x>)"
         }
         // 지난번에 이 버전을 적용하다 실패했나 (더 새 버전에는 기록이 없으니 그대로 진행한다)
         var failedWhy: String? = nil
@@ -465,6 +484,12 @@ extension Updater {
             return stagedDir(ver).appendingPathComponent(UpdateLogic.appBundleName, isDirectory: true)
         }
 
+        /// 복사본이 새 앱을 먼저 놓는 숨은 자리: app 과 같은 폴더의 .SmartScreen.app.incoming.
+        static func incomingURL(forApp app: URL) -> URL {
+            return app.deletingLastPathComponent()
+                .appendingPathComponent(UpdateLogic.incomingName, isDirectory: true)
+        }
+
         // ---- 실패 기록 ----
 
         static func markerURL(_ ver: String) -> URL? {
@@ -490,13 +515,19 @@ extension Updater {
 
         // ---- 묶음 ----
 
-        /// Contents/Info.plist 의 번들 id, 버전, 실행 파일 이름.
-        static func bundleInfo(_ app: URL) -> (id: String, version: String, executable: String)? {
+        /// Contents/Info.plist 를 사전으로 (없거나 못 읽으면 nil).
+        private static func infoPlist(_ app: URL) -> [String: Any]? {
             let plist = app.appendingPathComponent("Contents", isDirectory: true)
                 .appendingPathComponent("Info.plist", isDirectory: false)
             guard let data = try? Data(contentsOf: plist),
-                  let obj = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
-                  let dict = obj as? [String: Any] else { return nil }
+                  let obj = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)
+            else { return nil }
+            return obj as? [String: Any]
+        }
+
+        /// Contents/Info.plist 의 번들 id, 버전, 실행 파일 이름.
+        static func bundleInfo(_ app: URL) -> (id: String, version: String, executable: String)? {
+            guard let dict = infoPlist(app) else { return nil }
             let id = dict["CFBundleIdentifier"] as? String ?? ""
             let ver = dict["CFBundleShortVersionString"] as? String ?? ""
             let exe = dict["CFBundleExecutable"] as? String ?? UpdateLogic.executableName
@@ -513,6 +544,25 @@ extension Updater {
                 .appendingPathComponent("MacOS", isDirectory: true)
                 .appendingPathComponent(info.executable, isDirectory: false)
             return access(exe.path, X_OK) == 0
+        }
+
+        /// 그 앱을 이 Mac 의 macOS 로 띄울 수 있나. 못 띄우면 실패 이유, 되면 nil.
+        /// LaunchServices 는 LSMinimumSystemVersion 이 지금 macOS 보다 높은 앱을 열지 않는다. 바꾼 뒤에야
+        /// 알면 예전 앱은 .bak 에 있고 새 앱은 안 떠서 아무것도 화면을 지키지 않는다. 서버의 min_macos
+        /// 열은 Publish.exe 가 보내지 않아 기본값('13.0') 그대로일 수 있으므로, 묶음 자체를 본다.
+        /// 값이 없거나 모양이 틀리면 제약이 없는 것으로 본다 (UpdateLogic.unmetMacOS).
+        static func macOSProblem(_ app: URL) -> String? {
+            let minimum = infoPlist(app)?["LSMinimumSystemVersion"] as? String
+            guard let need = UpdateLogic.unmetMacOS(minimum, running: ProcessInfo.processInfo.operatingSystemVersion)
+            else { return nil }
+            return UpdateText.needsNewerMacOS(need)
+        }
+
+        /// 놓아도 되는 앱인가: 그 버전의 우리 앱이고 (appMatches), 이 macOS 에서 뜬다 (macOSProblem).
+        /// 되면 nil, 아니면 실패 기록에 들어갈 이유.
+        static func checkApp(_ app: URL, ver: String) -> String? {
+            if !appMatches(app, ver: ver) { return UpdateText.appMismatch }
+            return macOSProblem(app)
         }
 
         /// 받은 zip 을 update/staged-<ver> 에 새로 풀고 안의 SmartScreen.app 을 확인한다.
@@ -534,9 +584,11 @@ extension Updater {
                 try? fm.removeItem(at: dir)
                 return UpdateText.noAppInZip
             }
-            if !appMatches(app, ver: ver) {
+            // 이 macOS 에서 못 뜨는 앱도 여기서 거른다: 앱 쪽은 이 이유를 실패 기록으로 남겨(failMarked)
+            // 띠에 보이고, 기업 PC 가 같은 버전을 한 시간마다 다시 받지 않는다.
+            if let why = checkApp(app, ver: ver) {
                 try? fm.removeItem(at: dir)
-                return UpdateText.appMismatch
+                return why
             }
             return nil
         }

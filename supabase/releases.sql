@@ -133,6 +133,12 @@ alter table org_release_approvals enable row level security;
 -- 질의로 읽고, 그 권한 검사는 부르는 역할(anon)로 한다 - 없으면 로그인 없는 PC 의
 -- 업데이트 확인이 "permission denied for table release_admins" 로 끝난다. anon 에게
 -- 보이는 줄은 없다 (release_admins 의 정책이 authenticated 뿐이다).
+-- release_admins 의 쓰기 권한은 걷는다. 이 표는 SQL Editor 에서(postgres 로)만 고친다 (위의
+-- "insert/update/delete 정책은 없다"). 정책이 없어 지금도 못 쓰지만, 새 표에 anon / authenticated
+-- 의 모든 권한을 주는 프로젝트(라이브가 그렇다 - schema.sql)에서는 권한이 그대로 남는다. 걷어야
+-- "anon / authenticated 는 select 만" 이 사실이 되고, 정책이 잘못 더해져도 한 번 더 막힌다.
+-- 맨 아래 "관리자 지정" 은 SQL Editor 의 postgres 로 돌므로 이것과 상관없다.
+revoke insert, update, delete, truncate on release_admins from anon, authenticated;
 grant select on release_admins to anon, authenticated;
 grant select on releases, org_release_approvals to anon, authenticated;
 grant insert, update, delete on releases to authenticated;

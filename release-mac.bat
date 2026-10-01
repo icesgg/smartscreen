@@ -15,7 +15,9 @@ REM   release-mac.bat 1.1.8 -Notes "..."    default: the notes of Windows 1.1.8
 REM
 REM Needs the GitHub CLI (https://cli.github.com) and "gh auth login" once.
 REM HEAD must be pushed, and build\Publish.exe must be built from the same
-REM client/version.h.
+REM client/version.h. The server needs the mac_releases table: run
+REM supabase/mac_releases.sql once in the Supabase SQL Editor. Without it this
+REM stops at once, before waiting for CI (except with -DryRun).
 REM
 REM ASCII only: cmd.exe reads .bat in the system codepage.
 

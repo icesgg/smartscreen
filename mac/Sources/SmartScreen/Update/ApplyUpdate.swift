@@ -18,6 +18,10 @@ import SmartScreenCore
 // staged-<버전>/SmartScreen.app 그 자리, dst 의 이름은 SmartScreen.app, 그리고 zip 의 해시가 --sha 와
 // 같아야 한다. zip 은 해시를 잰 직후 그 zip 에서 다시 풀어 놓는다 - update 폴더에 놓여 있던 사이에
 // 풀린 묶음이 바뀌었어도, 놓이는 것은 방금 잰 바이트에서 나온 것이다.
+//
+// 놓는 순서 (dst 에는 언제나 온전한 앱이 있게): 푼 앱 → dst 옆의 숨은 .SmartScreen.app.incoming
+// (같은 볼륨이면 이름 바꾸기, 아니면 ditto) → 그 자리에서 검사 (버전·번들 id, 이 macOS 에서 뜨는지)
+// → renamex_np(RENAME_SWAP) 로 dst 와 맞바꾸기 → 예전 앱(이제 incoming 자리)을 .bak 으로.
 
 extension Updater {
     /// `--apply-update ...` 진입점. args 는 CommandLine.arguments 그대로여도, "--apply-update" 뒤의
@@ -26,7 +30,7 @@ extension Updater {
         guard let a = ApplyArgs.parse(args) else { return 2 }
 
         // 원래 앱이 끝나면서 이 프로세스를 데려가지 않게: 자기 세션을 만들고, 끊김 신호를 무시한다.
-        // 바꾸는 도중(.bak 으로 옮긴 뒤, 새 앱을 놓기 전)에 끝나면 그 자리에 앱이 없다.
+        // 맞바꾸기(RENAME_SWAP)가 없는 볼륨에서는 두 번의 이름 바꾸기 사이에 끝나면 그 자리에 앱이 없다.
         _ = setsid()
         _ = signal(SIGHUP, SIG_IGN)
         _ = signal(SIGTERM, SIG_IGN)
@@ -105,75 +109,141 @@ extension Updater {
         let staged = Disk.stagedApp(ver)
         EventLog.write("update: applier staged \(zip.path) -> \(staged.path)")
 
-        // 예전 앱을 .bak 으로. 같은 폴더라 이름 바꾸기 한 번이고, 되돌리기도 이름 바꾸기 한 번이다.
-        // .bak 은 묶음 확장자가 아니라서 LaunchServices 와 Spotlight 가 앱으로 보지 않는다.
+        // 1) 새 앱을 먼저 dst 옆의 숨은 자리(<폴더>/.SmartScreen.app.incoming)에 놓는다. dst 와 같은
+        // 볼륨이라 아래의 바꾸기는 언제나 이름 바꾸기다. update 폴더와 앱이 다른 볼륨이면 여기서 복사가
+        // 일어나는데, 그동안 dst 는 손대지 않은 예전 앱 그대로다. (예전에는 .bak 으로 옮긴 뒤 dst 로 바로
+        // 복사해서, 그 몇 초 사이에 로그아웃이나 전원이 끊기면 dst 에 앱이 없거나 반쯤 복사된 앱이
+        // 남았다 - SIGTERM 을 무시해도 launchd 는 SIGKILL 로 끝낸다.)
         let fm = FileManager.default
+        let incoming = Disk.incomingURL(forApp: dst)
         let bak = URL(fileURLWithPath: dst.path + ".bak", isDirectory: true)
+        try? fm.removeItem(at: incoming)          // 지난번에 끊긴 적용이 남긴 것
+        if rename(staged.path, incoming.path) != 0 {
+            let e = errno
+            if e != EXDEV {
+                return Applier.applyFailed(ver, Applier.permissionText(e) ?? UpdateText.placeFailed(Int(e)),
+                                           dst: dst, relaunch: a.relaunch)
+            }
+            // 다른 볼륨: ditto 로 복사한다 (묶음 안의 링크·실행 비트·확장 속성을 그대로).
+            if !Disk.runTool("/usr/bin/ditto", [staged.path, incoming.path], timeout: 300) {
+                try? fm.removeItem(at: incoming)
+                // ditto 는 errno 를 주지 않는다. 가장 흔한 이유(폴더에 쓸 수 없다)만 가려 말하고, 나머지는
+                // 복사로 가게 만든 오류(EXDEV)의 번호를 적는다.
+                let why = access(dst.deletingLastPathComponent().path, W_OK) != 0
+                    ? UpdateText.noPermission : UpdateText.placeFailed(Int(EXDEV))
+                return Applier.applyFailed(ver, why, dst: dst, relaunch: a.relaunch)
+            }
+        }
+
+        // 격리 표시가 붙어 있으면 Gatekeeper 가 새 앱을 처음 받은 앱처럼 막는다. URLSession 이 받은
+        // 파일에는 보통 붙지 않지만, 붙어 있으면 지운다 (실패해도 상관없다). dst 에 놓기 전에 한다.
+        Disk.runTool("/usr/bin/xattr", ["-dr", "com.apple.quarantine", incoming.path], timeout: 60)
+
+        // 2) 놓인 자리에서 다시 본다 (바꾸기 직전의 검사): 그 버전의 우리 앱이고, 이 macOS 에서 뜨는가.
+        // 여기서 걸리면 dst 는 아직 손대지 않았다.
+        if !Disk.appMatches(incoming, ver: ver) {
+            try? fm.removeItem(at: incoming)
+            return Applier.applyFailed(ver, UpdateText.placedButDiffers, dst: dst, relaunch: a.relaunch)
+        }
+        if let why = Disk.macOSProblem(incoming) {
+            try? fm.removeItem(at: incoming)
+            return Applier.applyFailed(ver, why, dst: dst, relaunch: a.relaunch)
+        }
+
+        // 3) 바꾼다. APFS 는 renamex_np(RENAME_SWAP) 로 두 이름을 한 번에 맞바꾼다 - dst 에는 언제나
+        // 온전한 앱이 있다 (그 전엔 예전 앱, 그 뒤엔 새 앱). 그러면 incoming 자리에 예전 앱이 오고, 그걸
+        // .bak 으로 옮긴다. 맞바꾸기가 없는 볼륨(HFS+, exFAT, 네트워크 - ENOTSUP/EINVAL)에서는 Windows 와
+        // 같은 두 번의 이름 바꾸기다: dst → .bak, incoming → dst (같은 볼륨이라 그 틈은 아주 짧다).
+        // .bak 은 묶음 확장자가 아니라서 LaunchServices 와 Spotlight 가 앱으로 보지 않는다.
         try? fm.removeItem(at: bak)
-        var moved = false
+        var useSwap = true
+        var oldMoved = false          // 예전 앱이 dst 에서 비켜났다 (맞바꾸기면 incoming 으로, 아니면 .bak 으로)
         var lastErr: Int32 = 0
         for _ in 0..<20 {
-            if rename(dst.path, bak.path) == 0 {
-                moved = true
-                break
+            if useSwap {
+                if renamex_np(incoming.path, dst.path, UInt32(RENAME_SWAP)) == 0 {
+                    oldMoved = true
+                    break
+                }
+                lastErr = errno
+                if lastErr == ENOTSUP || lastErr == EINVAL {
+                    EventLog.write("update: RENAME_SWAP not supported here (error \(lastErr)) - using two renames")
+                    useSwap = false
+                    continue              // 기다리지 않고 바로 두 번의 이름 바꾸기로
+                }
+            } else {
+                if rename(dst.path, bak.path) == 0 {
+                    oldMoved = true
+                    break
+                }
+                lastErr = errno
             }
-            lastErr = errno
             // 권한 문제는 기다려도 안 풀린다
             if lastErr == EACCES || lastErr == EPERM || lastErr == EROFS { break }
             usleep(500_000)       // 프로세스가 끝난 직후 잠깐 잡혀 있을 수 있다
         }
-        if !moved {
-            if lastErr == EACCES || lastErr == EROFS {
-                return Applier.applyFailed(ver, UpdateText.noPermission, dst: dst, relaunch: a.relaunch)
-            }
-            if lastErr == EPERM {
-                return Applier.applyFailed(ver, UpdateText.appManagement, dst: dst, relaunch: a.relaunch)
-            }
-            return Applier.applyFailed(ver, UpdateText.moveOldFailed(Int(lastErr)), dst: dst, relaunch: a.relaunch)
+        if !oldMoved {
+            // dst 는 그대로 예전 앱이다
+            try? fm.removeItem(at: incoming)
+            return Applier.applyFailed(ver, Applier.permissionText(lastErr) ?? UpdateText.moveOldFailed(Int(lastErr)),
+                                       dst: dst, relaunch: a.relaunch)
         }
 
-        // 새 앱을 놓는다. 같은 볼륨이면 이름 바꾸기, 아니면 FileManager 가 복사한다. 그것도 안 되면
-        // ditto 로 복사한다 (묶음 안의 링크·실행 비트·확장 속성을 그대로).
+        let swapped = useSwap         // 여기까지 왔으면 true = 맞바꾸기로 놓았다
+        var oldAt = bak               // 예전 앱이 지금 있는 곳 (되돌릴 때 쓴다)
         var placed = false
-        var placeErr = 0
-        do {
-            try fm.moveItem(at: staged, to: dst)
+        var placeErr: Int32 = 0
+        if swapped {
+            // dst = 새 앱, incoming = 예전 앱
             placed = true
-        } catch {
-            placeErr = Disk.errorCode(error)
-            try? fm.removeItem(at: dst)
-            if Disk.runTool("/usr/bin/ditto", [staged.path, dst.path], timeout: 300) {
-                placed = true
+            if rename(incoming.path, bak.path) != 0 {
+                // .bak 자리를 비우지 못했거나 해서 옮기지 못했다. 예전 앱은 숨은 자리에 그대로 두고
+                // (새 빌드가 뜨면 cleanupAfterStart 가 치운다), 되돌리기는 그 자리에서 한다.
+                let e = errno
+                EventLog.write("update: old app left at \(incoming.path) (error \(e))")
+                oldAt = incoming
             }
+        } else if rename(incoming.path, dst.path) == 0 {
+            placed = true
+        } else {
+            placeErr = errno
         }
+
         // Windows 는 놓은 파일의 해시를 다시 잰다. 여기서는 놓인 묶음이 그 버전의 우리 앱인지 본다.
         let same = placed && Disk.appMatches(dst, ver: ver)
         if !same {
-            // 되돌린다. 방금 놓은 새 묶음이나 .bak 을 Spotlight·백업이 잠깐 잡고 있을 수 있어 지우기와
-            // 옮기기를 둘 다 되풀이한다.
+            // 되돌린다. 맞바꿨으면 다시 맞바꾼다 (그 사이에도 dst 에 앱이 있다). 안 되면, 또는 두 번의
+            // 이름 바꾸기로 놓았으면 Windows 처럼 지우고 옮긴다. 방금 놓은 새 묶음이나 .bak 을
+            // Spotlight·백업이 잠깐 잡고 있을 수 있어 둘 다 되풀이한다.
             var restored = false
             for _ in 0..<20 {
+                if swapped && renamex_np(oldAt.path, dst.path, UInt32(RENAME_SWAP)) == 0 {
+                    try? fm.removeItem(at: oldAt)         // 이제 여기엔 방금 놓은 틀린 새 앱이 있다
+                    restored = true
+                    break
+                }
                 try? fm.removeItem(at: dst)
-                if rename(bak.path, dst.path) == 0 {
+                if rename(oldAt.path, dst.path) == 0 {
                     restored = true
                     break
                 }
                 usleep(500_000)
             }
-            let b = placed ? UpdateText.placedButDiffers : UpdateText.placeFailed(placeErr)
+            // 두 번의 이름 바꾸기에서 incoming → dst 가 안 됐으면 새 앱이 숨은 자리에 남아 있다
+            if !swapped { try? fm.removeItem(at: incoming) }
+            let b = placed ? UpdateText.placedButDiffers : UpdateText.placeFailed(Int(placeErr))
             if !restored {
                 // 가장 나쁜 경우: 제대로 된 앱이 없다. 이건 대화상자로 말해야 한다.
                 EventLog.write("update: apply FAILED and rollback FAILED - \(b)")
+                if oldAt.path != bak.path {
+                    EventLog.write("update: the old app is at \(oldAt.path)")
+                }
                 Disk.writeMarker(ver, b)
                 Applier.alert(UpdateText.rollbackFailedDialog(reason: b, folder: dst.deletingLastPathComponent().path))
                 return 1
             }
             return Applier.applyFailed(ver, b, dst: dst, relaunch: a.relaunch)
         }
-
-        // 격리 표시가 붙어 있으면 Gatekeeper 가 새 앱을 처음 받은 앱처럼 막는다. URLSession 이 받은
-        // 파일에는 보통 붙지 않지만, 붙어 있으면 지운다 (실패해도 상관없다).
-        Disk.runTool("/usr/bin/xattr", ["-dr", "com.apple.quarantine", dst.path], timeout: 60)
 
         try? fm.removeItem(at: zip)
         try? fm.removeItem(at: Disk.stagedDir(ver))
@@ -199,6 +269,14 @@ private enum Applier {
             alert(UpdateText.relaunchOldFailedDialog(reason: why, app: dst.path))
         }
         return 1
+    }
+
+    /// 앱 폴더를 고치지 못한 오류 번호를 사람이 할 일로: EACCES/EROFS = 쓸 권한이 없는 자리 (읽기 전용
+    /// 볼륨, 디스크 이미지 포함), EPERM = macOS 13+ 의 "앱 관리" 보호. 다른 번호면 nil.
+    static func permissionText(_ e: Int32) -> String? {
+        if e == EACCES || e == EROFS { return UpdateText.noPermission }
+        if e == EPERM { return UpdateText.appManagement }
+        return nil
     }
 
     /// LaunchServices 로 띄운다 (/usr/bin/open): 새 Info.plist 를 읽고, 이 복사본과 떨어진 프로세스로

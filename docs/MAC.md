@@ -109,9 +109,17 @@ SQL Editor 에서 Mac 행을 `releases` 에 잘못 넣는 길까지 서버가 �
 5. `Publish.exe --platform mac --file <zip>` - 브라우저 로그인을 한 번 더 한다. Publish.exe 도
    zip 안의 번들 id 와 버전을 직접 읽어 대조하고, 올린 뒤 anon 으로 다시 받아 해시를 본다
 
-Mac 단계가 실패해도 Windows 릴리스는 그대로이고, 다시 할 명령(`release-mac.bat <버전>`)을
-찍는다. 필요한 것: `gh` 와 `gh auth login` 한 번. `-NoGit` / `-DryRun` 이면 Mac 단계는 건너뛴다
-(푸시한 커밋이 없으면 CI 가 만들 것도 없다).
+Windows 의 요약(기업 PC 는 대시보드에서 [승인] 하라는 줄 포함)은 Mac 단계보다 **먼저** 찍는다 -
+Mac 단계는 CI 를 기다리느라 10~20분 걸릴 수 있고, 그 사이 창을 닫아도 Windows 쪽 안내는 이미
+보였다. Mac 단계를 시작하기 전에 anon 으로 `mac_releases` 를 한 번 읽어 **표가 없으면 기다리지
+않고 건너뛴다** (노란 안내, 종료 코드 0 - Windows 릴리스는 성공이다). Mac 단계가 실패하면 Windows
+릴리스는 그대로이고, 다시 할 명령(`release-mac.bat <버전>`)을 찍는다. 필요한 것: `gh` 와
+`gh auth login` 한 번. `-NoMac` 으로 Mac 단계만 건너뛰고, `-NoGit` / `-DryRun` 이면 Mac 단계도
+건너뛴다 (푸시한 커밋이 없으면 CI 가 만들 것도 없다).
+
+배포 메모는 임시 파일로 `git commit -F` 에 넘긴다. PowerShell 5.1 은 네이티브 명령의 인자 안
+따옴표를 이스케이프하지 않아서, `"폰 등록" 버튼 고침` 같은 메모가 Windows 게시 **뒤에** 커밋에서
+깨졌다 (검토에서 나온 것 - 예전에는 Publish.exe 에서 먼저 깨져 게시조차 안 됐다).
 
 ### 적용
 

@@ -8,23 +8,27 @@ import SmartScreenCore
 final class UpdateTests: XCTestCase {
     private let sha1 = String(repeating: "a", count: 64)
     private let sha2 = String(repeating: "b", count: 64)
+    /// 시험에서 "지금 도는 macOS" 로 쓰는 값 (13.5.0)
+    private let os13 = OperatingSystemVersion(majorVersion: 13, minorVersion: 5, patchVersion: 0)
 
     private func body(_ s: String) -> Data { return Data(s.utf8) }
 
+    /// minMacOS 는 JSON 조각 그대로 (예: "\"14.0\"", "null", "14"). nil 이면 열이 없다.
     private func row(_ v: String, sha: String? = nil, path: String? = nil, size: String = "123",
-                     notes: String = "\"메모\"") -> String {
+                     notes: String = "\"메모\"", minMacOS: String? = nil) -> String {
         let h = sha ?? sha1
         let p = path ?? "mac/\(v)/SmartScreen-mac.zip"
-        return "{\"version\":\"\(v)\",\"storage_path\":\"\(p)\",\"sha256\":\"\(h)\",\"size\":\(size),\"notes\":\(notes)}"
+        let m = minMacOS.map { ",\"min_macos\":" + $0 } ?? ""
+        return "{\"version\":\"\(v)\",\"storage_path\":\"\(p)\",\"sha256\":\"\(h)\",\"size\":\(size),\"notes\":\(notes)\(m)}"
     }
 
     // MARK: - 서버 질의
 
     func testQueriesAreExact() {
         XCTAssertEqual(UpdateLogic.releasesQuery(channel: "stable"),
-                       "/rest/v1/mac_releases?select=version,storage_path,sha256,size,notes&active=eq.true&channel=eq.stable&order=published_at.desc")
+                       "/rest/v1/mac_releases?select=version,storage_path,sha256,size,notes,min_macos&active=eq.true&channel=eq.stable&order=published_at.desc")
         XCTAssertEqual(UpdateLogic.releasesQuery(channel: "beta"),
-                       "/rest/v1/mac_releases?select=version,storage_path,sha256,size,notes&active=eq.true&channel=eq.beta&order=published_at.desc")
+                       "/rest/v1/mac_releases?select=version,storage_path,sha256,size,notes,min_macos&active=eq.true&channel=eq.beta&order=published_at.desc")
         // 오타·빈 값은 stable (조용히 멎으면 안 된다)
         XCTAssertTrue(UpdateLogic.releasesQuery(channel: "Beta").contains("channel=eq.stable&"))
         XCTAssertTrue(UpdateLogic.releasesQuery(channel: "").contains("channel=eq.stable&"))
@@ -87,7 +91,7 @@ final class UpdateTests: XCTestCase {
 
     func testScanPicksNumericallyNewestAndCountsEveryRow() {
         let json = "[" + [row("1.9.0"), row("1.10.0", sha: sha2), row("1.1.7"), row("1.0.0")].joined(separator: ",") + "]"
-        let s = UpdateLogic.scan(body(json), enterprise: false, approved: [], current: SemVer(1, 1, 7))
+        let s = UpdateLogic.scan(body(json), enterprise: false, approved: [], current: SemVer(1, 1, 7), macOS: os13)
         XCTAssertEqual(s.rows, 4)
         XCTAssertEqual(s.best?.version, "1.10.0")           // 문자열 비교면 1.9.0 이 이긴다
         XCTAssertEqual(s.best?.sha256, sha2)
@@ -109,7 +113,7 @@ final class UpdateTests: XCTestCase {
             row("0.9.0"),
         ]
         let s = UpdateLogic.scan(body("[" + rows.joined(separator: ",") + "]"), enterprise: false,
-                                 approved: [], current: SemVer(1, 1, 7))
+                                 approved: [], current: SemVer(1, 1, 7), macOS: os13)
         XCTAssertEqual(s.rows, 7)
         XCTAssertNil(s.best)
         XCTAssertNil(s.newest)
@@ -119,28 +123,115 @@ final class UpdateTests: XCTestCase {
     func testScanNormalizesFields() {
         let upper = String(repeating: "AB", count: 32)
         let json = "[" + row("2.0.0", sha: upper, size: "-5", notes: "null") + "]"
-        let s = UpdateLogic.scan(body(json), enterprise: false, approved: [], current: SemVer(1, 0, 0))
+        let s = UpdateLogic.scan(body(json), enterprise: false, approved: [], current: SemVer(1, 0, 0), macOS: os13)
         XCTAssertEqual(s.best?.sha256, String(repeating: "ab", count: 32))
         XCTAssertEqual(s.best?.size, 0)
         XCTAssertEqual(s.best?.notes, "")
         // 배열이 아니면 아무 행도 없다
-        let e = UpdateLogic.scan(body("{\"message\":\"x\"}"), enterprise: false, approved: [], current: SemVer(1, 0, 0))
+        let e = UpdateLogic.scan(body("{\"message\":\"x\"}"), enterprise: false, approved: [], current: SemVer(1, 0, 0),
+                                 macOS: os13)
         XCTAssertEqual(e.rows, 0)
         XCTAssertNil(e.best)
     }
 
     func testScanEnterpriseOnlyApproved() {
         let json = "[" + [row("1.3.0"), row("1.2.0"), row("1.4.0")].joined(separator: ",") + "]"
-        let s = UpdateLogic.scan(body(json), enterprise: true, approved: ["1.2.0", "1.3.0"], current: SemVer(1, 1, 7))
+        let s = UpdateLogic.scan(body(json), enterprise: true, approved: ["1.2.0", "1.3.0"], current: SemVer(1, 1, 7),
+                                 macOS: os13)
         XCTAssertEqual(s.best?.version, "1.3.0")
         XCTAssertEqual(s.newest?.version, "1.4.0")
-        let none = UpdateLogic.scan(body(json), enterprise: true, approved: [], current: SemVer(1, 1, 7))
+        let none = UpdateLogic.scan(body(json), enterprise: true, approved: [], current: SemVer(1, 1, 7), macOS: os13)
         XCTAssertNil(none.best)
         XCTAssertEqual(none.newest?.version, "1.4.0")
         // 승인은 글자 그대로 비교한다
         let lead = UpdateLogic.scan(body("[" + row("01.2.0") + "]"), enterprise: true, approved: ["1.2.0"],
-                                    current: SemVer(1, 1, 7))
+                                    current: SemVer(1, 1, 7), macOS: os13)
         XCTAssertNil(lead.best)
+    }
+
+    // MARK: - macOS 버전 (min_macos, LSMinimumSystemVersion)
+
+    func testParseMacOSVersion() {
+        func parts(_ s: String) -> [Int]? {
+            guard let v = UpdateLogic.parseMacOSVersion(s) else { return nil }
+            return [v.majorVersion, v.minorVersion, v.patchVersion]
+        }
+        XCTAssertEqual(parts("13.0"), [13, 0, 0])                 // 서버 min_macos 모양
+        XCTAssertEqual(parts("14"), [14, 0, 0])                   // Info.plist 에는 한 덩이도 온다
+        XCTAssertEqual(parts("10.15.7"), [10, 15, 7])
+        XCTAssertEqual(parts(" 13.0\n"), [13, 0, 0])              // 앞뒤 공백만 봐준다
+        for bad in ["", " ", "13.", ".0", "13..0", "13.0.1.2", "a.b", "13.0-beta", "-13.0", "+13", "13,0",
+                    "1234567890.0", "１３.0"] {
+            XCTAssertNil(UpdateLogic.parseMacOSVersion(bad), "'\(bad)'")
+        }
+    }
+
+    func testUnmetMacOS() {
+        let run = OperatingSystemVersion(majorVersion: 13, minorVersion: 6, patchVersion: 1)
+        XCTAssertNil(UpdateLogic.unmetMacOS("13.0", running: run))
+        XCTAssertNil(UpdateLogic.unmetMacOS("13.6", running: run))
+        XCTAssertNil(UpdateLogic.unmetMacOS("13.6.1", running: run))           // 같으면 된다
+        XCTAssertNil(UpdateLogic.unmetMacOS("12", running: run))
+        XCTAssertEqual(UpdateLogic.unmetMacOS("13.6.2", running: run), "13.6.2")
+        XCTAssertEqual(UpdateLogic.unmetMacOS("13.7", running: run), "13.7")
+        XCTAssertEqual(UpdateLogic.unmetMacOS("14.0", running: run), "14.0")
+        XCTAssertEqual(UpdateLogic.unmetMacOS("14", running: run), "14")
+        XCTAssertEqual(UpdateLogic.unmetMacOS(" 15.0\n", running: run), "15.0")    // 보여 줄 때는 공백 없이
+        // 없거나 못 읽는 값은 제약이 없다 (업데이트가 조용히 멎으면 안 된다)
+        XCTAssertNil(UpdateLogic.unmetMacOS(nil, running: run))
+        XCTAssertNil(UpdateLogic.unmetMacOS("", running: run))
+        XCTAssertNil(UpdateLogic.unmetMacOS("garbage", running: run))
+        XCTAssertNil(UpdateLogic.unmetMacOS("99.0-beta", running: run))
+    }
+
+    func testScanSkipsRowsNeedingNewerMacOS() {
+        let rows = [
+            row("1.3.0", minMacOS: "\"14.0\""),        // 이 Mac(13.5) 으로는 못 쓴다
+            row("1.2.0", minMacOS: "\"13.0\""),
+            row("1.2.1", minMacOS: "\"13.5\""),        // 같은 버전이면 된다
+            row("1.2.2"),                              // 열 없음 = 제약 없음 (가장 새 것)
+            row("1.2.3", minMacOS: "null"),            // null = 제약 없음
+            row("1.2.4", minMacOS: "14"),              // 글자가 아님 = 제약 없음
+            row("1.2.5", minMacOS: "\"junk\""),        // 모양이 틀림 = 제약 없음
+            row("1.4.0", minMacOS: "\"13.6\""),        // 못 쓴다
+            row("1.1.0", minMacOS: "\"15.0\""),        // 지금 버전 이하라 관심 없다 (로그도 없다)
+        ]
+        let json = body("[" + rows.joined(separator: ",") + "]")
+        let s = UpdateLogic.scan(json, enterprise: false, approved: [], current: SemVer(1, 1, 8), macOS: os13)
+        XCTAssertEqual(s.rows, 9)
+        XCTAssertEqual(s.best?.version, "1.2.5")
+        XCTAssertEqual(s.newest?.version, "1.2.5")
+        XCTAssertTrue(s.malformed.isEmpty)
+        XCTAssertEqual(s.osSkipped, [ReleaseOSSkip(version: "1.3.0", minMacOS: "14.0"),
+                                     ReleaseOSSkip(version: "1.4.0", minMacOS: "13.6")])
+        XCTAssertEqual(s.osSkipped.map { $0.logLine },
+                       ["update: skipping 1.3.0 (needs macOS 14.0)", "update: skipping 1.4.0 (needs macOS 13.6)"])
+
+        // 새 macOS 에서는 아무것도 건너뛰지 않는다
+        let os14 = OperatingSystemVersion(majorVersion: 14, minorVersion: 0, patchVersion: 0)
+        let s14 = UpdateLogic.scan(json, enterprise: false, approved: [], current: SemVer(1, 1, 8), macOS: os14)
+        XCTAssertEqual(s14.best?.version, "1.4.0")
+        XCTAssertTrue(s14.osSkipped.isEmpty)
+
+        // 기업 PC: 승인됐어도 이 macOS 로 못 쓰면 받지 않고, "승인 대기" 에도 그 버전이 보이지 않는다
+        let onlyNew = body("[" + row("1.3.0", minMacOS: "\"14.0\"") + "]")
+        let ent = UpdateLogic.scan(onlyNew, enterprise: true, approved: ["1.3.0"], current: SemVer(1, 1, 8), macOS: os13)
+        XCTAssertNil(ent.best)
+        XCTAssertNil(ent.newest)
+        XCTAssertEqual(ent.osSkipped.count, 1)
+        let out = UpdateLogic.outcome(ent, failedWhy: nil, enterprise: true, manual: false, running: "1.1.8")
+        XCTAssertEqual(out.phase, .upToDate)
+        XCTAssertFalse(out.downloadNow)
+    }
+
+    func testIncomingPlaceAndCleanup() {
+        XCTAssertEqual(UpdateLogic.incomingName, ".SmartScreen.app.incoming")
+        let run = SemVer(1, 2, 0)
+        XCTAssertTrue(UpdateLogic.shouldRemoveIncoming(version: "1.1.7", running: run))   // 맞바꾼 뒤 남은 예전 앱
+        XCTAssertTrue(UpdateLogic.shouldRemoveIncoming(version: "1.2.0", running: run))
+        XCTAssertTrue(UpdateLogic.shouldRemoveIncoming(version: nil, running: run))       // 반쯤 복사된 것
+        XCTAssertTrue(UpdateLogic.shouldRemoveIncoming(version: "x", running: run))
+        XCTAssertFalse(UpdateLogic.shouldRemoveIncoming(version: "1.3.0", running: run))  // 다른 복사본이 놓는 중일 수 있다
     }
 
     func testOutcomes() {
@@ -493,6 +584,9 @@ final class UpdateTests: XCTestCase {
         XCTAssertEqual(UpdateText.updaterLaunchFailed(2), "updater 를 띄우지 못했어요 (오류 2)")
         XCTAssertEqual(UpdateText.moveOldFailed(16), "기존 파일을 옮기지 못했어요 (오류 16)")
         XCTAssertEqual(UpdateText.placeFailed(28), "새 파일을 놓지 못했어요 (오류 28)")
+        XCTAssertEqual(UpdateText.needsNewerMacOS("14.0"), "이 macOS 에서는 새 버전을 쓸 수 없어요 (macOS 14.0 이상)")
+        XCTAssertEqual(UpdateText.applyFailedPrefix + UpdateText.needsNewerMacOS("14.0"),
+                       "적용 실패: 이 macOS 에서는 새 버전을 쓸 수 없어요 (macOS 14.0 이상)")
         XCTAssertEqual(UpdateText.applyFailedPrefix + UpdateText.wrongNameApp,
                        "적용 실패: 앱 이름이 SmartScreen.app 이 아니라 자동 업데이트를 못 해요 - 이름을 바꿔 주세요")
         XCTAssertEqual(UpdateText.rollbackFailedDialog(reason: "r", folder: "/Applications"),

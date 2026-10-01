@@ -67,6 +67,19 @@ public struct ReleaseCandidate: Equatable {
     }
 }
 
+/// 이 Mac 의 macOS 가 낮아서 건너뛴 행 하나 (행의 min_macos 가 지금 macOS 보다 높다).
+public struct ReleaseOSSkip: Equatable {
+    public let version: String
+    /// 행의 min_macos (앞뒤 공백만 뺀 글자 그대로, 예: "14.0")
+    public let minMacOS: String
+    public init(version: String, minMacOS: String) {
+        self.version = version
+        self.minMacOS = minMacOS
+    }
+    /// events.log 에 적을 줄 (시각 없이). 확인할 때마다 한 줄씩.
+    public var logLine: String { return "update: skipping \(version) (needs macOS \(minMacOS))" }
+}
+
 /// 서버의 행들을 훑은 결과.
 public struct ReleaseScan: Equatable {
     /// 받을 것 (기업 PC 는 승인된 것 중 가장 새 것)
@@ -78,6 +91,9 @@ public struct ReleaseScan: Equatable {
     /// 모양이 틀려 건너뛴 행의 version 값들 (차례대로). 부르는 쪽이
     /// "update: skipping malformed row (version '<v>')" 로 적는다.
     public var malformed: [String] = []
+    /// 지금 버전보다 새 것이지만 이 Mac 의 macOS 로는 못 쓰는 행들 (차례대로). best 도 newest 도
+    /// 되지 않는다. 부르는 쪽이 각각의 logLine 을 적는다.
+    public var osSkipped: [ReleaseOSSkip] = []
     public init() {}
 }
 
@@ -149,6 +165,11 @@ public enum UpdateText {
     public static let unzipFailed = "내려받은 파일을 풀지 못했어요"
     public static let noAppInZip = "내려받은 파일 안에 SmartScreen.app 이 없어요"
     public static let appMismatch = "내려받은 앱이 기록과 달라요 (버전 또는 번들 id)"
+    /// Mac 만: 받은 앱의 LSMinimumSystemVersion 이 이 Mac 의 macOS 보다 높다. LaunchServices 가 그 앱을
+    /// 열지 않으므로 바꾸면 아무것도 안 뜬다 - 바꾸기 전에 멈추고 기록한다 (같은 버전을 되풀이하지 않게).
+    public static func needsNewerMacOS(_ minimum: String) -> String {
+        return "이 macOS 에서는 새 버전을 쓸 수 없어요 (macOS \(minimum) 이상)"
+    }
     /// macOS 13+ 의 "앱 관리" 보호가 다른 앱이 고치는 것을 막을 때 (EPERM)
     public static let appManagement = "시스템 설정 > 개인정보 보호 및 보안 > 앱 관리 에서 SmartScreen 을 허용해 주세요"
     public static func moveOldFailed(_ code: Int) -> String { return "기존 파일을 옮기지 못했어요 (오류 \(code))" }
@@ -192,9 +213,12 @@ public enum UpdateLogic {
         return s == "beta" ? "beta" : "stable"
     }
 
-    /// 확인 질의 (Windows 의 releases 질의와 같은 모양, 표 이름만 다르다).
+    /// 확인 질의 (Windows 의 releases 질의와 같은 모양에 min_macos 를 더했다, 표 이름도 다르다).
+    /// min_macos 는 처음 나가는 Mac 빌드부터 묻는다: 한 번 깔린 클라이언트의 질의는 다시 못 바꾼다
+    /// (Windows 1.1.x 의 releases 질의가 그 함정이다). 나중에 배포 대상을 올린 빌드를 낮은 macOS 의
+    /// Mac 이 "새 버전" 으로 보지 않게 하는 자리가 이 열이다 (supabase/mac_releases.sql).
     public static func releasesQuery(channel: String) -> String {
-        return "/rest/v1/\(releasesTable)?select=version,storage_path,sha256,size,notes" +
+        return "/rest/v1/\(releasesTable)?select=version,storage_path,sha256,size,notes,min_macos" +
             "&active=eq.true&channel=eq.\(normalizeChannel(channel))&order=published_at.desc"
     }
 
@@ -263,8 +287,11 @@ public enum UpdateLogic {
     }
 
     /// CheckJob 의 행 고르기. 서버 순서(published_at desc)와 상관없이 버전 숫자로 고른다.
-    /// enterprise 면 approved 에 있는 버전만 best 가 된다.
-    public static func scan(_ body: Data, enterprise: Bool, approved: Set<String>, current: SemVer) -> ReleaseScan {
+    /// enterprise 면 approved 에 있는 버전만 best 가 된다. macOS = 지금 도는 macOS
+    /// (ProcessInfo.processInfo.operatingSystemVersion). 행의 min_macos 가 그보다 높으면 그 행은
+    /// best 도 newest 도 되지 않는다 (osSkipped 에 남는다).
+    public static func scan(_ body: Data, enterprise: Bool, approved: Set<String>, current: SemVer,
+                            macOS: OperatingSystemVersion) -> ReleaseScan {
         var out = ReleaseScan()
         var bestV: SemVer?
         var newestV: SemVer?
@@ -286,6 +313,13 @@ public enum UpdateLogic {
                 continue
             }
             if sv <= current { continue }                     // 내 버전 이하는 관심 없다
+            // 이 Mac 의 macOS 로는 못 쓰는 버전. 받아서 바꾸면 LaunchServices 가 새 앱을 열지 않아
+            // 아무것도 안 뜬다 - "새 버전" 으로 치지 않는다 (띠도, 승인 대기도, 기업 PC 의 자동 적용도
+            // 없다). 열이 없거나 글자가 아니거나 모양이 틀리면 제약이 없는 것으로 본다.
+            if let need = unmetMacOS(o["min_macos"] as? String, running: macOS) {
+                out.osSkipped.append(ReleaseOSSkip(version: v, minMacOS: need))
+                continue
+            }
             let c = ReleaseCandidate(version: v, storagePath: sp, notes: notes, sha256: sha, size: size)
             if newestV.map({ sv > $0 }) ?? true {
                 out.newest = c
@@ -387,6 +421,52 @@ public enum UpdateLogic {
     /// 다운로드 폴더에서 바로 연 앱은 macOS 가 읽기 전용의 임의 경로에서 돌린다.
     public static func isTranslocated(_ path: String) -> Bool {
         return path.contains("/AppTranslocation/")
+    }
+
+    /// 복사본이 새 앱을 먼저 놓는 숨은 자리의 이름. SmartScreen.app 과 같은 폴더(= 같은 볼륨)라서
+    /// 그 자리에서 SmartScreen.app 으로 가는 것은 언제나 이름 바꾸기 한 번이다. 묶음 확장자가 아니라
+    /// LaunchServices 와 Spotlight 가 앱으로 보지 않는다.
+    public static let incomingName = ".SmartScreen.app.incoming"
+
+    /// 앱이 켜질 때 남아 있는 숨은 자리(incomingName)를 지울 것인가. 끊긴 적용이 남긴 것이거나,
+    /// 맞바꾼 뒤 .bak 으로 못 옮긴 예전 앱이다. 다만 지금 것보다 새 버전이 들어 있으면 다른 복사본이
+    /// 지금 그걸 놓는 중일 수 있어 둔다 (그 복사본은 쓰기 전에 스스로 지운다). 버전을 못 읽으면 지운다.
+    public static func shouldRemoveIncoming(version: String?, running: SemVer) -> Bool {
+        guard let s = version, let v = SemVer(s) else { return true }
+        return v <= running
+    }
+
+    // ---- macOS 버전 ----
+
+    /// macOS 버전 글자: 서버의 min_macos ("13.0") 나 Info.plist 의 LSMinimumSystemVersion ("13.0",
+    /// "10.15.7", "14"). 숫자 덩이 1~3 개, 덩이마다 1~9 자리. 앞뒤 공백만 봐준다. 아니면 nil.
+    public static func parseMacOSVersion(_ s: String) -> OperatingSystemVersion? {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = t.split(separator: ".", omittingEmptySubsequences: false)
+        if parts.isEmpty || parts.count > 3 { return nil }
+        var n = [0, 0, 0]
+        for (i, p) in parts.enumerated() {
+            if p.isEmpty || p.utf8.count > 9 { return nil }
+            var v = 0
+            for c in p.utf8 {
+                if c < 48 || c > 57 { return nil }           // '0'...'9' 만
+                v = v * 10 + Int(c - 48)
+            }
+            n[i] = v
+        }
+        return OperatingSystemVersion(majorVersion: n[0], minorVersion: n[1], patchVersion: n[2])
+    }
+
+    /// minimum 이 running 보다 높으면 그 글자 (앞뒤 공백만 뺀 것, 화면과 로그에 쓴다), 아니면 nil.
+    /// 없거나 못 읽는 값은 제약이 없는 것으로 본다 - 서버 열이나 Info.plist 하나가 틀렸다고
+    /// 업데이트가 조용히 멎으면 안 된다 (그런 앱이 정말 못 뜨면 그건 LaunchServices 가 말한다).
+    public static func unmetMacOS(_ minimum: String?, running: OperatingSystemVersion) -> String? {
+        guard let raw = minimum else { return nil }
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let m = parseMacOSVersion(t) else { return nil }
+        let need = (m.majorVersion, m.minorVersion, m.patchVersion)
+        let have = (running.majorVersion, running.minorVersion, running.patchVersion)
+        return need > have ? t : nil
     }
 
     // ---- private ----
