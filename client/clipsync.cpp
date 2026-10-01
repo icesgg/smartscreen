@@ -25,6 +25,10 @@ namespace {
 constexpr wchar_t kWndClass[] = L"SmartScreenClipSync";
 constexpr UINT    WM_CLIP_APPLY = WM_APP + 71;   // LPARAM = new Payload*
 
+// 받았는데 붙이지 못하고 미뤄 둔 것을 다시 붙여 보는 타이머 (s_pending 의 주석).
+constexpr UINT_PTR kDeferTimerId = 1;
+constexpr UINT     kDeferRetryMs = 3000;
+
 // 입력이 최근에 있었으면 자주, 자리를 비웠으면 드물게 확인한다. 이 앱은 자리
 // 비움을 이미 재고 있으므로 그 값을 쓰면 공짜다. 5초 고정으로 두면 하루에
 // 2만 번이 넘는 요청이 되고, 아무도 안 쓰는 밤에도 그대로 돈다.
@@ -76,6 +80,24 @@ DWORD          s_ignoreSeq = 0;    // 우리가 클립보드를 바꾼 직후의
 unsigned long  s_localGen = 0;
 
 Payload*       s_outgoing = nullptr;   // 올릴 것이 있으면 여기 (최신 하나만)
+
+// ---- 아래 셋은 창 스레드만 만진다 ----
+// 받았는데 클립보드를 열지 못해 아직 붙이지 못한 것. 가장 새 것 하나만 쥔다.
+//
+// 예전에는 WM_CLIP_APPLY 에서 열기(30ms x 8)가 실패하면 그대로 버렸다. 일꾼은 그 전에
+// s_seenId 를 이미 올렸으므로 같은 항목을 다시 받지 않는다 - 윈도가 잠겨 있는 동안
+// 저쪽에서 복사한 것이 그렇게 전부 사라졌다 (노트북 로그 06:46-06:49, id 252-254,
+// 잠금 21:20:38-06:55:19). 240ms 는 다른 앱이 잠깐 쥐는 것을 견디는 시간이지 잠금을
+// 견디는 시간이 아니다.
+//
+// 하나만 쥐는 이유: 받는 쪽은 원래 "가장 새 행 하나" 만 본다. 붙일 수 있게 됐을 때
+// 사람이 Ctrl+V 로 원하는 것도 마지막 것이고, 그 앞의 것들을 차례로 붙여 봐야 마지막
+// 것에 덮인다.
+Payload*       s_pending = nullptr;
+ULONGLONG      s_pendingSince = 0;     // 미루기 시작한 GetTickCount64 ("after Ns")
+// 이 PC 의 클립보드 읽기가 열기에서 연달아 실패하는 중인지. 첫 번만 적는다 -
+// 다른 앱이 몇 분씩 쥐고 있으면 복사할 때마다 같은 줄이 쌓인다.
+bool           s_readOpenFailing = false;
 
 // 조회가 연달아 실패한 횟수. 일꾼 스레드만 만진다.
 int            s_pollFails = 0;
@@ -237,12 +259,73 @@ UINT PngFormat() {
     return f;
 }
 
-// 다른 앱이 쥐고 있으면 OpenClipboard 는 실패한다. 흔한 일이라 몇 번 기다린다.
-bool OpenClipboardRetry(HWND owner) {
-    for (int i = 0; i < 8; i++) {
-        if (OpenClipboard(owner)) return true;
-        Sleep(30);
+// OpenClipboard 가 실패한 그 자리의 사정.
+//
+// "클립보드를 열지 못했다" 만으로는 무엇이 막았는지 가릴 수 없었다. 갈래가 셋이다 -
+// 다른 앱이 쥐고 있다(holder), 윈도가 잠겨 있다(locked), 그 밖의 거절(err).
+// 잠긴 밤에 받은 것이 사라진 일(s_pending 의 주석)도 로그에는 "열지 못했다" 한 줄이라
+// 잠금 때문이라는 것을 시각을 맞춰 보고서야 알았다.
+struct OpenFail {
+    bool         failed = false;
+    bool         locked = false;   // 입력 데스크톱을 열 수 없다 = 잠금 화면 (또는 UAC 창)
+    std::wstring diag;             // "err=5, holder=none, locked=1"
+};
+
+// 지금 클립보드를 열고 있는 프로세스의 실행 파일 이름. 연 창이 없으면(아무도 안 열었거나
+// 창 없이 열었다) "none", 이름을 읽을 권한이 없으면 pid.
+std::wstring ClipboardHolder() {
+    HWND w = GetOpenClipboardWindow();
+    DWORD pid = 0;
+    if (w) GetWindowThreadProcessId(w, &pid);
+    if (!pid) return L"none";
+    std::wstring name;
+    if (HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
+        wchar_t path[MAX_PATH * 2];
+        DWORD n = _countof(path);
+        if (QueryFullProcessImageNameW(h, 0, path, &n)) {
+            const wchar_t* base = wcsrchr(path, L'\\');
+            name = base ? base + 1 : path;
+        }
+        CloseHandle(h);
     }
+    if (!name.empty()) return name;
+    wchar_t b[32];
+    _snwprintf_s(b, _countof(b), _TRUNCATE, L"pid %lu", pid);
+    return b;
+}
+
+// 잠금 화면(그리고 UAC 확인 창)이 떠 있는 동안 입력 데스크톱은 Winlogon 의 것이라
+// 사용자 프로세스가 열 수 없다.
+bool InputDesktopLocked() {
+    HDESK d = OpenInputDesktop(0, FALSE, DESKTOP_SWITCHDESKTOP);
+    if (!d) return true;
+    CloseDesktop(d);
+    return false;
+}
+
+// OpenClipboard 가 실패한 직후에 부른다. err 는 부르는 쪽이 실패 바로 다음에 받아 둔
+// GetLastError 다 - 여기서 부르는 API 들이 그 값을 덮어쓴다. 쥔 앱을 잠금보다 먼저
+// 보는 것은 그쪽이 몇 ms 뒤면 놓아 버리기 때문이다.
+void FillOpenFail(DWORD err, OpenFail& out) {
+    std::wstring holder = ClipboardHolder();
+    out.failed = true;
+    out.locked = InputDesktopLocked();
+    wchar_t b[320];
+    _snwprintf_s(b, _countof(b), _TRUNCATE, L"err=%lu, holder=%s, locked=%d",
+                 err, holder.c_str(), out.locked ? 1 : 0);
+    out.diag = b;
+}
+
+// 다른 앱이 쥐고 있으면 OpenClipboard 는 실패한다. 흔한 일이라 몇 번 기다린다
+// (tries 번, 30ms 간격). 열지 못했으면 outFail 에 그 자리의 사정을 적는다.
+bool OpenClipboardRetry(HWND owner, int tries, OpenFail& outFail) {
+    DWORD err = 0;
+    for (int i = 0; i < tries; i++) {
+        if (OpenClipboard(owner)) return true;
+        err = GetLastError();
+        if (i + 1 < tries) Sleep(30);
+    }
+    FillOpenFail(err, outFail);
     return false;
 }
 
@@ -289,9 +372,11 @@ bool ClipboardOptedOut() {
 // outOptedOut: 읽지 못한 이유가 위의 표시일 때만 true. 부르는 쪽이 이것만은
 // 화면에 말해 줘야 한다 - "넘길 형식이 없다" 는 늘 있는 일이지만, 복사했는데
 // 일부러 안 보낸 것은 사용자가 알아야 한다.
-bool ReadClipboard(HWND owner, Payload& out, std::wstring& why, bool& outOptedOut) {
+// outOpen: 열지 못해서 실패했으면 그 사정 (outOpen.failed).
+bool ReadClipboard(HWND owner, Payload& out, std::wstring& why, bool& outOptedOut,
+                   OpenFail& outOpen) {
     outOptedOut = false;
-    if (!OpenClipboardRetry(owner)) { why = L"클립보드를 열지 못했다"; return false; }
+    if (!OpenClipboardRetry(owner, 8, outOpen)) { why = L"클립보드를 열지 못했다"; return false; }
     // 무엇이든 읽기 전에 본다. 내용을 읽지 않으므로 해시도 남지 않는다.
     if (ClipboardOptedOut()) {
         CloseClipboard();
@@ -348,8 +433,18 @@ bool ReadClipboard(HWND owner, Payload& out, std::wstring& why, bool& outOptedOu
     return ok;
 }
 
+// WriteClipboard 의 결과. Busy 는 "지금은 붙일 수 없다" 이고 항목을 버리지 않는다
+// (s_pending). Failed 는 다시 해도 같을 것이다 - PNG 가 안 풀린다, 메모리.
+enum class WriteResult { Ok, Busy, Failed };
+
 // 클립보드 창 스레드에서만 부른다.
-bool WriteClipboard(HWND owner, const Payload& in, std::wstring& why) {
+//
+// tries: OpenClipboard 를 몇 번 시도할지 (OpenClipboardRetry).
+// expectSeq: 0 이 아니면, 연 뒤의 순번이 이 값과 다를 때 아무것도 바꾸지 않고 Busy 로
+//            돌아온다. 미뤄 둔 것을 붙이는 타이머가 쓴다 (RetryPending).
+// outOpen: 열지 못해서 Busy 이면 그 사정 (outOpen.failed).
+WriteResult WriteClipboard(HWND owner, const Payload& in, int tries, DWORD expectSeq,
+                           std::wstring& why, OpenFail& outOpen) {
     HBITMAP hbm = nullptr;
     HGLOBAL hText = nullptr;
     HGLOBAL hPng = nullptr;
@@ -357,7 +452,7 @@ bool WriteClipboard(HWND owner, const Payload& in, std::wstring& why) {
     // 클립보드를 열기 전에 만든다. 여는 동안 다른 앱이 기다리게 되므로
     // 안에서 PNG 를 푸는 시간을 보내지 않는다.
     if (in.isImage) {
-        if (!PngToBitmap(in.bytes, hbm, why)) return false;
+        if (!PngToBitmap(in.bytes, hbm, why)) return WriteResult::Failed;
         // 받은 PNG 바이트를 그대로 얹을 사본 (PngFormat 주석 참고).
         // 실패해도 CF_BITMAP 은 올라가므로 그림판 같은 곳에는 붙는다.
         hPng = GlobalAlloc(GMEM_MOVEABLE, in.bytes.size());
@@ -374,19 +469,32 @@ bool WriteClipboard(HWND owner, const Payload& in, std::wstring& why) {
         std::wstring w = Utf8ToWide(in.bytes);
         size_t cb = (w.size() + 1) * sizeof(wchar_t);
         hText = GlobalAlloc(GMEM_MOVEABLE, cb);
-        if (!hText) { why = L"메모리를 잡지 못했다"; return false; }
+        if (!hText) { why = L"메모리를 잡지 못했다"; return WriteResult::Failed; }
         void* p = GlobalLock(hText);
-        if (!p) { GlobalFree(hText); why = L"메모리를 잠그지 못했다"; return false; }
+        if (!p) { GlobalFree(hText); why = L"메모리를 잠그지 못했다"; return WriteResult::Failed; }
         memcpy(p, w.c_str(), cb);
         GlobalUnlock(hText);
     }
 
-    if (!OpenClipboardRetry(owner)) {
+    // 클립보드에 넘기지 못한 것은 우리가 지운다.
+    auto release = [&]() {
         if (hbm) DeleteObject(hbm);
         if (hText) GlobalFree(hText);
         if (hPng) GlobalFree(hPng);
+    };
+    if (!OpenClipboardRetry(owner, tries, outOpen)) {
+        release();
         why = L"클립보드를 열지 못했다";
-        return false;
+        return WriteResult::Busy;
+    }
+    if (expectSeq && GetClipboardSequenceNumber() != expectSeq) {
+        // 순번을 읽은 뒤 여기까지 오는 사이(그림이면 PNG 를 푸는 동안)에 누군가
+        // 클립보드를 바꿨다. 그것이 사용자의 복사인지는 그 알림을 처리해 봐야 안다 -
+        // 덮지 않고 돌아가 다음 바퀴에 s_localGen 으로 가린다.
+        CloseClipboard();
+        release();
+        why = L"그 사이에 클립보드가 바뀌었다";
+        return WriteResult::Busy;
     }
     EmptyClipboard();
     // SetClipboardData 가 성공하면 그 핸들은 시스템 것이 된다. 실패했을 때만
@@ -412,7 +520,7 @@ bool WriteClipboard(HWND owner, const Payload& in, std::wstring& why) {
     } else {
         why = L"클립보드에 올리지 못했다";
     }
-    return ok;
+    return ok ? WriteResult::Ok : WriteResult::Failed;
 }
 
 // ---------------------------------------------------------------------------
@@ -655,6 +763,92 @@ bool DownloadImage(const std::wstring& access, const std::wstring& path,
 // ---------------------------------------------------------------------------
 // 창 스레드 - 클립보드는 전부 이 스레드에서만 만진다
 // ---------------------------------------------------------------------------
+// 받은 것을 붙인 뒤의 셈과 상태. 되울림 방지(s_ignoreSeq / s_lastHash)는
+// WriteClipboard 가 이미 적었다. deferredSince 가 있으면 미뤘다가 붙인 것이다.
+void NoteApplied(const Payload& p, const ULONGLONG* deferredSince) {
+    {
+        std::lock_guard<std::mutex> lock(s_mx);
+        s_status.received++;
+    }
+    SetStatus(true, p.isImage ? L"그림을 받았습니다" : L"텍스트를 받았습니다");
+    if (deferredSince) {
+        DbgEvent(L"clip: applied %s (%zu bytes) after %llus",
+                 p.isImage ? L"image" : L"text", p.bytes.size(),
+                 (GetTickCount64() - *deferredSince) / 1000);
+    } else {
+        DbgEvent(L"clip: applied %s (%zu bytes)",
+                 p.isImage ? L"image" : L"text", p.bytes.size());
+    }
+}
+
+void ClearPending(HWND hw) {
+    KillTimer(hw, kDeferTimerId);
+    delete s_pending;
+    s_pending = nullptr;
+}
+
+// p 를 미뤄 둔다 (소유권을 넘겨받는다). 쥔 것이 있으면 그것은 더 오래된 것이다 -
+// WM_CLIP_APPLY 가 새 항목을 보자마자 비우므로 여기서는 지우기만 한다.
+void DeferPending(HWND hw, Payload* p) {
+    delete s_pending;
+    s_pending = p;
+    s_pendingSince = GetTickCount64();
+    SetTimer(hw, kDeferTimerId, kDeferRetryMs, nullptr);
+    SetStatus(true, L"잠금이 풀리면 붙여요");
+}
+
+// 미뤄 둔 것을 다시 붙여 본다 (kDeferTimerId, 3초마다).
+//
+// 한 번만 열어 본다. 여기 온 것은 30ms x 8 이 이미 실패한 뒤이고 잠금은 몇 분에서
+// 밤새 간다 - 3초마다 240ms 씩 이 스레드를 재우면 그동안 클립보드 알림도 밀린다.
+void RetryPending(HWND hw) {
+    if (!s_pending) { KillTimer(hw, kDeferTimerId); return; }
+
+    // 순번을 먼저 읽고, 그 다음에 처리하지 않은 알림이 큐에 남았는지 본다. 이 순서라야
+    // 빈틈이 없다 - 읽은 순번까지의 변경은 그 알림이 처리된 뒤 다음 바퀴에 s_localGen
+    // 으로, 그 뒤의 변경은 WriteClipboard 의 expectSeq 로 걸린다. WM_TIMER 는 큐가 비었을
+    // 때만 오지만, 그것을 꺼낸 뒤에 복사한 것의 알림은 이 처리 뒤에 줄 서 있다. 그걸
+    // 못 보고 덮으면 s_ignoreSeq 가 그 알림까지 "우리가 한 것" 으로 버리게 만든다
+    // (WM_CLIP_APPLY 의 postSeq 와 같은 이야기).
+    DWORD seq = GetClipboardSequenceNumber();
+    MSG m;
+    if (PeekMessageW(&m, hw, WM_CLIPBOARDUPDATE, WM_CLIPBOARDUPDATE, PM_NOREMOVE)) return;
+    // PeekMessage 는 다른 스레드가 보낸(Send) 메시지를 그 자리에서 처리한다.
+    if (!s_pending) return;
+
+    // 미룬 뒤에 여기서 새로 복사했으면 붙이지 않는다. 클립보드 순번이 아니라 s_localGen
+    // 을 본다 - 잠금을 풀거나 하는 것만으로도 순번이 오를 수 있고, 그건 사용자가 복사한
+    // 것이 아니다. s_localGen 은 우리 것도 그 되울림도 아닌 변경만 센다.
+    bool stale;
+    {
+        std::lock_guard<std::mutex> lock(s_mx);
+        stale = (s_pending->localGen != s_localGen);
+    }
+    if (stale) {
+        ClearPending(hw);
+        SetStatus(true, L"여기서 방금 복사한 것이 더 새것이라 받은 것은 붙이지 않았어요");
+        DbgEvent(L"clip: deferred item dropped - newer local copy");
+        return;
+    }
+
+    // 열리는지만 먼저 본다. 그림이면 WriteClipboard 가 열기 전에 PNG 를 푸는데, 잠긴
+    // 밤 내내 3초마다 수 MB 를 풀 이유가 없다. 열었다 닫기만 해서는 순번이 오르지 않는다.
+    if (!OpenClipboard(hw)) return;
+    CloseClipboard();
+
+    std::wstring why;
+    OpenFail of;
+    WriteResult r = WriteClipboard(hw, *s_pending, 1, seq, why, of);
+    if (r == WriteResult::Busy) return;    // 다음 바퀴에
+    if (r == WriteResult::Ok) {
+        NoteApplied(*s_pending, &s_pendingSince);
+    } else {
+        SetStatus(false, why);
+        DbgEvent(L"clip: apply failed - %s", why.c_str());
+    }
+    ClearPending(hw);
+}
+
 LRESULT CALLBACK ClipWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CLIPBOARDUPDATE: {
@@ -666,14 +860,25 @@ LRESULT CALLBACK ClipWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         Payload p;
         std::wstring why;
         bool optedOut = false;
-        if (!ReadClipboard(hw, p, why, optedOut)) {
+        OpenFail of;
+        bool read = ReadClipboard(hw, p, why, optedOut, of);
+        // 열기 실패는 연달아 이어지는 동안 첫 번만 적는다 (s_readOpenFailing).
+        if (of.failed && !s_readOpenFailing) {
+            DbgEvent(L"clip: read failed - %s (%s)", why.c_str(), of.diag.c_str());
+        }
+        s_readOpenFailing = of.failed;
+        if (!read) {
             // 넘길 형식이 없는 것은 늘 있는 일이라 상태를 흔들지 않는다
             // (파일을 복사하면 CF_HDROP 만 올라온다).
             //
             // 그래도 사용자가 여기서 방금 무언가를 복사했다는 것은 적어 둔다.
             // 넘기지 못하는 것이어도, 가지러 간 사이에 복사한 것 위에 남의 것을
             // 덮으면 안 되기는 마찬가지다 (WM_CLIP_APPLY).
-            {
+            //
+            // 잠긴 채로 열지 못한 것만은 세지 않는다. 잠금 화면 뒤에서 복사할 사람은
+            // 없고, 이걸 세면 잠금이 풀리기를 기다리던 것(s_pending)이 바로 그 잠금
+            // 때문에 "더 새 복사가 있다" 로 버려진다.
+            if (!(of.failed && of.locked)) {
                 std::lock_guard<std::mutex> lock(s_mx);
                 s_localGen++;
             }
@@ -740,6 +945,14 @@ LRESULT CALLBACK ClipWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         Payload* p = (Payload*)lp;
         std::wstring why;
 
+        // 미뤄 둔 것이 있으면 이것이 그보다 새것이다. 이것을 붙이든, 이것도 미루든,
+        // 이것마저 아래에서 버리든(여기서 복사한 것이 둘 다보다 새것이다) 앞의 것은
+        // 더 붙일 일이 없다.
+        if (s_pending) {
+            ClearPending(hw);
+            DbgEvent(L"clip: deferred item replaced by a newer one");
+        }
+
         // 가지러 간 사이에 사용자가 여기서 새로 복사했으면 붙이지 않는다.
         //
         // 일꾼이 행을 보고 그림을 내려받는 데는 몇 초가 걸릴 수 있고, 그 사이에도
@@ -780,14 +993,17 @@ LRESULT CALLBACK ClipWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
 
-        if (WriteClipboard(hw, *p, why)) {
-            {
-                std::lock_guard<std::mutex> lock(s_mx);
-                s_status.received++;
-            }
-            SetStatus(true, p->isImage ? L"그림을 받았습니다" : L"텍스트를 받았습니다");
-            DbgEvent(L"clip: applied %s (%zu bytes)",
-                     p->isImage ? L"image" : L"text", p->bytes.size());
+        OpenFail of;
+        WriteResult r = WriteClipboard(hw, *p, 8, 0, why, of);
+        if (r == WriteResult::Busy) {
+            // 열지 못한 것은 버리지 않고 쥐고 있다가 다시 붙여 본다 (s_pending 의 주석).
+            // s_seenId 는 이미 올랐으므로 여기서 놓으면 다시 받을 길이 없다.
+            DeferPending(hw, p);
+            DbgEvent(L"clip: apply deferred - %s (%s)", why.c_str(), of.diag.c_str());
+            return 0;
+        }
+        if (r == WriteResult::Ok) {
+            NoteApplied(*p, nullptr);
         } else {
             SetStatus(false, why);
             DbgEvent(L"clip: apply failed - %s", why.c_str());
@@ -795,7 +1011,14 @@ LRESULT CALLBACK ClipWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         delete p;
         return 0;
     }
+    case WM_TIMER:
+        if (wp == kDeferTimerId) RetryPending(hw);
+        return 0;
     case WM_DESTROY:
+        // 끄면 미뤄 둔 것도 버린다. 다시 켜면 기준선부터 다시 적으므로(clipsync.h
+        // 머리말) 이것을 이어 붙일 자리가 없다. 사라진 것이 로그에는 남게 한다.
+        if (s_pending) DbgEvent(L"clip: deferred item discarded - sync stopped");
+        ClearPending(hw);
         RemoveClipboardFormatListener(hw);
         PostQuitMessage(0);
         return 0;
@@ -826,6 +1049,7 @@ DWORD WINAPI WindowThread(LPVOID) {
         DestroyWindow(hw);
         return 0;
     }
+    s_readOpenFailing = false;
     s_hwnd = hw;
     DbgEvent(L"clip: listening as '%s'", s_device.c_str());
 
@@ -1007,7 +1231,15 @@ void DoPoll(const std::wstring& access, unsigned long localGen) {
         }
         return;
     }
-    if (p->bytes.empty()) { delete p; return; }
+    if (p->bytes.empty()) {
+        // 글의 본문을 받으러 가기 전에 그 행이 정리됐다 (FetchBody 의 주석). 어느 PC 가
+        // 그새 더 새 것을 올리면서 지난 행을 지운 것이고, 그것이 남의 것이면 다음 조회가
+        // 받는다 - 그래서 오류는 아니다. 하지만 아무 줄도 남기지 않으면 받은 줄도 실패한
+        // 줄도 없이 그 id 만 사라져서, 로그로는 잃은 것인지 건너뛴 것인지 가릴 수 없다.
+        if (!it.isImage) DbgEvent(L"clip: text body gone before download (id=%lld)", it.id);
+        delete p;
+        return;
+    }
     if (cap && p->bytes.size() > cap) {
         wchar_t b[96];
         _snwprintf_s(b, _countof(b), _TRUNCATE, L"%zu KB 라 받지 않음 (상한 %lu KB)",
