@@ -111,12 +111,15 @@ Mac 이 없는 곳에서 행동을 확인하는 유일한 방법이다.
   오버레이의 "Lock hh:mm" 이 UTC 오프셋만큼 틀리던 것(Q1), 잠금 해제 지연 타이머가 다음
   수동 잠금을 풀던 것(Q2), [중지] 뒤에 오버레이가 예전 상태로 남던 것(Q4), 고른 그림이
   다음 [시작] 까지 저장되지 않던 것(Q5), [중지] 직후 도착한 결과가 화면을 잠그던 것(Q6).
-  **Windows 판은 그대로다** - 고치려면 `client/` 에서 같이 고칠 것.
+  **Windows 판도 이제 같이 고쳤다** (다음 릴리스부터, `client/main.cpp`·`client/blackscreen.cpp`).
+  Q2 는 잠금이 시작되는 모든 곳(자동 `ActivateBlackScreen`, 수동 잠금 버튼들을 모은
+  `ManualLockNow`)에서 남은 해제 카운트다운을 지운다.
 - **폰 앱이 GATT 로 막 붙은 순간의 거짓 NEAR** (검토에서 나온 Windows 결함). 구독이 생기면
   판정 스레드가 바로 깨는데, 그때는 폴링 간격이 아직 0 이라 "입력 중 = 자리에 있음" 으로
   읽혀 NEAR 가 한 번 나온다 - 잠긴 화면이 한 샘플 동안 풀릴 수 있다. Mac 은 구독을 알리기
-  전에 간격을 먼저 계산해 둔다. Windows(`client/ble_gatt.cpp` 의 SubscribedClientsChanged)는
-  아직 그대로다.
+  전에 간격을 먼저 계산해 둔다. Windows(`client/ble_gatt.cpp` 의 SubscribedClientsChanged)도
+  이제 같은 방법으로 고쳤다 (다음 릴리스부터): 간격과 시각을 구독자 수보다 먼저 내놓고,
+  틱 스레드와 같은 잠금(`pollMutex`) 안에서 바꾼다.
 - `--clip-test` 는 SmartScreen 이 켜져 있으면 거절하고, 받은 새 refresh 토큰을 저장한다.
   Windows 판은 점검이 토큰을 회전시키고 버린다 (clipsync 명세 10-1). 그것만으로는 로그인이 끊기지
   않는다 - Supabase(GoTrue)는 바로 앞 세대의 refresh 토큰을 받아 준다 (v1: 살아 있는 토큰의 부모인
