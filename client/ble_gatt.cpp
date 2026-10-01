@@ -45,6 +45,9 @@ struct BleGattServer::Impl {
     std::atomic<ULONGLONG> lostTick{ 0 };
     std::atomic<bool> everSubscribed{ false };
     std::atomic<DWORD> intervalMs{ 0 };
+    // subscribers / intervalMs / pollStartTick / lastReportTick 를 한 묶음으로 바꾸는 잠금.
+    // 틱 스레드와 SubscribedClientsChanged 가 서로의 값을 덮어쓰지 않게 한다 (아래 람다 주석).
+    std::mutex pollMutex;
 
     KalmanFilter kalman{ 4.0, 10.0 };  // 1Hz 샘플링: v1(Q=1)보다 빠르게 반응
     std::mutex kalmanMutex;
@@ -128,10 +131,17 @@ struct BleGattServer::Impl {
                 lastAdvCheck = t;
                 self->EnsureAdvertising();
             }
-            DWORD want = (self->subscribers > 0) ? DesiredIntervalMs() : 0;
-            DWORD prev = self->intervalMs.exchange(want);
-            ULONGLONG now = GetTickCount64();
-            if (want > 0 && prev == 0) self->pollStartTick = now;
+            DWORD want;
+            ULONGLONG now;
+            {
+                // 구독 콜백과 같은 잠금 안에서 정한다. 잠금이 없으면 "구독자 0 -> 간격 0" 을
+                // 계산한 직후 콜백이 첫 간격을 내놓고, 그 위에 0 을 덮어써 버릴 수 있다.
+                std::lock_guard<std::mutex> lock(self->pollMutex);
+                want = (self->subscribers > 0) ? DesiredIntervalMs() : 0;
+                DWORD prev = self->intervalMs.exchange(want);
+                now = GetTickCount64();
+                if (want > 0 && prev == 0) self->pollStartTick = now;
+            }
             if (want == 0 || (now - lastSent) < want) continue;
             try {
                 DataWriter w;
@@ -218,11 +228,30 @@ bool BleGattServer::Start(bool plain, const std::wstring& logPath) {
             [impl](GattLocalCharacteristic const& sender, winrt::Windows::Foundation::IInspectable const&)
         {
             int n = (int)sender.SubscribedClients().Size();
-            int prev = impl->subscribers.exchange(n);
+            // 새 구독이면 폴링 간격을 여기서 바로 정해 구독자 수와 한 번에 내놓는다 (200 ms
+            // 틱과 같은 규칙). 예전에는 구독자 수만 0 -> 1 로 바꾸고 아래 SetEvent 로 판정
+            // 스레드를 깨웠는데, intervalMs 는 틱 스레드가 최대 200 ms 뒤에야 정했다. 그 사이
+            // 판정은 "구독자 있음, 간격 0" 을 본다: 간격 0 이면 IsHealthy 는 무조건 true 이고
+            // 판정은 "간격 0 = 사용자가 입력 중" 으로 읽어 NEAR 를 낸다. 자리에 아무도 없는데
+            // 잠긴 화면이 풀릴 수 있었다 (events.log 의 "GATT client subscribed" 바로 뒤
+            // "STATE FAR -> NEAR (GATT ...)"). Mac 판 GattServer 와 같은 고침이다.
+            // IsHealthy 는 subscribers 를 먼저 읽으므로 간격과 시각을 구독자 수보다 먼저 쓴다.
+            // DesiredIntervalMs 는 잠금 밖에서 계산한다 (잠금 안에서는 값만 바꾼다).
+            DWORD firstIv = Impl::DesiredIntervalMs();
             ULONGLONG now = GetTickCount64();
+            int prev;
+            {
+                std::lock_guard<std::mutex> lock(impl->pollMutex);
+                prev = impl->subscribers.load();
+                if (n > 0 && prev == 0) {
+                    impl->intervalMs = firstIv;
+                    // 첫 보고가 오기 전까지 판정은 상태를 그대로 둔다 (ReportAgeMs = 0xFFFFFFFF).
+                    impl->pollStartTick = now;
+                    impl->lastReportTick = 0;
+                }
+                impl->subscribers = n;
+            }
             if (n > 0 && prev == 0) {
-                impl->pollStartTick = now;
-                impl->lastReportTick = 0;
                 impl->everSubscribed = true;
                 {
                     std::lock_guard<std::mutex> lock(impl->kalmanMutex);
