@@ -45,6 +45,9 @@ struct ProbeResult {
     ProxState state;
     ProxState prevState;
     DWORD     timerRemainMs;
+    // 이 결과를 낸 판정 스레드의 세대 (main.cpp g_scanGen). [중지] 의 조인을 넘긴 예전
+    // 스레드가 다음 [시작] 뒤에 보낸 결과를 받는 쪽이 가려낸다.
+    int       gen;
 };
 
 struct FarEvent {
@@ -66,6 +69,15 @@ static constexpr DWORD WARMUP_MS       = 120000;
 // 아홉 번은 상한이 걸리기 전에 두 번째 샘플이 도착한다. 상한이 걸리는 나머지
 // 한 번은 6초간 광고가 아예 없었다는 뜻이라, 그 자체가 멀어졌다는 약한 증거다.
 static constexpr DWORD BELOW_SAMPLE_CAP_MS = 6000;
+
+// PC 가 잠들었다 깨면 판정 스레드가 본 마지막 샘플은 잠들기 전 것이다. GetTickCount64 는
+// 잠든 시간을 세므로 깨자마자 "keepAlive 를 넘겼다", "수신 끊김(-100)" 이 되어, 폰이
+// 곁에 있어도 첫 판정에서 FAR 로 떨어진다. 그래서 깬 뒤 이 시간 동안은 새 샘플(광고나
+// GATT 보고)을 기다리고, 그동안은 FAR 로 가지 않는다. 광고 간격 p90 5.8초의 두 배 남짓.
+static constexpr DWORD kWakeGraceMs  = 12000;
+// 판정 반복 사이에 잠든 시간이 이만큼 늘었으면 "깨어났다" 로 본다. 틱 해상도(16ms)의
+// 흔들림이나 바쁜 PC 에서 늦게 도는 반복과 헷갈리지 않을 만큼 크게.
+static constexpr DWORD kSleepGapMs   = 5000;
 
 // ---------------------------------------------------------------------------
 // User-configurable settings (global)
@@ -104,7 +116,8 @@ extern bool      g_bBlackActive;
 extern bool      g_bManualLock;
 // 재보기 마법사가 도는 동안 참. 자리를 비우는 것이 절차의 일부라
 // 그냥 두면 재는 도중에 화면이 꺼진다.
-extern bool      g_measuring;
+// GATT 틱 스레드도 읽는다 (재는 동안은 입력이 있어도 TICK 을 보낸다 - ble_gatt.cpp).
+extern std::atomic<bool> g_measuring;
 extern int       g_nCountdown;
 extern int       g_unlockTimer;
 extern wchar_t   g_ovlInfo[128];

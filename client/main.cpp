@@ -184,9 +184,31 @@ static HBRUSH g_hBrushLocked  = nullptr;
 static HBRUSH g_hBrushStopped = nullptr;
 
 static HANDLE g_hThread       = nullptr;
+// 판정 스레드 정지 이벤트의 UI 쪽 사본. 스레드는 따로 복제한 자기 사본을 기다린다 (StopScanThread 주석).
 static HANDLE g_hStopEvent    = nullptr;
+// [시작] 마다 하나씩 올라가는 판정 스레드의 세대. 스레드와 그 결과(ProbeResult::gen)가 들고
+// 다니며, 지금 값과 다르면 지난 [시작] 의 것이다.
+static std::atomic<int> g_scanGen{ 0 };
 static int    g_selectedIdx   = -1;
 static int    g_logCount      = 0;
+
+// 판정 스레드를 멈춘다. [중지](StopMon) 와 오버레이 [종료] 가 같이 쓴다.
+//
+// 15초를 넘기면 기다리지 않고 간다 - 레거시 RFCOMM 경로의 DoProbe 는 연결 한 번에 14초까지
+// 걸렸다 (이 노트북 실측). 예전에는 그때도 결과를 안 보고 이벤트를 닫아 null 로 만들었는데,
+// 스레드는 반복마다 전역 g_hStopEvent 를 다시 읽었다: 다음 대기가 바로 실패(WAIT_FAILED)하며
+// 돌다가, 다음 [시작] 이 만든 이벤트를 제 것으로 삼았다 - 판정 스레드가 둘이 됐다.
+// 지금은 스레드가 자기 사본을 갖고 있어서 여기서는 UI 의 사본만 닫는다. 남겨 둔 스레드는 하던
+// 일을 마치면 신호된 자기 이벤트나 바뀐 세대(g_scanGen)를 보고 스스로 끝난다.
+static void StopScanThread() {
+    if (g_hStopEvent) SetEvent(g_hStopEvent);
+    if (g_hThread) {
+        if (WaitForSingleObject(g_hThread, 15000) != WAIT_OBJECT_0)
+            DbgEvent(L"scan thread did not stop in 15s - left to finish");
+        CloseHandle(g_hThread); g_hThread = nullptr;
+    }
+    if (g_hStopEvent) { CloseHandle(g_hStopEvent); g_hStopEvent = nullptr; }
+}
 
 // Overlay state text
 static wchar_t g_ovlLine1[64] = L"Stopped";
@@ -345,11 +367,8 @@ static LRESULT CALLBACK OverlayProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         switch (LOWORD(wParam)) {
         case ID_OVL_EXIT:
             if (g_monitoring) {
-                SetEvent(g_hStopEvent);
-                WaitForSingleObject(g_hThread, 15000);
+                StopScanThread();
                 CloseProbeSocket();
-                CloseHandle(g_hThread); CloseHandle(g_hStopEvent);
-                g_hThread = nullptr; g_hStopEvent = nullptr;
                 g_monitoring = false;
             }
             g_hOverlay = nullptr;
@@ -482,7 +501,27 @@ static DWORD WINAPI ReconnectThread(LPVOID) {
 static bool g_hasToken = false;
 static bool g_hasIrk = false;
 
-static DWORD WINAPI ScanThread(LPVOID) {
+// 판정 스레드 하나가 받는 것. 스레드가 시작하면서 지운다.
+struct ScanThreadParam {
+    HANDLE stopEvent;   // 이 스레드 몫의 정지 이벤트 사본 (DuplicateHandle). 스레드가 끝날 때 닫는다
+    int    gen;         // 시작할 때의 g_scanGen
+};
+
+// 부팅 뒤 잠들어 있던 시간의 합 (ms). GetTickCount64 는 잠든 시간까지 세고
+// QueryUnbiasedInterruptTime 은 빼고 센다 - 둘의 차가 늘었으면 그만큼 잤다.
+// 틱 해상도 때문에 ±16ms 흔들리고 음수일 수도 있어 부호 있는 값으로 다룬다.
+static long long AsleepMs() {
+    ULONGLONG unbiased = 0;
+    QueryUnbiasedInterruptTime(&unbiased);
+    return (long long)GetTickCount64() - (long long)(unbiased / 10000);
+}
+
+static DWORD WINAPI ScanThread(LPVOID param) {
+    // 정지 이벤트는 전역(g_hStopEvent)을 다시 읽지 않고 받은 사본을 쓴다 (StopScanThread 주석).
+    auto* prm = (ScanThreadParam*)param;
+    HANDLE stopEv = prm->stopEvent;
+    const int gen = prm->gen;
+    delete prm;
     g_proxState = ProxState::Far;
     g_lastNearTick = 0;
     // RFCOMM 프로브 결과 캐시 (폰 연결 대기 중에는 프로브를 띄엄띄엄 돌린다)
@@ -494,7 +533,31 @@ static DWORD WINAPI ScanThread(LPVOID) {
     int       belowCount = 0;
     ULONGLONG belowFirstTick = 0;   // 이 구간의 첫 미만 샘플 시각 (상한 계산용)
     ULONGLONG belowSampleTick = 0;  // 마지막으로 센 샘플의 식별자 (같으면 다시 세지 않는다)
+    // 깨어남 (kWakeGraceMs 주석). resumeTick != 0 이면 깬 뒤 새 샘플을 기다리는 중이다.
+    long long asleepPrev = AsleepMs();
+    ULONGLONG resumeTick = 0;
+    bool waitFailLogged = false;
     while (true) {
+        // 지난 [시작] 의 스레드면 아무것도 쓰지 않고 끝난다 (StopScanThread 주석)
+        if (gen != g_scanGen.load()) break;
+
+        // 반복 사이에 잠든 시간이 늘었으면 PC 가 잤다 깬 것이다. 판정이 들고 있는 샘플은
+        // 잠들기 전 것이라 바로 믿지 않는다. 확인 연결의 재시도 간격도 처음으로 되돌린다 -
+        // 자는 동안 폰은 다른 주소로 바뀌었을 수 있고, 늘어난 간격 탓에 늦게 찾을 이유가 없다.
+        {
+            long long asleep = AsleepMs();
+            if (asleep - asleepPrev >= (long long)kSleepGapMs) {
+                resumeTick = GetTickCount64();
+                DbgEvent(L"judge: slept %llds - absence waits up to %lus for a fresh sample",
+                         (asleep - asleepPrev) / 1000, kWakeGraceMs / 1000);
+                g_bleScanner.ResetProbeBackoff();
+            }
+            asleepPrev = asleep;
+        }
+        // 이 PC 에 폰 앱이 붙어 있는지 스캐너에 알린다. 오래 붙어 있으면 확인 연결을 쉬고,
+        // 떨어지면 곧바로 다시 찾는다 (BleRssiScanner::SetGattLinked).
+        g_bleScanner.SetGattLinked(g_bleGatt.IsHealthy());
+
         bool reachable = false; DWORD latency = 0; int wsaErr = 0;
         bool isNear = false, bleAvail = false, useGatt = false;
         int rssi = -100;
@@ -578,6 +641,9 @@ static DWORD WINAPI ScanThread(LPVOID) {
                 if (!gattWaiting || lastProbeTick == 0 || (tick - lastProbeTick) >= 20000) {
                     lastProbeTick = tick;
                     DoProbe(g_targetAddr, reachable, latency, wsaErr);
+                    // RFCOMM 연결은 14초까지 걸린다. 그 사이 [중지] 가 기다리기를 그만두고 다음
+                    // [시작] 이 새 스레드를 띄웠으면 이 결과는 지난 세대의 것이다 - 쓰지 않고 끝난다.
+                    if (gen != g_scanGen.load()) break;
                     cachedReachable = reachable; cachedLatency = latency; cachedErr = wsaErr;
                 } else {
                     reachable = cachedReachable; latency = cachedLatency; wsaErr = cachedErr;
@@ -599,6 +665,22 @@ static DWORD WINAPI ScanThread(LPVOID) {
         if (!bleAvail) {
             bool inWarmup = (g_reconnectTick > 0 && (now - g_reconnectTick) < WARMUP_MS);
             isNear = reachable && (latency <= g_nearLatencyMs || inWarmup);
+        }
+
+        // 깬 뒤 새 샘플(광고든 GATT 보고든)이 올 때까지는 어느 갈래로도 FAR 로 가지 않는다.
+        // GetTickCount64 는 잠든 시간까지 세므로, 깨자마자는 keepAlive 도 수신 타임아웃(-100)도
+        // 이미 넘긴 것으로 보여 폰이 곁에 있어도 첫 판정에서 FAR 가 된다. 새 샘플이 오면 바로
+        // 평소 규칙으로 돌아가고, kWakeGraceMs 안에 하나도 안 오면 그때는 정말 없는 것이다.
+        bool wakeHold = false;
+        if (resumeTick != 0) {
+            if (g_bleScanner.LastReceivedTick() > resumeTick || g_bleGatt.LastReportTick() > resumeTick) {
+                resumeTick = 0;
+            } else if (now - resumeTick < kWakeGraceMs) {
+                wakeHold = true;
+            } else {
+                DbgEvent(L"judge: no sample within %lus of waking - absence applies", kWakeGraceMs / 1000);
+                resumeTick = 0;
+            }
         }
 
         if (isNear) {
@@ -631,9 +713,10 @@ static DWORD WINAPI ScanThread(LPVOID) {
                 goFar = (belowCount >= 2) ||
                         (now - belowFirstTick) >= BELOW_SAMPLE_CAP_MS;
             }
-            if (goFar) g_proxState = ProxState::Far;
+            if (goFar && !wakeHold) g_proxState = ProxState::Far;
         }
         auto* r = new ProbeResult{};
+        r->gen = gen;
         r->reachable = reachable; r->latencyMs = latency; r->wsaError = wsaErr;
         r->rssiDbm = rssi; r->bleAvailable = bleAvail; r->gatt = useGatt;
         r->thresholdDbm = effThr;
@@ -645,9 +728,21 @@ static DWORD WINAPI ScanThread(LPVOID) {
         } else r->timerRemainMs = 0;
         PostMessage(g_hWnd, WM_SCAN_RESULT, 0, (LPARAM)r);
         // 대상 기기의 BLE 패킷이 도착하면 주기를 기다리지 않고 즉시 재판정
-        HANDLE waits[3] = { g_hStopEvent, g_bleScanner.PacketEvent(), g_bleGatt.ReportEvent() };
-        if (WaitForMultipleObjects(3, waits, FALSE, g_scanIntervalSec * 1000) == WAIT_OBJECT_0) break;
+        HANDLE waits[3] = { stopEv, g_bleScanner.PacketEvent(), g_bleGatt.ReportEvent() };
+        DWORD w = WaitForMultipleObjects(3, waits, FALSE, g_scanIntervalSec * 1000);
+        if (w == WAIT_OBJECT_0) break;
+        if (w == WAIT_FAILED) {
+            // 세 핸들이 다 살아 있으면 일어나지 않는다. 그래도 끝내지는 않는다 - 끝내면 화면은
+            // 멀쩡해 보이는데 판정만 조용히 멎는다. 한 번만 적고, 2초씩 쉬며 계속 판정한다
+            // (쉬지 않으면 실패한 대기가 곧바로 돌아와 CPU 를 다 쓴다).
+            if (!waitFailLogged) {
+                DbgEvent(L"scan thread wait failed (err=%lu)", GetLastError());
+                waitFailLogged = true;
+            }
+            Sleep(2000);
+        }
     }
+    CloseHandle(stopEv);
     return 0;
 }
 
@@ -941,8 +1036,23 @@ static void StartMon() {
     cfg.bannerImagePath = g_bannerImagePath;
     SaveAppConfig(cfg);
 
+    // 판정 스레드는 새 세대 번호와, 정지 이벤트를 복제한 자기 사본을 받는다 (StopScanThread 주석).
+    // 지난 [중지] 에서 끝나지 않고 남은 스레드가 있으면 세대가 바뀐 것을 보고 스스로 끝난다.
+    int gen = ++g_scanGen;
     g_hStopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-    g_hThread = CreateThread(nullptr, 0, ScanThread, nullptr, 0, nullptr);
+    auto* sp = new ScanThreadParam{ nullptr, gen };
+    HANDLE th = nullptr;
+    if (g_hStopEvent &&
+        DuplicateHandle(GetCurrentProcess(), g_hStopEvent, GetCurrentProcess(),
+                        &sp->stopEvent, 0, FALSE, DUPLICATE_SAME_ACCESS))
+        th = CreateThread(nullptr, 0, ScanThread, sp, 0, nullptr);
+    if (!th) {
+        // 예전에는 확인하지 않았다. 판정 스레드가 없으면 화면은 "보호 중" 인데 아무것도 판정하지 않는다.
+        DbgEvent(L"scan thread could not start (err=%lu)", GetLastError());
+        if (sp->stopEvent) CloseHandle(sp->stopEvent);
+        delete sp;
+    }
+    g_hThread = th;
     g_monitoring = true;
     g_hMouseHook = SetWindowsHookExW(WH_MOUSE_LL, LLMouseProc, nullptr, 0);
     g_hKeyHook = SetWindowsHookExW(WH_KEYBOARD_LL, LLKeyProc, nullptr, 0);
@@ -956,13 +1066,10 @@ static void StartMon() {
 
 static void StopMon() {
     if (!g_monitoring) return;
-    SetEvent(g_hStopEvent);
-    WaitForSingleObject(g_hThread, 15000);
+    StopScanThread();
     CloseProbeSocket();
     g_bleScanner.Stop();  // BLE RSSI 스캐너 중지
     g_bleGatt.Stop();
-    CloseHandle(g_hThread); CloseHandle(g_hStopEvent);
-    g_hThread = nullptr; g_hStopEvent = nullptr;
     g_monitoring = false;
     KillTimer(g_hWnd, IDT_COUNTDOWN);
     if (g_hMouseHook) { UnhookWindowsHookEx(g_hMouseHook); g_hMouseHook = nullptr; }
@@ -1062,15 +1169,22 @@ static void OnResult(ProbeResult* r) {
     // Q6: [중지] 전에 판정 스레드가 보낸 결과가 중지 뒤에 도착할 수 있다 (PostMessage).
     // 그 결과로 화면을 가리거나 "정지됨" 표시를 덮어쓰면 안 된다. r 은 부르는 쪽이 지운다.
     if (!g_monitoring) return;
+    // 지난 [시작] 의 판정 스레드가 보낸 것. [중지] 가 15초를 기다리다 두고 간 스레드는 다음
+    // [시작] 뒤에도 결과를 하나 더 보낼 수 있다 (StopScanThread 주석).
+    if (r->gen != g_scanGen.load()) return;
     g_logCount++;
     bool transition = (r->state != r->prevState);
-    if (transition)
-        DbgEvent(L"STATE %s -> %s  (%s rssi=%d dBm thr=%d set=%d, latency=%lums reachable=%d)",
+    if (transition) {
+        // 확인 연결(토큰 탐색)이 돌고 있거나 막 끝났으면 꼬리가 붙는다 (", probing for 1.3s").
+        // 탐색은 광고 수신과 같은 안테나를 쓴다 - 그 순간의 STATE 가 탐색 탓인지 로그만 보고 가르려고.
+        std::wstring probeTag = g_bleScanner.ProbeTagForLog();
+        DbgEvent(L"STATE %s -> %s  (%s rssi=%d dBm thr=%d set=%d, latency=%lums reachable=%d%s)",
             r->prevState == ProxState::Near ? L"NEAR" : L"FAR", r->state == ProxState::Near ? L"NEAR" : L"FAR",
             r->gatt ? L"GATT" : (r->bleAvailable ? L"adv" : L"latency"), r->rssiDbm,
             r->thresholdDbm,                                          // 히스테리시스 적용된 실효값
             r->gatt ? g_gattRssiThreshold : g_nearRssiThreshold,      // 설정값
-            r->latencyMs, r->reachable ? 1 : 0);
+            r->latencyMs, r->reachable ? 1 : 0, probeTag.c_str());
+    }
     if (transition && r->state == ProxState::Far) {
         FarEvent fe; fe.tickMs=GetTickCount64(); GetLocalTime(&fe.st);
         g_farEvents.push_back(fe);
@@ -1173,10 +1287,14 @@ static void OnResult(ProbeResult* r) {
         : (g_bleGatt.IsClientSubscribed() ? L"linked" : L"waiting");
     // 잠긴 아이폰을 특정하는 수단. 둘 다 없으면 특정할 방법이 원천적으로 없고,
     // 그래도 화면은 멀쩡해 보이므로 여기에 드러내 둔다.
+    // 토큰으로 아직 못 묶었어도 IRK 가 방금(30초 안) 폰의 광고를 풀었으면 폰은 알아보고 있다.
+    // 그동안은 확인 연결도 쉬므로 "토큰 대기" 라고 하면 기다리지 않는 것을 기다린다고 말하게 된다.
     const wchar_t* idSt =
         (!g_hasToken && !g_hasIrk)             ? L"없음!"
         : !g_hasToken                          ? L"IRK"
-        : (g_bleScanner.BoundAddress() == 0)   ? (g_hasIrk ? L"IRK/토큰 대기" : L"토큰 대기")
+        : (g_bleScanner.BoundAddress() == 0)   ? (!g_hasIrk ? L"토큰 대기"
+                                                  : g_bleScanner.IrkRecognisesPhone() ? L"IRK"
+                                                  : L"IRK/토큰 대기")
         :                                        (g_hasIrk ? L"토큰+IRK" : L"토큰");
     if(r->bleAvailable)
         // 초당 수신 건수: 신호가 얼마나 촘촘한지 보면서 임계값을 잡을 수 있다
@@ -2416,6 +2534,23 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 DbgEvent(L"companion app seen - gattSeen NOT saved (it will be set again on a later run)");
         }
         break;
+    }
+
+    case WM_POWERBROADCAST: {
+        // 잠자기와 깨어남을 기록만 한다 (Mac 의 SLEEP / WAKE 와 같은 글자). 행동은 바꾸지 않는다 -
+        // 깬 뒤의 판정은 판정 스레드가 잠든 시간을 직접 재서 다룬다 (ScanThread, kWakeGraceMs).
+        // 이 메시지는 숨겨진 창이라도 최상위 창이면 받는다 (메시지 전용 창은 못 받는다). 이 창은
+        // 늘 떠 있는 최상위 창이라 여기서 받는다.
+        // 깨어날 때는 RESUMEAUTOMATIC 이 오고, 사람이 깨웠으면 RESUMESUSPEND 가 하나 더 온다 -
+        // 한 번 잠든 것에 WAKE 는 한 줄만.
+        static bool s_wakeLogged = false;
+        if (wParam == PBT_APMSUSPEND) {
+            DbgEvent(L"SLEEP");
+            s_wakeLogged = false;
+        } else if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
+            if (!s_wakeLogged) { DbgEvent(L"WAKE"); s_wakeLogged = true; }
+        }
+        return TRUE;
     }
 
     case WM_SESSION_ROTATED: {

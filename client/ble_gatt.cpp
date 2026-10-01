@@ -62,6 +62,10 @@ struct BleGattServer::Impl {
     // 폴링 정책: RSSI가 필요한 건 "자리를 떴을지도 모를 때"뿐 → 입력 중에는 폰 앱을 깨우지 않음 (배터리)
     static DWORD DesiredIntervalMs() {
         if (g_bBlackActive) return 2000;                 // 잠김 상태: 복귀 감시
+        // 재보기 중: 입력이 있어도 1초마다 깨운다. 아래 "입력 중 = 0" 을 그대로 두면 앉아
+        // 있는 1분 동안 키보드를 만진 사람은 연결 표본이 하나도 안 쌓여 "연결 신호 못 쟀어요"
+        // 가 된다. 재는 동안은 잠그지 않으므로(g_measuring) 판정이 연결 RSSI 를 봐도 괜찮다.
+        if (g_measuring) return 1000;
         ULONGLONG idle = GetTickCount64() - g_lastInputTick.load();
         if (idle < 5000)   return 0;                     // 입력 중 = 자리에 있음
         if (idle < 120000) return 1000;                  // 입력 멈춤 직후: 빠르게 확인
@@ -120,16 +124,32 @@ struct BleGattServer::Impl {
         }
     }
 
+    // 틱 스레드가 받는 것. 스레드가 시작하면서 지운다.
+    struct TickParam {
+        Impl*  self;
+        HANDLE stopEvent;   // 이 스레드 몫의 사본 (DuplicateHandle). 스레드가 끝날 때 닫는다
+    };
+
+    // 정지 이벤트는 멤버(stopEvent)를 매번 다시 읽지 않고 자기 사본을 기다린다. 예전에는
+    // Stop 이 3초 조인을 넘겨도 멤버를 닫고 null 로 만들어서, 그때 아직 돌던 스레드의 대기가
+    // 바로 실패(WAIT_FAILED)하며 200ms 쉼 없이 돌았고, 다음 Start 가 만든 이벤트를 제 것으로
+    // 삼아 틱 스레드가 둘이 됐다. 사본은 Stop 이 자기 것을 닫아도 살아 있고 이미 신호돼 있다.
     static DWORD WINAPI TickThread(LPVOID p) {
-        auto* self = (Impl*)p;
+        auto* prm = (TickParam*)p;
+        Impl* self = prm->self;
+        HANDLE stopEv = prm->stopEvent;
+        delete prm;
         try { winrt::init_apartment(winrt::apartment_type::multi_threaded); } catch (...) {}
         ULONGLONG lastSent = 0, lastAdvCheck = 0;
         uint8_t seq = 0;
-        while (WaitForSingleObject(self->stopEvent, 200) != WAIT_OBJECT_0) {
+        while (WaitForSingleObject(stopEv, 200) == WAIT_TIMEOUT) {
             ULONGLONG t = GetTickCount64();
             if (self->subscribers == 0 && (t - lastAdvCheck) > 3000) {
                 lastAdvCheck = t;
                 self->EnsureAdvertising();
+                // 광고를 다시 켜는 데는 시간이 걸린다 (멈춤 -> 200ms -> 시작). 그 사이 Stop 이
+                // 지나갔으면 tickChar 를 비우는 중일 수 있다 - 만지지 않고 나간다.
+                if (WaitForSingleObject(stopEv, 0) != WAIT_TIMEOUT) break;
             }
             DWORD want;
             ULONGLONG now;
@@ -150,6 +170,7 @@ struct BleGattServer::Impl {
                 lastSent = now;
             } catch (...) {}
         }
+        CloseHandle(stopEv);
         return 0;
     }
 };
@@ -317,8 +338,19 @@ bool BleGattServer::Start(bool plain, const std::wstring& logPath) {
         DbgEvent(L"GATT advertising: status=%d (2=Started, 3=Aborted)",
                  (int)m_impl->provider.AdvertisementStatus());
 
+        // 틱 스레드는 정지 이벤트의 사본을 따로 받는다 (TickThread 주석). 멤버는 Stop 의 몫이다.
         m_impl->stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        m_impl->thread = CreateThread(nullptr, 0, Impl::TickThread, m_impl, 0, nullptr);
+        auto* tp = new Impl::TickParam{ m_impl, nullptr };
+        if (m_impl->stopEvent &&
+            DuplicateHandle(GetCurrentProcess(), m_impl->stopEvent, GetCurrentProcess(),
+                            &tp->stopEvent, 0, FALSE, DUPLICATE_SAME_ACCESS))
+            m_impl->thread = CreateThread(nullptr, 0, Impl::TickThread, tp, 0, nullptr);
+        if (!m_impl->thread) {
+            // 예전에는 확인하지 않았다. 틱이 없으면 폰 앱이 깨지 않아 보고가 안 온다.
+            DbgEvent(L"GATT tick thread could not start (err=%lu)", GetLastError());
+            if (tp->stopEvent) CloseHandle(tp->stopEvent);
+            delete tp;
+        }
         m_impl->running = true;
         DbgEvent(L"GATT server started (%s)", plain ? L"plain" : L"encryption required");
         return true;
@@ -338,10 +370,13 @@ void BleGattServer::Stop() {
 
     if (m_impl->thread) {
         SetEvent(m_impl->stopEvent);
-        WaitForSingleObject(m_impl->thread, 3000);
+        // 넘기면 스레드는 그대로 두고 갈 길을 간다. 스레드는 자기 사본(이미 신호됨)을
+        // 기다리므로 지금 하던 일을 마치면 스스로 끝난다. 여기서는 내 사본만 닫는다.
+        if (WaitForSingleObject(m_impl->thread, 3000) != WAIT_OBJECT_0)
+            DbgEvent(L"GATT tick thread did not stop in 3s - left to finish");
         CloseHandle(m_impl->thread); m_impl->thread = nullptr;
-        CloseHandle(m_impl->stopEvent); m_impl->stopEvent = nullptr;
     }
+    if (m_impl->stopEvent) { CloseHandle(m_impl->stopEvent); m_impl->stopEvent = nullptr; }
     try {
         if (m_impl->tickChar) m_impl->tickChar.SubscribedClientsChanged(m_impl->subToken);
         if (m_impl->rssiChar) m_impl->rssiChar.WriteRequested(m_impl->writeToken);
