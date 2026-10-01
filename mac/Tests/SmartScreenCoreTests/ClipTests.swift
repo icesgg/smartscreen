@@ -144,18 +144,12 @@ final class ClipTests: XCTestCase {
         XCTAssertFalse(ClipLogic.isFileCopy(types: ["public.png", "public.tiff"]))
     }
 
-    func testRemoteAppleCopy() {
-        // 아이폰에서 복사해 유니버설 클립보드로 넘어온 글/그림
-        XCTAssertTrue(ClipLogic.isRemoteAppleCopy(types: ["public.utf8-plain-text", "com.apple.is-remote-clipboard"]))
-        XCTAssertTrue(ClipLogic.isRemoteAppleCopy(types: ["com.apple.is-remote-clipboard", "public.png"]))
-        // 이 Mac 에서 복사한 것
-        XCTAssertFalse(ClipLogic.isRemoteAppleCopy(types: ["public.utf8-plain-text", "public.png"]))
-        XCTAssertFalse(ClipLogic.isRemoteAppleCopy(types: []))
-        // 비슷한 이름은 아니다 (정확히 그 형식만)
-        XCTAssertFalse(ClipLogic.isRemoteAppleCopy(types: ["com.apple.is-remote-clipboard.x", "is-remote-clipboard"]))
-        // "공유하지 말라고 표시" 와는 다른 것이다 - 상태 줄에 그 말이 뜨면 안 된다
+    func testRemoteAppleCopyIsSent() {
+        // 아이폰에서 복사해 유니버설 클립보드로 넘어온 것도 보낸다 (사용자가 원하는 쓰임, 2026-10-01).
+        // "공유하지 말라" 표시로 잘못 거르지 않는지만 지킨다.
         XCTAssertFalse(ClipLogic.optOutTypes.contains("com.apple.is-remote-clipboard"))
         XCTAssertFalse(ClipLogic.isOptedOut(types: ["public.utf8-plain-text", "com.apple.is-remote-clipboard"]))
+        XCTAssertFalse(ClipLogic.isFileCopy(types: ["com.apple.is-remote-clipboard", "public.png"]))
     }
 
     // MARK: - JSON (§2.4)
