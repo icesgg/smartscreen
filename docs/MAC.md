@@ -62,6 +62,18 @@ Mac 이 없는 곳에서 행동을 확인하는 유일한 방법이다.
   수동 잠금을 풀던 것(Q2), [중지] 뒤에 오버레이가 예전 상태로 남던 것(Q4), 고른 그림이
   다음 [시작] 까지 저장되지 않던 것(Q5), [중지] 직후 도착한 결과가 화면을 잠그던 것(Q6).
   **Windows 판은 그대로다** - 고치려면 `client/` 에서 같이 고칠 것.
+- **폰 앱이 GATT 로 막 붙은 순간의 거짓 NEAR** (검토에서 나온 Windows 결함). 구독이 생기면
+  판정 스레드가 바로 깨는데, 그때는 폴링 간격이 아직 0 이라 "입력 중 = 자리에 있음" 으로
+  읽혀 NEAR 가 한 번 나온다 - 잠긴 화면이 한 샘플 동안 풀릴 수 있다. Mac 은 구독을 알리기
+  전에 간격을 먼저 계산해 둔다. Windows(`client/ble_gatt.cpp` 의 SubscribedClientsChanged)는
+  아직 그대로다.
+- `--clip-test` 는 SmartScreen 이 켜져 있으면 거절하고, 받은 새 refresh 토큰을 저장한다.
+  Windows 판은 점검이 토큰을 회전시키고 버려서, 켜져 있는 앱의 로그인이 풀릴 수 있다
+  (clipsync 명세 10-1). 역시 Windows 는 그대로다.
+- 잠금 화면은 자기 창만 앞으로 올린다. 앱 전체를 활성화하면 열어 둔 설정 창까지 다른 앱
+  창들 위로 올라온다 (Windows 의 SetForegroundWindow 는 잠금 창 하나만 올린다).
+- 블루투스 권한이 없으면 [시작] 에서 한 번, BLE 직접 등록에서 매번 그렇게 말한다. Windows 에는
+  권한이라는 것이 없어서 대응하는 문구가 없다.
 - 앱을 다시 열면(Finder, Launchpad) 간단 창이 나온다. Windows 는 두 번째 실행이 "이미
   실행 중" 으로 끝나지만, macOS 는 같은 앱을 다시 띄우지 않고 떠 있는 앱을 깨운다.
   오버레이 [설정] 말고도 돌아오는 길이 하나 더 생긴 것뿐이다.
@@ -81,28 +93,78 @@ PC 들이 Mac zip 을 받아 자기 exe 자리에 놓으려 든다. 그래서 Ma
 | `org_mac_release_approvals` | 조직 admin 의 Mac 버전 승인 |
 | Storage `releases` | 같은 버킷, `mac/` 아래 (버킷 정책은 이미 관리자에게 모든 경로를 연다) |
 
-버전 번호는 Windows 와 같다 (`client/version.h`). `release.bat` 이 Windows 판을 내놓고
-푸시하면 CI 가 그 커밋의 Mac 판을 만들고, `release.ps1` 이 그 artifact 를 받아
-`Publish.exe --platform mac` 으로 올린다. Mac 단계가 실패해도 Windows 릴리스는 그대로이고,
-다시 할 명령(`release-mac.bat <버전>`)을 알려 준다.
+마이그레이션은 덤으로 `releases.storage_path` 에 `<버전>/SmartScreen.exe` 모양의 제약을 건다.
+SQL Editor 에서 Mac 행을 `releases` 에 잘못 넣는 길까지 서버가 막는다 - 위의 사고는 행 하나로
+난다. 2026-10-01 에 라이브의 켜진 행 8개(1.1.0 ~ 1.1.7)를 anon key 로 읽어 전부 그 모양인 것을
+확인했다. `Publish.exe` 도 Windows 모드에서 `MZ` 로 시작하지 않는 파일을 거절한다.
 
-적용: 받은 zip 의 해시를 행과 대조 → `ditto` 로 풀기 → 풀린 앱의 번들 id 와 버전 확인 →
-자기 실행 파일을 `update/updater` 로 복사해 `--apply-update` 로 띄우고 정상 종료 → 복사본이
-원래 프로세스가 끝나기를 기다렸다가 `SmartScreen.app` 을 `.bak` 으로 옮기고 새 앱을 놓고
-다시 띄운다. 실패는 Windows 와 같이 `failed-<버전>.txt` 로 기억한다.
+### 내놓는 길
+
+버전 번호는 Windows 와 같다 (`client/version.h`). `release.bat` 한 번이 둘 다 한다:
+
+1. 지금까지와 같이 Windows 판을 빌드·게시·커밋·푸시하고 앱을 다시 띄운다
+2. 푸시한 커밋의 CI 실행(`mac.yml`)을 `gh` 로 찾아 끝나기를 기다린다
+3. artifact `SmartScreen-mac` 을 받아 `VERSION` 과 zip 안의 Info.plist 버전이 새 번호인지 본다
+4. 저장소 맨 위에 `SmartScreen-mac.zip` 으로 복사하고 (새로 까는 Mac 용)
+5. `Publish.exe --platform mac --file <zip>` - 브라우저 로그인을 한 번 더 한다. Publish.exe 도
+   zip 안의 번들 id 와 버전을 직접 읽어 대조하고, 올린 뒤 anon 으로 다시 받아 해시를 본다
+
+Mac 단계가 실패해도 Windows 릴리스는 그대로이고, 다시 할 명령(`release-mac.bat <버전>`)을
+찍는다. 필요한 것: `gh` 와 `gh auth login` 한 번. `-NoGit` / `-DryRun` 이면 Mac 단계는 건너뛴다
+(푸시한 커밋이 없으면 CI 가 만들 것도 없다).
+
+### 적용
+
+받은 zip 의 해시를 행과 대조 → `ditto` 로 풀기 → 풀린 앱의 번들 id 와 버전 확인 (여기까지
+받는 단계에서 한다 - 잘못된 zip 을 앱이 꺼지기 전에 알아채고 실패로 기록한다) → 자기 실행
+파일을 `update/updater` 로 복사해 `--apply-update` 로 띄우고 정상 종료 → 복사본이 원래
+프로세스가 끝나기를 기다렸다가 zip 의 해시를 **다시 재고 다시 풀어** 그것을 놓는다 (풀어 둔
+폴더가 그 사이에 바뀌었으면 해시 검사가 무의미하다) → `SmartScreen.app` 을 `.bak` 으로 옮기고
+새 앱을 놓고 다시 띄운다. 실패는 Windows 와 같이 `failed-<버전>.txt` 로 기억한다.
+
+Windows 와 다른 실패 사유가 셋 있다. 앱 이름이 `SmartScreen.app` 이 아닐 때, 다운로드 폴더에서
+바로 실행 중일 때(macOS 가 읽기 전용 임시 위치로 옮겨 실행한다 - App Translocation), 그리고
+macOS 의 "앱 관리" 보호가 바꾸기를 막을 때(EPERM). 셋 다 띠에 이유가 뜨고, 같은 버전을
+저절로 다시 시도하지 않는다.
+
+---
+
+## 경고창이 판정을 멈추면 안 된다 (검토에서 나온 것)
+
+Windows 의 MessageBox 는 떠 있는 동안에도 메시지를 돌린다 - 로그인 결과 창이 떠 있어도
+`WM_SCAN_RESULT` 가 와서 FAR 이면 바로 잠근다. macOS 에서 같은 일을 하려면 조심해야 한다:
+`DispatchQueue.main.async` 블록 **안에서** `NSAlert.runModal()` 을 띄우면, 창이 닫힐 때까지 메인
+큐의 다른 블록이 하나도 돌지 않는다 (메인 큐는 직렬이고 중첩 런 루프는 그것을 다시 비우지
+않는다). 판정 결과가 메인 큐로 오던 첫 판에서는, 계정 로그인 결과 창을 띄워 둔 채 자리를
+떠도 화면이 바로 가려지지 않았고 폰이 돌아와도 풀리지 않았다. 검토자 다섯이 따로 찾았다.
+
+그래서 두 겹으로 막는다:
+- 판정 결과는 `MainLoop.perform` (CFRunLoopPerformBlock, common modes) 으로 보낸다. 이건 모달
+  런 루프 안에서도 돈다
+- 다른 스레드의 결과로 경고창을 띄울 때는 `MainTimer.once(after: 0)` 로 한 번 건너서, 경고창이
+  메인 큐 블록 밖(타이머 콜백)에서 뜨게 한다
+
+타이머(1초 카운트다운, 100 ms 입력 감시)는 `.common` 모드라 모달 중에도 원래 돈다.
 
 ---
 
 ## 확인하지 못한 것 (Mac 실기가 필요하다)
 
-CI 는 컴파일과 판단 로직 시험까지만 한다. 아래는 Mac 과 아이폰이 있어야 알 수 있다.
+CI 는 컴파일, 판단 로직 시험(174개), 유니버설 빌드, 서명, zip 까지 한다. 아래는 Mac 과
+아이폰이 있어야 알 수 있다. 중요한 순서다.
 
 1. **macOS 가 잠긴 아이폰의 overflow 광고를 서비스 필터로 찾아 주는가.** 이 포팅 전체가
    여기에 걸려 있다. `SmartScreen --probe-scan` 을 폰을 잠근 채 돌려 `>>> 토큰` 이 나오는지
    본다. 안 나오면 필터 없이 스캔해 제조사 데이터(`4C 00 01 ...`)를 Windows 처럼 직접 읽는
    쪽으로 바꿔야 한다 (ble 명세 8.3-1)
-2. Mac 의 광고 수신 간격 (Windows 실측 중앙값 1.7초, p90 5.8초). 6초 상한이 그 p90 에 맞춘
+2. 검은 화면을 띄우는 것 자체가 입력 유휴 시간을 되돌리지 않는가 (그러면 화면이 스스로 풀린다)
+3. 업데이트 뒤 블루투스 허용을 다시 묻는가 (위 "designated requirement"). 물으면 기업 Mac 의
+   자동 적용은 서명을 바꾸기 전까지 끄는 것이 맞다
+4. 자기 업데이트가 "앱 관리" 보호(macOS 13+)에 막히는가. 막히면 띠에 그 설정을 안내한다
+5. Mac 의 광고 수신 간격 (Windows 실측 중앙값 1.7초, p90 5.8초). 6초 상한이 그 p90 에 맞춘
    값이다. `bleDebugLog=1` 로 한 번 잴 것
-3. 검은 화면을 띄우는 것 자체가 입력 유휴 시간을 되돌리지 않는가 (그러면 화면이 스스로 풀린다)
-4. 업데이트 뒤 블루투스 허용을 다시 묻는가 (위 "designated requirement")
-5. 루프백 로그인이 Supabase 허용 목록을 통과하는가 (Windows 와 같은 주소라 통과해야 한다)
+6. 잠긴 아이폰이 Mac 의 GATT 서비스에 붙는가 (고급 창 아래 `GATT: linked`)
+7. 클립보드: macOS 15.4+ 의 "다른 앱에서 붙여넣기" 확인 창이 뜨는가, Chrome/Slack/미리보기에
+   받은 그림이 붙는가, 1Password 에서 복사한 것이 안 넘어가는가
+8. 루프백 로그인이 Supabase 허용 목록을 통과하는가 (Windows 와 같은 주소라 통과해야 한다)
+9. 잠금 화면이 다른 앱의 전체 화면 Space 와 메뉴 막대까지 덮는가, mp4 가 도는가

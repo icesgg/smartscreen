@@ -92,3 +92,21 @@ public enum MainTimer {
         return t
     }
 }
+
+/// Windows PostMessage 자리 - 작업 스레드가 메인에 결과를 넘길 때 쓴다. 아무 스레드에서 불러도 된다.
+///
+/// DispatchQueue.main.async 와 다른 점: GCD main 큐의 블록을 실행하는 동안에는 CFRunLoop 가 main
+/// 큐를 다시 비우지 않는다. 그 블록 안에서 NSAlert.runModal() 이 중첩 런 루프를 돌려도 마찬가지라,
+/// main.async 블록 안에서 열린 알림이 떠 있는 동안 뒤이은 main.async 블록(판정 결과 등)은 알림이
+/// 닫힐 때까지 전부 기다린다. CFRunLoopPerformBlock 으로 common 모드에 건 블록은 런 루프 자신의
+/// 일이라, 런 루프가 common 모드 중 하나로 돌기만 하면 처리된다 - runModal 의 모달 모드도 common 에
+/// 들어 있으므로, 그 알림이 GCD main 블록 안에서 열렸더라도 그 중첩 런 루프에서 돈다. Windows 의
+/// MessageBox 가 WM_SCAN_RESULT 를 계속 처리하던 것과 같다 (spec monitor §5 순서 제약 8).
+/// 걸어 둔 순서대로 돈다. 블록만 걸면 잠든 런 루프는 깨지 않으므로 CFRunLoopWakeUp 으로 깨운다.
+public enum MainLoop {
+    public static func perform(_ block: @escaping () -> Void) {
+        let rl = CFRunLoopGetMain()
+        CFRunLoopPerformBlock(rl, CFRunLoopMode.commonModes.rawValue, block)
+        CFRunLoopWakeUp(rl)
+    }
+}

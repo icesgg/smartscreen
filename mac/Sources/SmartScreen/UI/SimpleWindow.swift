@@ -366,8 +366,10 @@ final class SimpleWindowController: NSObject {
             text = "\(us.version) 내려받는 중 · \(us.progressPct)%"
         case .ready:
             show = true
-            // 가리는 중, 재는 중, 로그인 중에는 다시 시작하지 않는다 (UpdateTick 이 1분마다 다시 본다)
+            // 가리는 중, 재는 중, 로그인 중, 블루투스 등록 중에는 다시 시작하지 않는다 (UpdateTick 이
+            // 1분마다 다시 본다). 조건은 AppController.updateTick 과 같아야 한다.
             let held = app.guardEngine.blackActive || app.guardEngine.measuring || app.loginBusy
+                || app.bleRegisterBusy
             text = held ? "\(us.version) 준비됨 · 화면이 풀리면 적용해요"
                         : "\(us.version) 준비됨 · 곧 다시 시작해요"
         case .applying:

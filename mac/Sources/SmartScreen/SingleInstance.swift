@@ -33,6 +33,33 @@ enum SingleInstance {
         exit(0)
     }
 
+    /// 기다리지 않고 지금 잠금을 잡아 프로세스가 끝날 때까지 쥔다 (--clip-test). 다른 SmartScreen 이
+    /// 잡고 있으면 false. 잠금 파일을 못 열거나 잠금을 지원하지 않는 파일 시스템이면 true (막지 않는다 -
+    /// acquire() 와 같은 방침).
+    /// 확인만 하고 놓으면 점검이 도는 사이에 앱이 떠서 두 프로세스가 같은 refresh 토큰을 쓴다. 쥐고
+    /// 있으면 그 사이에 켠 앱은 10 초를 기다리다 "already running" 으로 끝난다 - 점검이 끝난 뒤 다시 켜면 된다.
+    static func tryAcquireNow() -> Bool {
+        if lockFd >= 0 { return true }
+        let path = Paths.configDir.appendingPathComponent("instance.lock", isDirectory: false).path
+        let fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
+        if fd < 0 { return true }
+        var interrupted = 0
+        while true {
+            if flock(fd, LOCK_EX | LOCK_NB) == 0 {
+                lockFd = fd
+                return true
+            }
+            let e = errno
+            if e == EINTR && interrupted < 3 {
+                interrupted += 1
+                continue
+            }
+            close(fd)
+            // 남이 잡고 있으면 EWOULDBLOCK (Darwin 에서는 EAGAIN 과 같은 값). 그 밖의 오류는 막지 않는다.
+            return e != EAGAIN
+        }
+    }
+
     private static func acquire() -> Bool {
         if lockFd >= 0 { return true }
         let path = Paths.configDir.appendingPathComponent("instance.lock", isDirectory: false).path

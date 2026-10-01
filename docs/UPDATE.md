@@ -272,3 +272,14 @@ version.h 패치 번호 +1  ->  배포 메모 묻기  ->  앱 정상 종료(오�
 - 아직 안 해 본 것: 실패 기록 뒤 [다시 시도], Program Files 에 둔 exe,
   `updateChannel=beta`. 코드는 있고 돈 적이 없다 - 이 저장소가 반복해서 배운 것이
   "쓰인 적 없는 코드는 틀린 줄 모른다" 다
+
+---
+
+## Mac 판 (2026-10-01)
+
+Mac 은 같은 버전 번호로, **다른 표**에서 받는다: `mac_releases` / `org_mac_release_approvals`
+(`supabase/mac_releases.sql`). 이미 깔린 Windows 1.1.x 는 `releases` 의 켜진 행을 플랫폼을
+묻지 않고 전부 받아 해시만 보고 실행하므로, 그 표에 Mac zip 을 넣는 순간 Windows PC 가
+zip 을 exe 자리에 놓는다. 이유와 적용 절차, `release.bat` 의 Mac 단계와 `release-mac.bat` 은
+`docs/MAC.md` "업데이트는 표를 따로 쓴다". 대시보드의 "프로그램 업데이트" 칸은 Windows / Mac
+목록이 따로이고 승인도 따로다.

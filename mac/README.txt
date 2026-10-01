@@ -198,7 +198,14 @@ Windows PC 에서 캡처하면 Mac 에서 Command+V 로 붙고, 반대도 됩니
 
   점검 (터미널에서):
     /Applications/SmartScreen.app/Contents/MacOS/SmartScreen --clip-test
-  결과는 ~/Library/Application Support/SmartScreen/clip-test.txt 에도 적힙니다.
+  올리기 / 조회 / 내려받기 / 덮어쓰기를 이 Mac 한 대에서 차례로 해 보고
+  어디서 막히는지 알려줍니다. 결과는
+  ~/Library/Application Support/SmartScreen/clip-test.txt 에도 적힙니다.
+
+  ※ SmartScreen 을 먼저 끄세요 (오른쪽 위 작은 상자의 [종료]).
+    점검이 로그인을 새로 받는데, 켜져 있는 SmartScreen 은 예전 로그인을 들고
+    있어서 그쪽 로그인이 풀릴 수 있습니다. 켜져 있으면 점검이 그렇게 말하고
+    멈춥니다.
 
 
 7. 설정 파일

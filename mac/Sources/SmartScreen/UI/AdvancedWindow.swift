@@ -73,6 +73,9 @@ final class AdvancedWindowController: NSObject {
 
     /// 목록 줄 (맨 위가 최신, 최대 500). insertRow 가 채운다.
     private var rows: [[String]] = []
+    /// AppController 가 setRegisterButtonEnabled 로 정한 [폰 등록] 상태 (로그인 중 / BLE 등록 중이면
+    /// false). syncFromModel 은 이것을 따른다 - app.loginBusy 만 보면 BLE 등록 중에 단추가 다시 켜진다.
+    private var registerAllowed = true
 
     init(app: AppController) {
         self.app = app
@@ -157,8 +160,8 @@ final class AdvancedWindowController: NSObject {
         let status = app.statusText
         if !status.isEmpty { statusBar.text = status }
 
-        // 로그인 중에는 [폰 등록] 을 막는다 (WM_LOGIN_RESULT 가 다시 켠다).
-        registerButton.isEnabled = !app.loginBusy
+        // 로그인 중과 BLE 직접 등록 중에는 [폰 등록] 을 막는다 (결과가 오면 AppController 가 다시 켠다).
+        registerButton.isEnabled = registerAllowed && !app.loginBusy
         setMonitoringUI(app.monitoring)
         chart.needsDisplay = true
     }
@@ -230,6 +233,7 @@ final class AdvancedWindowController: NSObject {
     }
 
     func setRegisterButtonEnabled(_ on: Bool) {
+        registerAllowed = on
         registerButton.isEnabled = on
     }
 

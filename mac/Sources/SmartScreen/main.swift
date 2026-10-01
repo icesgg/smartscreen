@@ -6,7 +6,7 @@ import SmartScreenCore
 // 순서:
 //  1. 보조 모드: argv[1] 만 정확히(대소문자 구분) 본다. 한 번만 하고 끝나는 일이라 창을 만들지 않는다.
 //     단일 실행 잠금보다 먼저다 - 본 프로그램이 떠 있는 채로 돌려 봐야 쓸모가 있다 (적용기는 원래
-//     프로세스가 아직 살아 있을 때 시작된다).
+//     프로세스가 아직 살아 있을 때 시작된다). --clip-test 만은 앱이 떠 있으면 하지 않는다 (아래).
 //  2. 단일 실행 잠금 (10 초까지 기다린다)
 //  3. NSApplication: .accessory (Dock 아이콘 없음 - Windows 의 "작업 표시줄 없음, 트레이 없음"),
 //     AppDelegate, 보이지 않는 편집 메뉴. 나머지는 applicationDidFinishLaunching → AppController.launch.
@@ -46,12 +46,50 @@ private final class SSClipTestBox {
     var done = false
 }
 
+/// --clip-test 가 회전시킨 refresh 토큰(봉한 값)을 config.ini 에 적는다. 메인에서만 부른다 -
+/// config.ini 는 파일 전체를 다시 쓰므로 쓰는 쪽은 하나여야 한다.
+private func ssSaveRotatedRefresh(_ sealed: String) {
+    if sealed.isEmpty { return }
+    var c = ConfigStore.load()
+    c.authRefresh = sealed
+    // 못 읽은 config 는 save 가 거절한다 (그 사유는 ConfigStore 가 적는다)
+    if !ConfigStore.save(c) {
+        EventLog.write("clip-test: refresh token rotated but NOT saved - the next start may need a new login")
+    }
+}
+
 /// --clip-test: 클립보드 왕복 진단. 세션을 살리고, 올리고 받아 보고, 결과를 파일과 상자로 보인다.
 /// 파일로도 남기는 이유: 창에 뜬 글자를 손으로 옮겨 적게 만들면 아무도 그러지 않고, 실패한 줄의
 /// 상태코드가 그대로 사라진다.
+///
+/// 로그인 토큰 (Windows 와 일부러 다르다): 세션을 살리는 것 자체가 refresh 를 해서 refresh 토큰을
+/// 바꾼다(회전). Supabase 는 이미 쓴 토큰이 다시 오면 (재사용 감지) 그 로그인 전체를 끊는다.
+/// Windows 의 --clip-test 는 회전 콜백 없이 SessionStart 를 불러 새 토큰을 버린다. 그래서 config.ini
+/// 에는 이미 쓴 토큰이 남아 다음 실행이 로그인을 잃고, 떠 있던 앱은 메모리에 든 예전 토큰으로 다음
+/// 갱신을 하다가 세션째 끊긴다 (spec clipsync §10.1). Mac 은
+///   - 앱이 떠 있으면 (instance.lock 이 잡혀 있으면) 점검하지 않는다. 떠 있는 앱의 메모리 속 토큰은
+///     이 프로세스가 고칠 길이 없다.
+///   - 떠 있지 않으면 회전 콜백을 시작보다 먼저 걸고, 새 토큰을 메인에서 config.ini 에 저장한다.
+///     그래야 저장된 로그인이 다음 실행에도 살아 있다.
 private func ssRunClipTest() -> Int32 {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
+
+    // 확인만 하지 않고 잡아서 끝까지 쥔다 - 점검 도중에 앱이 떠서 같은 토큰을 쓰는 일도 막는다.
+    if !SingleInstance.tryAcquireNow() {
+        Alerts.warning("SmartScreen 이 켜져 있어요.\n\n점검이 로그인을 새로 받으면서, 켜져 있는 SmartScreen 의 "
+                       + "로그인이 풀릴 수 있어요.\n오른쪽 위 작은 상자의 [종료] 로 끈 뒤 다시 실행하세요.",
+                       title: "클립보드 왕복 진단")
+        return 1
+    }
+
+    // 회전 콜백은 일꾼 스레드에서 (start 와 token() 을 부른 스레드에서) 온다. 저장은 메인으로 넘긴다.
+    // 아래 결과 블록보다 먼저 main 큐에 들어가므로, 상자를 띄우기 전에 저장이 끝나 있다.
+    AccountSession.shared.onRotated { sealed in
+        DispatchQueue.main.async {
+            ssSaveRotatedRefresh(sealed)
+        }
+    }
 
     // 네트워크는 일꾼에서 돌리고 메인 런 루프는 돌려 둔다 (Http 는 메인에서 부르지 않는다는 약속)
     let box = SSClipTestBox()
@@ -82,9 +120,13 @@ private func ssRunClipTest() -> Int32 {
 
     var report = box.report
     let file = Paths.configDir.appendingPathComponent("clip-test.txt", isDirectory: false)
-    // Windows 는 ccs=UTF-8 로 써서 BOM 이 붙는다. 같은 모양으로 남긴다.
+    // Windows 는 "w, ccs=UTF-8" (텍스트 모드) 로 써서 BOM 이 붙고 줄마다 \n 이 \r\n 이 된다.
+    // 같은 바이트로 남긴다 (spec clipsync §7.1: UTF-8 BOM + CRLF). 화면에 띄우는 글은 \n 그대로다.
     var data = Data([0xEF, 0xBB, 0xBF])
-    data.append(Data(report.utf8))
+    for b in report.utf8 {
+        if b == 0x0A { data.append(UInt8(0x0D)) }
+        data.append(b)
+    }
     if (try? data.write(to: file, options: .atomic)) != nil {
         report += "\n이 내용을 파일로도 적어 두었습니다:\n\(file.path)\n"
     }

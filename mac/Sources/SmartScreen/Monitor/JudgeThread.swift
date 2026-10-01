@@ -65,7 +65,8 @@ final class JudgeThread {
     private var joinPending = false
     private let finished = DispatchSemaphore(value: 0)
 
-    /// onResult / onGattSeen are delivered on the main queue. session is copied into every result.
+    /// onResult / onGattSeen are delivered on the main thread (MainLoop.perform: the main run loop in
+    /// common modes, so they also run while a modal alert is open). session is copied into every result.
     init(session: Int, onResult: @escaping (ProbeResult) -> Void, onGattSeen: @escaping () -> Void) {
         self.session = session
         self.onResult = onResult
@@ -163,8 +164,9 @@ final class JudgeThread {
             Shared.shared.gattSeen = true
             // 저장은 메인이 한다 (Windows WM_GATT_SEEN). 여기서 직접 Load -> Save 하면
             // 그 사이에 메인이 쓴 값(회전한 refresh 토큰 등)을 낡은 사본으로 덮는다.
+            // 결과와 같은 길(MainLoop)로 보낸다 - 순서가 유지되고, 알림이 떠 있어도 처리된다.
             let seen = onGattSeen
-            DispatchQueue.main.async {
+            MainLoop.perform {
                 seen()
             }
             EventLog.write(JudgeThread.gattSeenLine)
@@ -179,8 +181,13 @@ final class JudgeThread {
         r.session = session
         let result = r
         let deliver = onResult
-        // 보내기만 하고 기다리지 않는다 (PostMessage). main.async 는 NSAlert.runModal() 중에도 처리된다.
-        DispatchQueue.main.async {
+        // 보내기만 하고 기다리지 않는다 (PostMessage). DispatchQueue.main.async 는 쓰지 않는다: 그
+        // 블록은 GCD main 큐 블록 "안에서" 열린 NSAlert.runModal() 동안에는 알림이 닫힐 때까지
+        // 처리되지 않는다 (CFRunLoop 가 main 큐를 겹쳐 비우지 않는다). 그동안 FAR 전환 잠금과 NEAR
+        // 자동 해제가 멎고, 닫는 순간 밀린 결과가 한꺼번에 돈다. MainLoop.perform 은 common 모드의
+        // 런 루프 블록이라 어떤 알림이 떠 있어도 처리된다 - Windows MessageBox 가 WM_SCAN_RESULT 를
+        // 계속 돌리던 것과 같다.
+        MainLoop.perform {
             deliver(result)
         }
     }

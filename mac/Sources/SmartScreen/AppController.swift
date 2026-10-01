@@ -19,9 +19,15 @@ import SmartScreenCore
 //   - 시작 순서, 계정 세션과 회전한 토큰 저장(FlushAuthSave), 구글 로그인 일꾼, BLE 직접 등록
 //   - 기업 콘텐츠 동기화(시작할 때), 업데이트 틱, 클립보드 타일, 정상 종료
 //
-// 스레드: 전부 메인 스레드. 일꾼(로그인, 세션 시작, 기업 동기화, 판정 스레드)은 결과만
-// DispatchQueue.main.async 로 넘긴다 (Windows 의 PostMessage). config.ini 쓰기도 메인에서만 한다 -
-// SaveAppConfig 는 파일 전체를 다시 쓰므로 두 스레드가 쓰면 서로의 변경을 덮는다.
+// 스레드: 전부 메인 스레드. 일꾼(로그인, 세션 시작, 기업 동기화)은 결과만 DispatchQueue.main.async
+// 로 넘긴다 (Windows 의 PostMessage). 판정 스레드는 MainLoop.perform 으로 넘긴다 (알림이 떠 있어도
+// 결과가 닿아야 한다). config.ini 쓰기도 메인에서만 한다 - SaveAppConfig 는 파일 전체를 다시 쓰므로
+// 두 스레드가 쓰면 서로의 변경을 덮는다.
+//
+// 알림(NSAlert.runModal)은 DispatchQueue.main.async 블록 안에서 띄우지 않는다. 그 블록이 끝날 때까지
+// main 큐가 다시 비워지지 않아 세션 회전 저장, 업데이트 알림 같은 뒤이은 블록이 알림이 닫힐 때까지
+// 기다린다. 그런 결과에서 알림을 띄울 수 있으면 MainTimer.once(after: 0) 로 한 번 넘겨서 부른다
+// (Alerts.swift 머리말).
 //
 // Windows 와 일부러 다르게 한 것:
 //   - 판정 결과마다 세션 번호를 싣고, [중지] 뒤에 도착한 결과나 지난 세션의 결과는 버린다 (Q6).
@@ -112,8 +118,10 @@ final class AppController: NSObject, GuardEngineHost {
     private var activity: NSObjectProtocol?
     /// 오버레이에 마지막으로 넘긴 두 줄과 색. 입력은 셋째 줄만 지운다 (Windows 는 다시 그리기만 했다).
     private var lastOverlay: (line1: String, line2: String, color: RGB)?
-    /// BLE 직접 등록이 도는 중 (6 초 스캔 + 토큰 읽기)
-    private var bleRegisterBusy = false
+    /// BLE 직접 등록이 도는 중 (6 초 스캔 + 토큰 읽기). 간단 창의 업데이트 띠도 읽는다.
+    private(set) var bleRegisterBusy = false
+    /// 블루투스 권한이 없다는 알림을 이번 실행에서 이미 보였다 ([시작] 마다 띄우지 않는다)
+    private var bluetoothDeniedShown = false
     /// 등록이 도는 동안 눌린 [시작]. Windows 는 그동안 UI 스레드가 막혀 있어서 클릭이 등록 뒤에
     /// 처리됐다 - 같은 순서로 등록이 끝난 다음에 시작한다.
     private var startAfterRegister = false
@@ -478,6 +486,22 @@ final class AppController: NSObject, GuardEngineHost {
             ? Paths.configDir.appendingPathComponent("ble_scan_log.csv", isDirectory: false).path
             : nil)
         AdvScanner.shared.start(targetName: targetName)
+
+        // 블루투스 권한이 없으면 말해 준다. 감시는 그대로 시작한다: 스캐너는 "쓸 수 없음" 으로 남고
+        // 목록은 시간 초과를 보이며, 유휴 잠금은 그대로 된다 - 블루투스가 없는 PC 와 같다. 권한은
+        // 사용자만 켤 수 있으므로 상자는 실행마다 한 번만. 자동 시작은 main.async 로 여기에 오므로
+        // 타이머로 한 번 넘겨 GCD 블록 밖에서 띄운다 (알림이 떠 있는 동안 main 큐가 멎지 않게).
+        if AdvScanner.shared.bluetoothDenied {
+            EventLog.write("start: Bluetooth permission denied")
+            if !bluetoothDeniedShown {
+                bluetoothDeniedShown = true
+                _ = MainTimer.once(after: 0) { [weak self] in
+                    guard let self = self, !self.isExiting else { return }
+                    Alerts.warning("블루투스 권한이 없어요. 시스템 설정 > 개인정보 보호 및 보안 > 블루투스에서 "
+                                   + "SmartScreen 을 켜 주세요.", title: "SmartScreen")
+                }
+            }
+        }
 
         cfg.btAddress = 0
         cfg.nearLatencyMs = AppController.fixedNearLatencyMs
@@ -942,9 +966,12 @@ final class AppController: NSObject, GuardEngineHost {
             if !s.window.isVisible || s.window.isMiniaturized { s.showWithoutActivating() }
         }
         if isReady {
-            if guardEngine.blackActive || guardEngine.measuring || loginBusy {
+            if guardEngine.blackActive || guardEngine.measuring || loginBusy || bleRegisterBusy {
                 // 나중에 다시 - 1 분 타이머가 다시 온다. 가리는 동안 다시 시작하면 그 1~2 초 동안
                 // 화면이 드러난다. 그 화면을 지키는 것이 이 프로그램의 일이다.
+                // BLE 직접 등록도 기다린다: Windows 는 등록하는 동안 UI 스레드가 막혀 이 틱이 돌 수
+                // 없었다. Mac 은 비동기라, 여기서 나가면 읽던 토큰이 저장되지 않고 상자도 안 뜬다.
+                // (간단 창 띠의 "화면이 풀리면 적용해요" 도 같은 조건을 본다.)
             } else {
                 let r = Updater.launchApplier()
                 if r.ok {
@@ -1097,7 +1124,11 @@ final class AppController: NSObject, GuardEngineHost {
                 r.err = signed.1
             }
             let result = r
-            DispatchQueue.main.async { self?.onLoginResult(result) }
+            // onLoginResult 는 알림을 띄운다. main.async 블록 안에서 띄우면 알림이 떠 있는 동안 뒤이은
+            // main 큐 블록(세션 회전 저장, 업데이트 알림...)이 전부 멎으므로 타이머로 한 번 넘긴다.
+            DispatchQueue.main.async {
+                _ = MainTimer.once(after: 0) { self?.onLoginResult(result) }
+            }
         }
     }
 
@@ -1180,8 +1211,10 @@ final class AppController: NSObject, GuardEngineHost {
         // Windows 는 여기서 모래시계를 띄우고 UI 스레드를 6 초 넘게 막았다. Mac 은 단추만 끄고 기다린다.
         bleRegisterBusy = true
         updateRegisterButton()
+        // 완료는 AdvScanner 가 main.async 로 보낸다. onBleRegisterResult 는 알림을 띄우므로 타이머로
+        // 한 번 넘겨 GCD 블록 밖에서 부른다 (startLoginWorker 와 같은 이유).
         AdvScanner.shared.registerPhone(scanSec: AppController.registerScanSec) { [weak self] outcome in
-            self?.onBleRegisterResult(outcome)
+            _ = MainTimer.once(after: 0) { self?.onBleRegisterResult(outcome) }
         }
     }
 
