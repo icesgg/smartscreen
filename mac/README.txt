@@ -175,6 +175,19 @@ Windows 판의 ProbeScan.exe / AdvScan.exe / BtCheck.exe 가 Mac 에서는
   잠긴 폰에서 신원을 읽어 오는지 (폰을 잠근 채로):
     /Applications/SmartScreen.app/Contents/MacOS/SmartScreen --probe-scan
 
+    SmartScreen 이 켜져 있으면 오른쪽 위 작은 상자의 [종료] 로 끈 뒤에 하면
+    결과가 깨끗합니다. 1분쯤 세 단계로 폰을 찾습니다:
+      1 필터 스캔      macOS 에 "SmartScreen 신원 서비스" 로 걸러 달라고 한다
+      2 직접 읽기 스캔  거르지 않고 Apple 광고의 제조사 데이터를 직접 읽는다
+      3 둘 다 동시에    프로그램이 실제로 도는 모양
+    그다음 찾은 기기에 붙어 신원을 읽고 (">>> 토큰" 줄), 맨 끝에
+    "요약" 블록을 찍습니다. 문제를 알릴 때는 그 블록을 그대로 보내 주세요.
+    "결과:" 줄이 어느 길로 잠긴 폰을 찾는지 말합니다:
+      필터 경로 / 직접 읽기 경로 / 둘 다   -> 정상
+      둘 다 안 됨   -> 광고로는 못 찾는 Mac 입니다. 보호를 켠 뒤 고급 설정 창
+                       아래의 GATT 줄이 linked 가 되는지 보세요
+    "주의:" 줄이 있으면 그 말대로 다시 해 보세요 (예: 폰을 잠그지 않았다).
+
   다른 PC/Mac 의 SmartScreen 신호가 들리는지:
     /Applications/SmartScreen.app/Contents/MacOS/SmartScreen --adv-scan
 
@@ -182,7 +195,10 @@ Windows 판의 ProbeScan.exe / AdvScan.exe / BtCheck.exe 가 Mac 에서는
     /Applications/SmartScreen.app/Contents/MacOS/SmartScreen --bt-check
 
   ※ 터미널에서 처음 실행하면 "터미널" 이 블루투스를 쓰려 한다는 창이
-    뜰 수 있습니다. [허용] 하세요.
+    뜰 수 있습니다. [허용] 하세요. 터미널에서 실행하면 macOS 는 블루투스
+    권한을 SmartScreen 이 아니라 터미널에 묻습니다. "블루투스 권한이 없어요"
+    가 나오면 시스템 설정 > 개인정보 보호 및 보안 > 블루투스 에서 "터미널"
+    (명령을 실행한 앱) 을 켠 뒤 다시 실행하세요.
 
 
 6. 다른 PC/Mac 와 클립보드 공유
@@ -248,12 +264,14 @@ Windows 판과 같은 이름과 같은 뜻입니다.
   bleDebugLog         1이면 신호를 전부 기록합니다 (4장). 평소에는 0
   bleTimeoutSec       이 시간 동안 신호가 없으면 끊긴 것으로 봅니다 (기본 90초)
   phoneToken          등록한 폰의 식별값. [등록하기] 가 채웁니다. 지우지 마세요
+  phoneOvfBit         잠긴 폰을 빨리 찾으려고 프로그램이 스스로 배워 적는 번호
+                      (-1 = 아직 모름). 손대지 않아도 됩니다
   clipSync            1이면 클립보드를 주고받습니다 (6장). 화면의 타일이 바꿉니다
   clipMaxKB           이보다 큰 것은 건너뜁니다 (기본 4096 = 4 MB, 최대 8192)
   updateCheck         1이면 새 버전이 있는지 서버에 묻습니다 (10장). 0이면 안 묻습니다
   updateChannel       stable 또는 beta. 평소에는 stable
 
-  Mac 에서 쓰지 않는 값: bleIrk, btAddress, phoneOvfBit (그대로 둡니다)
+  Mac 에서 쓰지 않는 값: bleIrk, btAddress (그대로 둡니다)
 
 
 8. 문제 해결
