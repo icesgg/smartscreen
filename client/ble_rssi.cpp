@@ -21,8 +21,10 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <map>
+#include <vector>
 
 using namespace winrt;
 using namespace Windows::Devices::Bluetooth::Advertisement;
@@ -103,19 +105,131 @@ struct BleRssiScanner::Impl {
 
     // 못 붙은 것은 금방 다시 해 본다. 실측에서 맞는 주소인데도 Unreachable 이
     // 다섯 번 연달아 났고, 60초 간격이라 4분에 다섯 번밖에 시도하지 못했다.
+    // 다만 같은 주소가 계속 못 붙으면 15, 30, 60, 120, 120... 초로 벌린다.
+    // 로그에서 결합 38번 중 32번이 폰이 GATT 로 막 붙은 뒤 60초 안이었다. 그 밖에서
+    // 연달아 못 붙는 주소는 다음에도 못 붙기 쉬운데, 시도마다 최악 10초씩 라디오를 쥔다.
+    // 그래서 다섯 번째 시도가 위 실측(15초 간격)보다 늦어지는 것을 감수하고, 붙을
+    // 가능성이 달라지는 때(깨어남, GATT 링크가 생기거나 끊김, 토큰 변경, 감시 시작)에
+    // 처음 간격으로 되돌린다 - ResetBackoff.
     static constexpr ULONGLONG kRetryUnreachableMs = 15000;
+    static constexpr ULONGLONG kRetryUnreachableMaxMs = 120000;
     // 붙었는데 우리 서비스가 없던 기기는 다시 볼 이유가 없다. 주소가 바뀌면
     // 어차피 새 후보로 들어온다.
     static constexpr ULONGLONG kRetryNotOursMs = 600000;
+    // 이 PC 에 폰 앱이 GATT 로 이만큼 붙어 있으면 탐색을 쉰다. 링크가 생긴 직후가
+    // 결합이 되는 때라(위 32/38) 그 60초는 평소대로 찾는다.
+    static constexpr ULONGLONG kGattHoldAfterMs = 60000;
+    // IRK 가 이 안에 폰의 광고를 풀었으면 탐색을 쉰다 - 폰은 이미 알아보고 있다.
+    static constexpr ULONGLONG kIrkPauseMs = 30000;
+    // 이만큼 탐색하지 않은 주소의 연속 실패는 끝난 것으로 본다 (주소가 바뀌었거나 멀어짐).
+    static constexpr ULONGLONG kStreakIdleMs = 300000;
 
     struct Cand { bool rnd; int rssi; int bit; ULONGLONG seen; };
     std::mutex candMutex;
     std::map<uint64_t, Cand> cands;             // overflow 비트 하나짜리 광고들
     // 주소별 재시도 금지 시각. 실패 종류에 따라 길이가 다르다 -
     // 남의 기기로 확인된 주소를 계속 다시 찌르면 맞는 기기에 쓸 시도를 낭비한다.
-    std::map<uint64_t, ULONGLONG> probedUntil;
+    // set 은 금지를 건 시각: 간격을 처음으로 되돌릴 때 "첫 실패였다면" 으로 줄이는 데 쓴다.
+    // notOurs 는 10분짜리 "남의 폰" 판정 - 되돌리기와 GATT 링크 끊김이 건드리지 않는다.
+    struct Hold { ULONGLONG until; ULONGLONG set; bool notOurs; };
+    std::map<uint64_t, Hold> probedUntil;
+    // 주소별 연속 Unreachable. 재시도 간격을 몇 번째인지로 정하고, 실패 줄을 묶는다 -
+    // 첫 실패만 그대로 적고 나머지는 10번째마다와 끝날 때 "x<N> since" 한 줄로 적는다.
+    // 같은 주소의 실패를 한 줄씩 적으면 그 사이의 STATE 줄을 찾기 어렵다. candMutex 로 보호.
+    struct Streak {
+        int fails = 0;          // 이번 연속의 실패 수 (= 재시도 간격의 몇 번째)
+        int logged = 0;         // 그중 로그에 이미 담긴 수
+        SYSTEMTIME firstWall{}; // 첫 실패의 벽시계 시각 (since 표시용)
+        ULONGLONG lastTick = 0; // 마지막 실패 시각 = 마지막으로 탐색한 시각
+        std::wstring lastWhy;
+        DWORD lastMs = 0;
+    };
+    std::map<uint64_t, Streak> streaks;
     HANDLE proberThread{ nullptr };
     HANDLE proberStop{ nullptr };
+
+    // 탐색 조절 상태. 판정 스레드(SetGattLinked), 광고 콜백(irkMatchTick),
+    // UI 스레드(ProbeTagForLog, IrkRecognisesPhone)가 함께 보므로 원자값으로 둔다.
+    std::atomic<ULONGLONG> gattLinkSince{ 0 };  // GATT 링크가 생긴 시각, 끊겨 있으면 0
+    std::atomic<ULONGLONG> irkMatchTick{ 0 };   // IRK 가 폰의 광고를 마지막으로 푼 시각
+    std::atomic<ULONGLONG> probeStartTick{ 0 }; // 진행 중인 탐색의 시작 시각, 없으면 0
+    std::atomic<ULONGLONG> probeEndTick{ 0 };   // 마지막 탐색이 끝난 시각
+
+    // 다른 스레드가 방금 적은 시각은 now 보다 클 수 있다. 그냥 빼면 부호 없는 값이
+    // 넘어가 "아주 오래 전" 이 된다 - 방금 광고한 묶인 폰을 went quiet 로 읽는 식.
+    static ULONGLONG Elapsed(ULONGLONG now, ULONGLONG t) { return now > t ? now - t : 0; }
+
+    // 잠금을 쥔 채로 파일에 쓰지 않으려고 줄을 먼저 만든다. DbgEvent 는 파일을 열고
+    // 닫으므로, candMutex 를 쥔 채 부르면 광고 콜백이 그동안 기다린다.
+    static std::wstring Fmt(const wchar_t* fmt, ...) {
+        wchar_t buf[512];
+        va_list ap; va_start(ap, fmt);
+        _vsnwprintf_s(buf, _countof(buf), _TRUNCATE, fmt, ap);
+        va_end(ap);
+        return buf;
+    }
+    static void LogLines(const std::vector<std::wstring>& lines) {
+        for (auto const& l : lines) DbgEvent(L"%s", l.c_str());
+    }
+
+    // n 번째 연속 실패 뒤의 재시도 간격: 15초에서 두 배씩, 120초에서 멈춘다.
+    static ULONGLONG UnreachableRetryMs(int n) {
+        ULONGLONG ms = kRetryUnreachableMs;
+        for (int i = 1; i < n && ms < kRetryUnreachableMaxMs; i++) ms *= 2;
+        return (std::min)(ms, kRetryUnreachableMaxMs);
+    }
+
+    // 연속 실패 묶음 줄. 첫 실패는 따로 적혀 있으므로 그 뒤가 하나라도 남았을 때만.
+    static void StreakLine(uint64_t a, const Streak& s, std::vector<std::wstring>& lines) {
+        if (s.fails <= 1 || s.fails <= s.logged) return;
+        lines.push_back(Fmt(L"ident: %012llX probe failed x%d since %02d:%02d:%02d (last: %s, %lums)",
+            (unsigned long long)a, s.fails,
+            s.firstWall.wHour, s.firstWall.wMinute, s.firstWall.wSecond,
+            s.lastWhy.c_str(), s.lastMs));
+    }
+    // candMutex 를 쥔 채 부른다. 그 주소의 연속 실패를 끝낸다 (묶임, 남의 폰 판정).
+    void EndStreak(uint64_t a, std::vector<std::wstring>& lines) {
+        auto it = streaks.find(a);
+        if (it == streaks.end()) return;
+        StreakLine(it->first, it->second, lines);
+        streaks.erase(it);
+    }
+    // candMutex 를 쥔 채 부른다. 모든 연속 실패를 끝낸다 (쉼, 감시 중지, 되돌리기).
+    void EndAllStreaks(std::vector<std::wstring>& lines) {
+        for (auto const& [a, s] : streaks) StreakLine(a, s, lines);
+        streaks.clear();
+    }
+
+    // 재시도 간격을 처음으로 되돌리고 연속 실패 수를 잊는다. 잊기 전에 묶음 줄은 남긴다 -
+    // 안 그러면 "x7" 같은 실패가 로그에서 사라진다.
+    // 이미 걸린 못-붙음 금지는 "첫 실패였다면" 의 길이(15초)로 줄인다.
+    // clearUnreachable 이면 아예 지워서 다음 2초 틱에 바로 찾는다 (GATT 링크 끊김, 감시 시작).
+    // "남의 폰" 판정(10분)은 건드리지 않는다 - 다시 붙어도 같은 답이다.
+    void ResetBackoff(bool clearUnreachable) {
+        std::vector<std::wstring> lines;
+        {
+            std::lock_guard<std::mutex> lock(candMutex);
+            EndAllStreaks(lines);
+            for (auto it = probedUntil.begin(); it != probedUntil.end(); ) {
+                if (it->second.notOurs) { ++it; continue; }
+                if (clearUnreachable) { it = probedUntil.erase(it); continue; }
+                it->second.until = (std::min)(it->second.until, it->second.set + kRetryUnreachableMs);
+                ++it;
+            }
+        }
+        LogLines(lines);
+    }
+
+    // IRK 가 최근에 폰의 광고를 풀었는지. 그동안 탐색은 같은 폰을 다시 확인할 뿐이다.
+    bool IrkMatchedRecently(ULONGLONG now) {
+        ULONGLONG t = irkMatchTick.load();
+        return t != 0 && Elapsed(now, t) < kIrkPauseMs && HasIrk();
+    }
+    // GATT 링크가 60초 넘게 이어졌는지. 결합은 대부분(위 32/38) 그 60초 안에 됐다.
+    bool GattHeld(ULONGLONG now) const {
+        ULONGLONG s = gattLinkSince.load();
+        return s != 0 && Elapsed(now, s) >= kGattHoldAfterMs;
+    }
 
     // 최근 수신 시각 링버퍼 (초당 수신 건수 계산용)
     static constexpr int kRateSlots = 256;
@@ -281,18 +395,64 @@ struct BleRssiScanner::Impl {
     // 스캔 콜백 스레드에서 하면 안 된다 - 연결은 최악 10초까지 걸린다.
     static DWORD WINAPI ProberThunk(LPVOID p) { ((Impl*)p)->ProberLoop(); return 0; }
 
+    // 탐색을 쉬는 이유. 둘 다면 IRK 쪽만 적는다 - 로그에는 지금 효력이 있는 이유 하나.
+    enum class Pause { None, Irk, Gatt };
+
     void ProberLoop() {
+        Pause pause = Pause::None;   // 이 스레드만 쓴다
         while (WaitForSingleObject(proberStop, 2000) == WAIT_TIMEOUT) {
             // 스캔이 꺼져 있으면 논다. 스레드를 Impl 수명 내내 살려 두는 이유는
             // 연결 한 번이 최악 10초라 Stop 에서 조인하면 UI 가 그만큼 멈추기 때문이다.
-            if (!running || !identOn) continue;
+            // 쉬던 이유는 조용히 내려놓는다 - 다시 시작하면 그 세션에서 처음부터 적는다.
+            if (!running || !identOn) { pause = Pause::None; continue; }
             ULONGLONG now = GetTickCount64();
+
+            // 쉴지 정한다. 바뀔 때만 한 줄. 쉬기 시작하면 연속 실패도 끝낸다 -
+            // 쉬는 동안의 공백을 건너 "x<N>" 이 이어지면 실패가 촘촘했던 것처럼 읽힌다.
+            Pause next = IrkMatchedRecently(now) ? Pause::Irk
+                       : GattHeld(now)           ? Pause::Gatt
+                       :                           Pause::None;
+            if (next != pause) {
+                if (next != Pause::None) {
+                    std::vector<std::wstring> lines;
+                    { std::lock_guard<std::mutex> lock(candMutex); EndAllStreaks(lines); }
+                    LogLines(lines);
+                }
+                if (next == Pause::Irk)
+                    DbgEvent(L"ident: probes paused - IRK recognises the phone");
+                else if (next == Pause::Gatt)
+                    DbgEvent(L"ident: probes held - GATT linked for 60s");
+                else if (pause == Pause::Irk)
+                    DbgEvent(L"ident: probes resumed - IRK has not matched for 30s");
+                else
+                    DbgEvent(L"ident: probes resumed - GATT link ended");
+                pause = next;
+            }
+
+            // 5분 동안 탐색하지 않은 주소의 연속 실패는 끝났다 (주소가 바뀌었거나 멀어졌다).
+            // 묶여 있거나 쉬는 동안에도 본다 - 묶음 줄이 그 주소를 마지막으로 본 때에 가깝게 남는다.
+            {
+                std::vector<std::wstring> lines;
+                {
+                    std::lock_guard<std::mutex> lock(candMutex);
+                    for (auto it = streaks.begin(); it != streaks.end(); ) {
+                        if (Elapsed(now, it->second.lastTick) < kStreakIdleMs) { ++it; continue; }
+                        StreakLine(it->first, it->second, lines);
+                        it = streaks.erase(it);
+                    }
+                }
+                LogLines(lines);
+            }
+
+            // 쉬는 동안에는 결합도 그대로 둔다. 여기서 went quiet 로 풀면 "looking again"
+            // 이라고 적고는 찾지 않는다. 쉼이 끝나는 틱에 아래에서 바로 풀고 찾는다.
+            if (pause != Pause::None) continue;
 
             // 묶인 주소가 아직 광고 중이면 할 일이 없다.
             // 30초로 잡은 이유: 실측 광고 간격의 최대가 19.9초였다. 20초로 두면
             // 정상적인 공백에도 결합이 풀려 헛된 탐색이 돈다. 늦게 풀어도 손해가
             // 적은 쪽인데, 결합이 풀려도 RSSI 는 bleTimeoutSec(90초)까지 살아 있다.
-            if (boundAddr && (now - boundSeenTick) < 30000) continue;
+            if (boundAddr && Elapsed(now, boundSeenTick) < 30000) continue;
             if (boundAddr) {
                 DbgEvent(L"ident: %012llX went quiet, looking again",
                          (unsigned long long)boundAddr.load());
@@ -303,12 +463,12 @@ struct BleRssiScanner::Impl {
             {
                 std::lock_guard<std::mutex> lock(candMutex);
                 for (auto it = cands.begin(); it != cands.end(); ) {
-                    if (now - it->second.seen > 30000) it = cands.erase(it);
+                    if (Elapsed(now, it->second.seen) > 30000) it = cands.erase(it);
                     else ++it;
                 }
                 // 주소는 주기적으로 바뀌므로 그냥 두면 계속 쌓인다
                 for (auto it = probedUntil.begin(); it != probedUntil.end(); ) {
-                    if (now > it->second + 300000) it = probedUntil.erase(it);
+                    if (now > it->second.until + 300000) it = probedUntil.erase(it);
                     else ++it;
                 }
                 int want = identBit.load();
@@ -320,41 +480,75 @@ struct BleRssiScanner::Impl {
                         if (pass == 0 && c.bit != want) continue;
                         if (c.rssi < probeFloor) continue;   // 자리 판정에 쓸 수 없는 거리는 건드리지 않는다
                         auto pit = probedUntil.find(a);
-                        if (pit != probedUntil.end() && now < pit->second) continue;
+                        if (pit != probedUntil.end() && now < pit->second.until) continue;
                         if (c.rssi > pickRssi) {
                             pick = a; pickRnd = c.rnd; pickBit = c.bit; pickRssi = c.rssi;
                         }
                     }
                 }
-                if (pick) probedUntil[pick] = now + kRetryUnreachableMs;
+                // 잠정 금지: 탐색 중에 같은 주소를 다시 고르지 않게. 결과가 덮어쓴다.
+                if (pick) probedUntil[pick] = Hold{ now + kRetryUnreachableMs, now, false };
             }
             if (!pick) continue;
 
             std::wstring tok, why;
             DWORD took = 0;
+            // STATE 줄 꼬리(ProbeTagForLog)용. 읽는 쪽은 시작을 먼저 보고 0 이면 끝을 본다.
+            // 그래서 끝난 시각을 먼저 적고 시작을 지운다 - 거꾸로면 방금 끝난 탐색이
+            // 꼬리에서 한 번 빠진다 (시작은 지워졌는데 끝은 지난 탐색의 것).
+            probeStartTick = (std::max)(GetTickCount64(), 1ULL);
             ProbeOutcome r = ReadPhoneToken(pick, pickRnd, tok, why, &took);
+            ULONGLONG done = GetTickCount64();
+            probeEndTick = done;
+            probeStartTick = 0;
             // 연결에 수 초가 걸리므로 등록된 값은 붙잡고 있지 않고 지금 다시 읽는다.
             // 탐색 중에 등록이 바뀌었으면 새 값으로 판정하는 편이 맞다.
             std::wstring want;
             { std::lock_guard<std::mutex> lock(identMutex); want = identToken; }
             bool ours = (r == ProbeOutcome::Token) &&
                         (_wcsicmp(tok.c_str(), want.c_str()) == 0);
+            std::vector<std::wstring> lines;
             if (!ours) {
                 // 붙었는데 아닌 것으로 확인된 기기는 한동안 접어 둔다.
                 // 못 붙은 것은 일시적일 수 있으니 금방 다시 해 본다 -
                 // 실측에서 맞는 주소인데도 연달아 다섯 번 Unreachable 이 났다.
+                // 같은 주소가 계속 못 붙으면 간격을 벌린다 (kRetryUnreachableMs 주석).
                 bool settled = (r != ProbeOutcome::Unreachable);
+                const wchar_t* reason = why.empty() ? L"token mismatch" : why.c_str();
                 {
                     std::lock_guard<std::mutex> lock(candMutex);
-                    probedUntil[pick] = GetTickCount64() +
-                        (settled ? kRetryNotOursMs : kRetryUnreachableMs);
+                    if (settled) {
+                        // 남의 폰으로 확인됐으니 그 주소의 연속 실패는 여기서 끝난다
+                        EndStreak(pick, lines);
+                        probedUntil[pick] = Hold{ done + kRetryNotOursMs, done, true };
+                        lines.push_back(Fmt(L"ident: %012llX is not our phone (%s, %lums)",
+                                            (unsigned long long)pick, reason, took));
+                    } else {
+                        Streak& s = streaks[pick];
+                        if (s.fails == 0) GetLocalTime(&s.firstWall);
+                        s.fails++;
+                        s.lastTick = done;
+                        s.lastWhy = reason;
+                        s.lastMs = took;
+                        probedUntil[pick] = Hold{ done + UnreachableRetryMs(s.fails), done, false };
+                        // 첫 실패는 예전과 똑같이 적는다 - 한 번 실패하고 바로 묶이는 흔한
+                        // 경우는 로그가 달라지지 않는다. 그 뒤는 10번째마다 묶음 줄.
+                        if (s.fails == 1) {
+                            lines.push_back(Fmt(L"ident: %012llX probe failed (%s, %lums)",
+                                                (unsigned long long)pick, reason, took));
+                            s.logged = 1;
+                        } else if (s.fails % 10 == 0) {
+                            StreakLine(pick, s, lines);
+                            s.logged = s.fails;
+                        }
+                    }
                 }
-                DbgEvent(L"ident: %012llX %s (%s, %lums)",
-                         (unsigned long long)pick,
-                         settled ? L"is not our phone" : L"probe failed",
-                         why.empty() ? L"token mismatch" : why.c_str(), took);
+                LogLines(lines);
                 continue;
             }
+            // 묶였으니 그 주소의 연속 실패는 끝난다. 묶음 줄을 bound 줄보다 먼저 적는다.
+            { std::lock_guard<std::mutex> lock(candMutex); EndStreak(pick, lines); }
+            LogLines(lines);
             boundAddr = pick;
             boundSeenTick = GetTickCount64();
             DbgEvent(L"ident: bound to %012llX (%d dBm, %lums)",
@@ -418,6 +612,12 @@ bool BleRssiScanner::Start(const std::wstring& targetDeviceName, uint64_t target
         std::lock_guard<std::mutex> lock(m_impl->kalmanMutex);
         m_impl->kalman.Reset();
     }
+    // 감시 시작은 새 세션이다. 지난 세션의 IRK 일치나 GATT 링크로 쉬지 않고,
+    // 재시도 간격도 처음부터 (Stop 사이에 끝난 탐색이 남긴 것까지 지운다).
+    // 판정 스레드는 이 뒤에 뜨므로 gattLinkSince 를 여기서 써도 겹치지 않는다.
+    m_impl->irkMatchTick = 0;
+    m_impl->gattLinkSince = 0;
+    m_impl->ResetBackoff(true);
 
     try {
         // WinRT COM 초기화 (MTA)
@@ -477,8 +677,14 @@ bool BleRssiScanner::Start(const std::wstring& targetDeviceName, uint64_t target
                 }
             }
 
+            // IRK 해석은 묶인 주소여도 따로 본다. 탐색을 쉴지(IrkRecognisesPhone)가
+            // 여기서 정해지는데, 묶인 주소라고 건너뛰면 IRK 가 폰을 알아보는 동안에도
+            // 30초 뒤 "IRK has not matched" 로 읽힌다. 주소별 캐시라 다시 계산하지는 않는다.
+            bool irkMatch = m_impl->ResolveRpa(addr);
+            if (irkMatch) m_impl->irkMatchTick = (std::max)(GetTickCount64(), 1ULL);
+
             bool matched = identMatch
-                || m_impl->ResolveRpa(addr)
+                || irkMatch
                 || Impl::NameContains(advName, m_impl->targetName)
                 || (m_impl->targetAddr != 0 && addr == m_impl->targetAddr)
                 // 서비스 UUID 는 앱 설치본마다 같으므로 폰을 특정하지 못한다.
@@ -582,12 +788,17 @@ void BleRssiScanner::Stop() {
 
     // 프로버 스레드는 그대로 두고(위 주석 참고) 묶인 주소만 버린다.
     // 다시 시작하면 처음부터 후보를 모아 다시 확인한다.
+    // 감시를 멈추면 연속 실패도 끝난다 - 아직 안 적힌 실패는 묶음 줄로 남긴다.
     m_impl->boundAddr = 0;
+    m_impl->irkMatchTick = 0;
+    std::vector<std::wstring> lines;
     {
         std::lock_guard<std::mutex> lock(m_impl->candMutex);
         m_impl->cands.clear();
         m_impl->probedUntil.clear();
+        m_impl->EndAllStreaks(lines);
     }
+    Impl::LogLines(lines);
 }
 
 // ---------------------------------------------------------------------------
@@ -636,13 +847,17 @@ void BleRssiScanner::SetIdentity(const std::wstring& tokenHex, int ovfBit, int p
         // 결론은 10분을 버티므로 그대로 두면 새로 등록한 폰을 그만큼 무시한다.
         // 묶여 있던 주소도 더는 확인된 주소가 아니다 - 다른 폰을 등록했는데
         // 예전 폰이 계속 묶여 있으면 그게 화면을 열어둔다.
+        // 연속 실패 수도 예전 토큰을 찾던 것이라 새 토큰은 처음 간격부터 찾는다.
         size_t dropped;
+        std::vector<std::wstring> lines;
         {
             std::lock_guard<std::mutex> lock(m_impl->candMutex);
             dropped = m_impl->probedUntil.size();
             m_impl->probedUntil.clear();
+            m_impl->EndAllStreaks(lines);
             m_impl->boundAddr = 0;
         }
+        Impl::LogLines(lines);
         // 등록을 바꾼 직후 폰을 못 알아보는 일이 로그에서 갈리도록 남긴다.
         DbgEvent(L"ident: token %s, dropped %d past verdict(s) and the binding",
                  m_impl->identOn ? L"set" : L"cleared", (int)dropped);
@@ -665,11 +880,45 @@ uint64_t BleRssiScanner::BoundAddress() const {
     return m_impl->boundAddr.load();
 }
 
-// 확인 연결 조절 - 자리만 잡아 둔다 (구현은 ProberLoop 쪽 작업에서)
-void BleRssiScanner::SetGattLinked(bool) {}
-void BleRssiScanner::ResetProbeBackoff() {}
-std::wstring BleRssiScanner::ProbeTagForLog() const { return std::wstring(); }
-bool BleRssiScanner::IrkRecognisesPhone() const { return false; }
+// ---------------------------------------------------------------------------
+// 확인 연결 조절
+// ---------------------------------------------------------------------------
+// 판정 스레드가 반복마다 부른다. 바뀔 때만 일한다. 링크가 생기면 그 뒤 60초가
+// 결합이 되는 때라 재시도 간격을 처음으로 되돌리고, 끊기면 못 붙음 금지까지 지워
+// 다음 2초 틱에 바로 찾는다 - 링크가 있는 동안 쉬었으므로 그 사이 바뀐 주소를 모른다.
+// "탐색 재개" 줄과 60초 뒤의 "쉼" 은 프로버 스레드가 이 시각을 보고 적는다.
+void BleRssiScanner::SetGattLinked(bool linked) {
+    bool was = m_impl->gattLinkSince.load() != 0;
+    if (linked == was) return;
+    m_impl->gattLinkSince = linked ? (std::max)(GetTickCount64(), 1ULL) : 0;
+    m_impl->ResetBackoff(!linked);
+}
+
+// 깨어남 등. 잠든 동안 폰도 주소도 달라졌을 수 있어 처음 간격부터 다시 찾는다.
+void BleRssiScanner::ResetProbeBackoff() {
+    m_impl->ResetBackoff(false);
+}
+
+// STATE 줄 꼬리. UI 스레드가 부르므로 원자값만 읽는다. Mac probeTagForLog 와 같은 글자.
+std::wstring BleRssiScanner::ProbeTagForLog() const {
+    ULONGLONG now = GetTickCount64();
+    wchar_t buf[64];
+    ULONGLONG s = m_impl->probeStartTick.load();
+    if (s != 0) {
+        swprintf_s(buf, L", probing for %.1fs", Impl::Elapsed(now, s) / 1000.0);
+        return buf;
+    }
+    ULONGLONG e = m_impl->probeEndTick.load();
+    if (e != 0 && Impl::Elapsed(now, e) <= 3000) {
+        swprintf_s(buf, L", probe ended %.1fs ago", Impl::Elapsed(now, e) / 1000.0);
+        return buf;
+    }
+    return std::wstring();
+}
+
+bool BleRssiScanner::IrkRecognisesPhone() const {
+    return m_impl->IrkMatchedRecently(GetTickCount64());
+}
 
 bool BleRssiScanner::SetIrk(const std::wstring& irkHex) {
     if (irkHex.empty()) { m_impl->ClearIrk(); return false; }
@@ -689,7 +938,7 @@ bool BleRssiScanner::HasEverReceived() const {
 int BleRssiScanner::GetSmoothedRssi() const {
     // 마지막 수신으로부터 타임아웃(기본 90초) 이상 경과하면 -100 (수신 없음) 반환
     if (m_impl->lastReceivedTick == 0) return -100;
-    ULONGLONG elapsed = GetTickCount64() - m_impl->lastReceivedTick;
+    ULONGLONG elapsed = Impl::Elapsed(GetTickCount64(), m_impl->lastReceivedTick);
     if (elapsed > m_impl->timeoutMs) {
         m_impl->receiving = false;
         return -100;
@@ -702,7 +951,7 @@ int BleRssiScanner::GetSmoothedRssi() const {
 // ---------------------------------------------------------------------------
 int BleRssiScanner::GetRawRssi() const {
     if (m_impl->lastReceivedTick == 0) return -100;
-    ULONGLONG elapsed = GetTickCount64() - m_impl->lastReceivedTick;
+    ULONGLONG elapsed = Impl::Elapsed(GetTickCount64(), m_impl->lastReceivedTick);
     if (elapsed > m_impl->timeoutMs) return -100;
     return m_impl->rawRssi;
 }
@@ -712,7 +961,7 @@ int BleRssiScanner::GetRawRssi() const {
 // ---------------------------------------------------------------------------
 DWORD BleRssiScanner::GetTimeSinceLastReceived() const {
     if (m_impl->lastReceivedTick == 0) return 99999;
-    return (DWORD)(GetTickCount64() - m_impl->lastReceivedTick);
+    return (DWORD)Impl::Elapsed(GetTickCount64(), m_impl->lastReceivedTick);
 }
 
 // ---------------------------------------------------------------------------
@@ -720,7 +969,7 @@ DWORD BleRssiScanner::GetTimeSinceLastReceived() const {
 // ---------------------------------------------------------------------------
 bool BleRssiScanner::IsReceiving() const {
     if (m_impl->lastReceivedTick == 0) return false;
-    return (GetTickCount64() - m_impl->lastReceivedTick) < m_impl->timeoutMs;
+    return Impl::Elapsed(GetTickCount64(), m_impl->lastReceivedTick) < m_impl->timeoutMs;
 }
 
 // ---------------------------------------------------------------------------
