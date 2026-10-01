@@ -43,6 +43,9 @@ final class LockScreen {
     private var bannerPath = ""
     private var previousApp: NSRunningApplication?
     private weak var previousKeyWindow: NSWindow?
+    /// 다른 앱을 쓰던 중에 잠겼을 때, 그 뒤에 깔려 보이던 우리 창 (간단/고급 설정 창).
+    /// 앞에서 뒤 순서. 풀 때 다시 뒤로 보낸다 (restoreFrontmost). 창을 붙잡지 않게 약하게 쥔다.
+    private var windowsBehind: [WeakWindow] = []
     private var rebuildQueued = false
     private var screenObserver: NSObjectProtocol?
 
@@ -240,46 +243,100 @@ final class LockScreen {
 
     // MARK: - 앞에 있던 앱
 
+    /// 창을 붙잡지 않고 가리키기만 한다 (잠긴 동안 설정 창이 닫혀도 남지 않게).
+    private struct WeakWindow {
+        weak var window: NSWindow?
+    }
+
     private func rememberFrontmost() {
         previousApp = nil
         previousKeyWindow = nil
+        windowsBehind = []
         let me = NSRunningApplication.current
         if let front = NSWorkspace.shared.frontmostApplication,
            front.processIdentifier != me.processIdentifier {
             previousApp = front
+            // 다른 앱을 쓰던 중이었다. 그 앱 뒤에 보이던 우리 설정 창을 적어 둔다 - 잠글 때의
+            // 활성화가 그 창을 앞으로 끌어올렸으면 풀 때 다시 뒤로 보낸다.
+            windowsBehind = LockScreen.visibleSettingsWindows()
         } else {
             // 우리 창(간단 창의 "지금 가리기" 등)을 쓰던 중이었다.
             previousKeyWindow = NSApp.keyWindow
         }
     }
 
+    /// 보이는 우리 일반 창 (커튼, 오버레이 같은 패널, 알림 창, 지금의 키 창은 뺀다), 앞에서 뒤 순서.
+    private static func visibleSettingsWindows() -> [WeakWindow] {
+        let key = NSApp.keyWindow
+        func eligible(_ w: NSWindow) -> Bool {
+            return w.isVisible && !(w is LockWindow) && !(w is NSPanel) && w.level == .normal && w !== key
+        }
+        // orderedWindows 는 앞에서 뒤 순서다. 거기 빠진 창이 있으면 (스크립트용 목록이라 빠질 수
+        // 있다) 뒤에 붙인다.
+        var list = NSApp.orderedWindows.filter { eligible($0) }
+        for w in NSApp.windows where eligible(w) && !list.contains(where: { $0 === w }) {
+            list.append(w)
+        }
+        return list.map { WeakWindow(window: $0) }
+    }
+
     /// Windows 는 SetForegroundWindow(잠금 창). 거절되어도 커튼은 맨 위에 보인다 - 여기도 같다.
+    ///
+    /// Windows 의 SetForegroundWindow 는 잠금 창 하나만 올리고 다른 창의 z-순서는 건드리지 않는다.
+    /// Mac 의 NSApp.activate(ignoringOtherApps:) 는 앱의 창을 전부 앞으로 올려서, 다른 앱 뒤에 있던
+    /// 간단/고급 창이 잠글 때마다 그 앱들 위로 올라왔다 (풀어도 그대로 남았다). 그래서 커튼을 먼저
+    /// 키 창이자 주 창으로 만든 뒤, 키/주 창만 앞으로 올리는 방식으로 활성화한다
+    /// (.activateAllWindows 를 넣지 않는다). 그래도 올라온 창은 restoreFrontmost 가 뒤로 보낸다.
     private func activateSelf() {
+        if let w = windows.first {
+            w.makeKeyAndOrderFront(nil)
+            // 주 창도 커튼으로 바꿔 둔다 - 아니면 예전 주 창(설정 창)이 활성화에 같이 딸려 온다.
+            w.makeMain()
+        }
         if #available(macOS 14.0, *) {
             NSApp.activate()
         } else {
-            NSApp.activate(ignoringOtherApps: true)
+            _ = NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
         }
-        windows.first?.makeKeyAndOrderFront(nil)
     }
 
     /// Windows 는 잠금 창이 사라지면 z-순서상 다음 창(보통 쓰던 앱)이 저절로 활성화된다.
     /// Mac 은 그런 것이 없으므로 기억해 둔 앱을 직접 되돌린다.
+    /// 다른 앱을 쓰다가 잠겼으면 우리 설정 창도 그 앱 뒤로 돌려보낸다 - Windows 에서는 잠금 창이
+    /// 사라져도 다른 창의 z-순서가 잠그기 전 그대로다 (spec 6.5). 우리 앱을 쓰던 중이었으면
+    /// 예전 그대로 그 키 창을 다시 앞으로 한다.
     private func restoreFrontmost() {
         let app = previousApp
         let keyWindow = previousKeyWindow
+        let behind = windowsBehind.compactMap { $0.window }
         previousApp = nil
         previousKeyWindow = nil
-        // 그 사이 다른 앱이 앞으로 나왔다면 사용자가 고른 것이니 건드리지 않는다.
-        guard NSApp.isActive else { return }
+        windowsBehind = []
+        guard NSApp.isActive else {
+            // 그 사이 다른 앱이 앞으로 나왔다면 사용자가 고른 것이니 활성화는 건드리지 않는다.
+            // 잠글 때 같이 올라온 우리 창만 다시 뒤로 보낸다.
+            if app != nil { LockScreen.sendBack(behind) }
+            return
+        }
         if let app = app {
             if app.isTerminated { return }
             if #available(macOS 14.0, *) {
                 NSApp.yieldActivation(to: app)
             }
             _ = app.activate(options: [])
+            LockScreen.sendBack(behind)
         } else if let w = keyWindow, w.isVisible, !(w is LockWindow) {
             w.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    /// 잠그기 전에 다른 앱 뒤에 있던 우리 창을 다시 뒤로 보낸다. 앞에서 뒤 순서로 하나씩 맨 뒤로
+    /// 보내므로 우리 창끼리의 순서는 그대로다. orderBack 은 키/주 창도, 활성 앱도 바꾸지 않는다.
+    /// (그 앱의 창 바로 뒤가 아니라 같은 층의 맨 뒤로 간다 - 다른 앱의 창 순서를 모르므로
+    /// 가장 안전한 쪽을 고른다.)
+    private static func sendBack(_ list: [NSWindow]) {
+        for w in list where w.isVisible && !(w is LockWindow) {
+            w.orderBack(nil)
         }
     }
 
@@ -438,6 +495,10 @@ private enum LockColors {
 /// 커튼 창. 테두리 없음. 키 창이 될 수 있어야 활성화했을 때 키 입력이 다른 앱으로 새지 않는다.
 private final class LockWindow: NSWindow {
     override var canBecomeKey: Bool { return true }
+
+    /// 테두리 없는 창은 기본으로 주 창이 될 수 없다. 그러면 활성화할 때 예전 주 창(설정 창)이
+    /// 주 창으로 남아 같이 앞으로 올라온다. 커튼이 주 창을 맡아 그것을 막는다 (activateSelf).
+    override var canBecomeMain: Bool { return true }
 
     /// 메뉴 막대 자리까지 덮어야 한다. AppKit 이 창을 화면 안쪽으로 밀어 넣지 않게 한다.
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {

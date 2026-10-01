@@ -312,10 +312,23 @@ final class GattServer: NSObject, CBPeripheralManagerDelegate {
     /// 구독자 수가 바뀌었다 (0->N, N->0 규칙).
     private func subscribersChanged(from prev: Int, to n: Int) {
         let now = Mono.now()
+        let firstSub = n > 0 && prev == 0
+        // 새 구독이면 폴링 간격을 여기서 바로 정해 구독과 한 번에 내놓는다 (200 ms 틱과 같은 규칙).
+        // 그러지 않으면 아래 wake 로 깨어난 판정이 "구독자 있음, 간격 0" 을 본다: 간격 0 이면
+        // healthy 는 무조건 true 이고 판정은 "간격 0 = 사용자가 입력 중" 으로 읽어 NEAR 를 낸다.
+        // 잠긴 화면이 자리에 아무도 없는데 한 샘플 동안 풀릴 수 있다.
+        // Windows 에는 이 경합이 아직 있다 (client/ble_gatt.cpp SubscribedClientsChanged 가
+        // reportEvent 를 먼저 깨우고 intervalMs 는 틱 스레드가 나중에 정한다).
+        // Shared 의 잠금은 우리 잠금 밖에서 잡는다 (두 잠금을 겹쳐 잡지 않는다).
+        let firstInterval: UInt32 = firstSub ? GattServer.desiredIntervalMs(now: now) : 0
         var lostRssi: Int?
         lock.lock()
         pubSubCount = n
-        if n > 0 && prev == 0 {
+        if firstSub {
+            pubIntervalMs = firstInterval
+            // 폴링 시작 시각도 같이 찍는다. 틱은 간격이 0 에서 0 이 아닌 값으로 바뀔 때만 다시
+            // 찍으므로, 여기서 간격이 0 이 아니면 틱이 덮어쓰지 않고, 0 이면 입력이 멈춰 폴링을
+            // 시작하는 순간 틱이 다시 찍는다 - 어느 쪽이든 healthy 의 기준 시각이 실제 폴링 시작이다.
             pubPollStartTick = now
             // 첫 보고가 오기 전까지 판정은 상태를 그대로 둔다 (ReportAgeMs = 0xFFFFFFFF).
             // 보고를 받기 전에 0 으로 해 둬야 한다 - 보고도 이 큐에서 처리되므로 순서가 지켜진다.
@@ -327,7 +340,7 @@ final class GattServer: NSObject, CBPeripheralManagerDelegate {
         }
         let wake = reportHandler
         lock.unlock()
-        if n > 0 && prev == 0 {
+        if firstSub {
             kalman.reset()
             EventLog.write("GATT client subscribed")
         }

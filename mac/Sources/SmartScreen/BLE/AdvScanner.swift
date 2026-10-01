@@ -137,12 +137,22 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     private final class Registration {
-        var scanning = true
+        let scanSec: Int
+        var scanning = true                 // 스캔 단계 (블루투스를 기다리는 중 포함)
         var best: CBPeripheral?
         var bestRssi = -127
-        var timer: DispatchSourceTimer?
+        var timer: DispatchSourceTimer?     // 스캔 시간. 실제로 스캔을 건 순간에 건다
+        var waitTimer: DispatchSourceTimer? // 블루투스가 켜지기를 기다리는 상한
         var completions: [(RegisterOutcome) -> Void] = []
+
+        init(scanSec: Int) {
+            self.scanSec = scanSec
+        }
     }
+
+    // 블루투스가 켜지기를 (권한 질문에 답하기를) 기다리는 상한. 처음 실행하면 여기서 처음
+    // CBCentralManager 를 만들어 권한 창이 뜨고, 사용자가 읽고 누를 때까지 상태가 .unknown 이다.
+    private static let registerWaitCapSec = 30
 
     private override init() {
         super.init()
@@ -272,17 +282,31 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                 reg.completions.append(completion)
                 return
             }
-            let sec = max(scanSec, 3)
-            let reg = Registration()
+            let reg = Registration(scanSec: max(scanSec, 3))
             reg.completions.append(completion)
             self.registration = reg
             self.ensureCentral()
-            self.updateScan()   // 블루투스가 아직 안 켜졌으면 켜지는 순간 state 콜백이 건다
-            let t = DispatchSource.makeTimerSource(queue: BLEIds.queue)
-            t.schedule(deadline: .now() + .seconds(sec))
-            t.setEventHandler { [weak self] in self?.registrationScanEnded() }
-            reg.timer = t
-            t.resume()
+            // 권한이 없거나 꺼져 있으면 기다려 봐야 소용없다. 바로 그 이유로 끝낸다
+            // ("폰을 찾지 못했습니다" 로 끝나면 사용자는 폰 쪽을 의심한다).
+            let st = self.central?.state ?? .unknown
+            if let why = AdvScanner.registrationBlockedWhy(st) {
+                EventLog.write("register: Bluetooth unavailable (\(BLEIds.stateName(st)))")
+                self.finishRegistration(.failure(why: why))
+                return
+            }
+            // 켜져 있으면 여기서 스캔과 스캔 타이머가 같이 걸린다. 아직이면 켜지는 순간
+            // state 콜백이 건다 - Windows 처럼 정해진 초 전부를 실제로 스캔하는 데 쓴다.
+            self.updateScan()
+            if reg.timer == nil {
+                let w = DispatchSource.makeTimerSource(queue: BLEIds.queue)
+                w.schedule(deadline: .now() + .seconds(AdvScanner.registerWaitCapSec))
+                w.setEventHandler { [weak self, weak reg] in
+                    guard let self = self, let reg = reg else { return }
+                    self.registrationWaitExpired(reg)
+                }
+                reg.waitTimer = w
+                w.resume()
+            }
         }
     }
 
@@ -340,6 +364,11 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             c.scanForPeripherals(withServices: [BLEIds.identService],
                                  options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
             if running { setAvailable(true) }
+            // 등록 스캔의 시간은 스캔을 실제로 건 지금부터 잰다. 권한 창이나 꺼진 블루투스를
+            // 기다린 시간이 스캔 시간을 먹으면 앱을 띄운 폰이 있어도 "못 찾았다" 가 된다.
+            if let reg = registration, reg.scanning, reg.timer == nil {
+                armRegistrationScanTimer(reg)
+            }
         } else if c.isScanning {
             c.stopScan()
         }
@@ -384,12 +413,19 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         setAvailable(false)
         cands.removeAll()
         if boundId != nil { setBound(nil) }
+        // 등록 중에 권한이 거부됐거나(권한 창에서 "허용 안 함") 블루투스가 꺼졌다/없다: 기다려도
+        // 소용없으니 바로 그 이유로 끝낸다. (.resetting 은 곧 돌아오므로 기다린다.)
+        let regWhy: String? = registration != nil ? AdvScanner.registrationBlockedWhy(st) : nil
         if let pr = probe {
-            if pr.purpose.isIdent {
+            if pr.purpose.isIdent || regWhy != nil {
                 abortProbe()
             } else {
                 finishProbe(.unreachable, token: "", why: "Unreachable")
             }
+        }
+        if let why = regWhy {
+            EventLog.write("register: Bluetooth unavailable (\(BLEIds.stateName(st)))")
+            finishRegistration(.failure(why: why))
         }
     }
 
@@ -684,6 +720,43 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
     // MARK: - 내부: BLE 직접 등록
 
+    /// 등록을 기다려도 소용없는 블루투스 상태면 사용자에게 보일 이유, 아니면 nil.
+    /// (권한 문장은 spec 4.8 의 것. 부르는 쪽이 "등록하지 못했습니다." 로 감싼다.)
+    private static func registrationBlockedWhy(_ st: CBManagerState) -> String? {
+        if BLEIds.authorizationDenied || st == .unauthorized {
+            return "블루투스 권한이 없어요. 시스템 설정 > 개인정보 보호 및 보안 > 블루투스에서 SmartScreen 을 켜 주세요."
+        }
+        switch st {
+        case .poweredOff:
+            return "블루투스가 꺼져 있어요. 켠 뒤 다시 하세요."
+        case .unsupported:
+            return "이 Mac 에서 블루투스를 쓸 수 없어요."
+        default:
+            return nil
+        }
+    }
+
+    /// 스캔을 실제로 건 순간에 부른다 (updateScan). 블루투스를 기다리던 상한은 여기서 끝난다.
+    private func armRegistrationScanTimer(_ reg: Registration) {
+        reg.waitTimer?.cancel()
+        reg.waitTimer = nil
+        let t = DispatchSource.makeTimerSource(queue: BLEIds.queue)
+        t.schedule(deadline: .now() + .seconds(reg.scanSec))
+        t.setEventHandler { [weak self] in self?.registrationScanEnded() }
+        reg.timer = t
+        t.resume()
+    }
+
+    /// 상한(30초) 동안 블루투스가 켜지지 않았다 (권한 창에 답하지 않았거나, 재설정이 끝나지 않았다).
+    private func registrationWaitExpired(_ reg: Registration) {
+        guard registration === reg, reg.scanning, reg.timer == nil else { return }
+        let st = central?.state ?? .unknown
+        EventLog.write("register: Bluetooth not ready after \(AdvScanner.registerWaitCapSec)s (\(BLEIds.stateName(st)))")
+        let why = AdvScanner.registrationBlockedWhy(st)
+            ?? "블루투스가 준비되지 않았어요. 블루투스 권한을 묻는 창이 떴다면 허용한 뒤 다시 하세요."
+        finishRegistration(.failure(why: why))
+    }
+
     private func registrationScanEnded() {
         guard let reg = registration, reg.scanning else { return }
         reg.scanning = false
@@ -711,6 +784,13 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         registration = nil
         reg.timer?.cancel()
         reg.timer = nil
+        reg.waitTimer?.cancel()
+        reg.waitTimer = nil
+        if reg.scanning {
+            // 스캔 단계에서 끝났다 (블루투스 없음/권한 없음/기다림 상한). 모니터링이 아니면 스캔을 내린다.
+            reg.scanning = false
+            updateScan()
+        }
         let callbacks = reg.completions
         DispatchQueue.main.async {
             for cb in callbacks { cb(outcome) }

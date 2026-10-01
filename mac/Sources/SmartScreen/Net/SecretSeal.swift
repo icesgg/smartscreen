@@ -82,6 +82,7 @@ enum SecretSeal {
     /// 새 salt 를 만든다. 임시 파일(0600)에 쓰고 fsync 한 뒤 제자리에 놓는다.
     /// salt 파일이 아직 없으면 link(2) 로 놓는다 - 다른 프로세스(--clip-test 등)가 먼저 만들었으면
     /// EEXIST 로 실패하고, 그때는 그쪽 salt 를 쓴다 (덮어쓰면 그쪽이 봉한 값이 열리지 않는다).
+    /// 볼륨이 하드 링크를 지원하지 않으면 open(O_EXCL) 로 만든다 (createSaltExclusive).
     /// 이미 있는데 망가진 파일(길이가 다르다)이면 rename(2) 으로 바꾼다 - 그 파일로는 어차피
     /// 아무것도 열리지 않는다.
     private static func createSalt() -> Data? {
@@ -129,9 +130,39 @@ enum SecretSeal {
             if e == EEXIST {
                 return readSalt()      // 다른 프로세스가 방금 만들었다
             }
-            return nil
+            // 하드 링크를 못 쓰는 볼륨이다 (SMB 네트워크 홈 폴더, FAT/exFAT: ENOTSUP, EPERM ...).
+            // 여기서 포기하면 그런 Mac 에서는 봉하기가 늘 실패해 로그인이 재시작을 넘기지 못한다
+            // (Windows DPAPI 는 네트워크 프로필에서도 된다).
+            return createSaltExclusive(bytes, dest: dest)
         }
         _ = unlink(tmp)
         return Data(bytes)
+    }
+
+    /// link(2) 대신 open(O_CREAT|O_EXCL) 로 "없을 때만 만들기" 를 한다. 같은 프로세스 안의 경합은
+    /// SecretSeal.lock 이 이미 한 줄로 세웠고, 쓰다 만 파일(32 바이트가 아님)은 readSalt 가 거절한다.
+    /// 다른 프로세스가 그사이 망가진 파일로 보고 rename 으로 바꿔 놓았을 수 있으므로, 다 쓴 뒤에는
+    /// 우리 바이트가 아니라 지금 파일에 있는 salt 를 돌려준다 - 무엇으로 봉하든 디스크의 salt 와 같게.
+    /// 실패해도 만든 파일을 지우지 않는다: 그새 다른 프로세스가 놓은 멀쩡한 salt 일 수 있고,
+    /// 망가진 파일은 다음 createSalt 의 rename 경로가 바꾼다.
+    private static func createSaltExclusive(_ bytes: [UInt8], dest: String) -> Data? {
+        let fd = open(dest, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
+        if fd < 0 {
+            if errno == EEXIST {
+                return readSalt()      // 다른 프로세스가 방금 만들었다
+            }
+            return nil
+        }
+        // umask 와 상관없이 소유자만 읽고 쓴다 (SMB 에서는 실패할 수 있다 - 무시한다).
+        _ = fchmod(fd, 0o600)
+        let written: Int = bytes.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int in
+            return write(fd, raw.baseAddress, raw.count)
+        }
+        let synced = fsync(fd) == 0
+        let closed = close(fd) == 0
+        if written != saltBytes || !synced || !closed {
+            return nil
+        }
+        return readSalt()
     }
 }
