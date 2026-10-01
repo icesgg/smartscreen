@@ -223,9 +223,12 @@ public enum UpdateLogic {
             let isDot = c == 0x2E
             if isDot && prevDot { return false }               // ".."
             prevDot = isDot
-            let ok = (c >= 0x30 && c <= 0x39) || (c >= 0x61 && c <= 0x7A) || (c >= 0x41 && c <= 0x5A) ||
-                c == 0x2E || c == 0x5F || c == 0x2D || c == 0x2F
-            if !ok { return false }
+            switch c {
+            case 0x30...0x39, 0x41...0x5A, 0x61...0x7A, 0x2E, 0x5F, 0x2D, 0x2F:   // 0-9 A-Z a-z . _ - /
+                break
+            default:
+                return false
+            }
         }
         return true
     }

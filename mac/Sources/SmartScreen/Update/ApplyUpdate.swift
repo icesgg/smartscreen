@@ -51,7 +51,8 @@ extension Updater {
                 if !ver.isEmpty { Disk.writeMarker(ver, UpdateText.cannotConfirmExit) }
                 return 1
             }
-            var gone = Applier.waitGone(a.pid, ms: 120_000)
+            // 그 번호가 이미 다른 프로그램의 것이면 원래 앱은 끝났고 번호만 다시 쓰인 것이다.
+            var gone = !Applier.isOurApp(a.pid) || Applier.waitGone(a.pid, ms: 120_000)
             if !gone {
                 EventLog.write("update: old process \(a.pid) still alive after 120 s - terminating it")
                 // Windows 는 열어 둔 핸들이 pid 를 붙잡아 다른 프로세스가 그 번호를 쓸 수 없다.
@@ -231,7 +232,10 @@ private enum Applier {
         if kill(pid, 0) != 0 {
             return errno == ESRCH
         }
-        guard let k = procInfo(pid) else { return true }
+        guard let k = procInfo(pid) else {
+            // 그 사이에 끝났거나 sysctl 이 실패했다. kill 로 다시 본다 (모르면 살아 있다고 본다).
+            return kill(pid, 0) != 0 && errno == ESRCH
+        }
         return k.kp_proc.p_stat == 5        // SZOMB
     }
 
