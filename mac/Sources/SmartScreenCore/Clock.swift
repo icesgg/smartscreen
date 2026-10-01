@@ -16,6 +16,16 @@ public enum Mono {
         // 0 은 어디서나 "한 번도 없음" 이다. 부팅 직후라도 그 값을 돌려주면 안 된다.
         return ms == 0 ? 1 : ms
     }
+
+    /// 부팅 뒤 잠들어 있던 시간의 합 (ms): CLOCK_MONOTONIC(잠자기를 센다) - CLOCK_UPTIME_RAW(안 센다).
+    /// Windows GetTickCount64() - QueryUnbiasedInterruptTime()/10000 자리. 판정 스레드가 반복마다
+    /// 읽어 늘어난 만큼 잤다고 본다 (SleepWatch). 두 시계를 한 번에 읽을 수 없어 µs 단위로 흔들리고,
+    /// CLOCK_MONOTONIC 은 NTP 에 밀릴 수 있다 - 그래서 쓰는 쪽은 직전 반복과만 비교하고 5 s 미만은 버린다.
+    public static func asleepMs() -> UInt64 {
+        let mono = clock_gettime_nsec_np(CLOCK_MONOTONIC)
+        let awake = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        return mono > awake ? (mono - awake) / 1_000_000 : 0
+    }
 }
 
 /// 지역 시각 문자열 (Windows GetLocalTime + "%02d:%02d:%02d").

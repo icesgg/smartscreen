@@ -139,24 +139,39 @@ final class JudgeThread {
     private func run() {
         // 판정 상태(히스테리시스용 현재 상태, 2샘플 규칙의 카운터)는 스레드마다 새로 시작한다.
         let judge = ProximityJudge()
+        // 반복 사이의 잠자기를 잰다. 기준은 스레드가 시작할 때 잡는다 - 첫 판정은 비교할 것이 없다.
+        var sleepWatch = SleepWatch()
+        _ = sleepWatch.observe(asleepMs: Mono.asleepMs())
         // stop 을 먼저 본다: 깨어난 이유가 패킷이든 시간 초과든 stop 이 서 있으면 판정하지 않는다.
         while !isStopRequested() {
             // 런 루프가 없는 스레드라 반복마다 autorelease 풀을 비운다.
             autoreleasepool {
-                iterate(judge)
+                iterate(judge, &sleepWatch)
             }
             _ = wakeSignal.wait(timeoutMs: JudgeThread.scanIntervalMs)
         }
         finished.signal()
     }
 
-    private func iterate(_ judge: ProximityJudge) {
+    private func iterate(_ judge: ProximityJudge, _ sleepWatch: inout SleepWatch) {
         let now = Mono.now()
+        // 잠들었다 깼으면 판정보다 먼저 알린다: 깨어난 뒤 첫 판정부터 유예가 걸려야 한다. 그 판정이
+        // 보는 스캐너와 GATT 는 아직 자기 전 그대로라 "신호 없음" 이 부재처럼 보인다.
+        if let slept = sleepWatch.observe(asleepMs: Mono.asleepMs()) {
+            judge.noteResume(now: now)
+            EventLog.write(ProximityJudge.sleptLine(sleptMs: slept))
+            // 잠들기 전의 연결 실패로 늘어난 재시도 간격(최대 120 s)을 처음으로 - 깨어난 폰을 바로 다시 찾는다.
+            AdvScanner.shared.resetProbeBackoff()
+        }
         let scanner = AdvScanner.shared.snapshot(now: now)
         let gatt = GattServer.shared.snapshot(now: now)
         let settings = Shared.shared.judgeSettings()
         let out = judge.step(now: now, scanner: scanner, gatt: gatt, settings: settings,
                              timeStr: LocalClock.hhmmss())
+        if out.wakeGraceExpired {
+            // STATE 줄보다 먼저 남는다 (그 줄은 결과를 받은 메인이 쓴다).
+            EventLog.write(ProximityJudge.wakeGraceExpiredLine)
+        }
 
         // 앱이 처음 연결되면 config 에 기록 -> 다음부터는 미연결을 "부재" 로 취급.
         if out.becameGattSeen {

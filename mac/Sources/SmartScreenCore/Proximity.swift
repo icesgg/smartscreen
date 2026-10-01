@@ -103,9 +103,27 @@ public final class ProximityJudge {
     private static let belowSampleCapMs: UInt64 = 6000
     /// FAR 에서 NEAR 로 돌아올 때 더하는 히스테리시스 (dB)
     private static let hysteresisDb = 4
+    /// 깨어난 뒤 새 샘플을 기다리는 최대 시간 (Windows kWakeGraceMs, client/common.h).
+    /// 잠든 동안 스캐너도 GATT 연결도 멎었다 - 깨어난 직후의 "신호 없음" 은 부재가 아니라 아직
+    /// 아무것도 못 들은 것이다. 그대로 두면 깨자마자 수신 타임아웃(-100)이나 끊긴 연결("absent")로
+    /// FAR 이 되어, 책상 앞에서 Mac 을 연 사람 앞에서 화면이 가려진다.
+    /// 광고 p90 간격 5.8 s 의 두 배쯤이다. 정말 자리에 없을 때 늦어지는 것은 이 12 s 뿐이다.
+    public static let wakeGraceMs: UInt64 = 12000
+
+    /// "judge: slept 32400s - absence waits up to 12s for a fresh sample". 초는 버림.
+    /// Windows 와 같은 글자 (두 플랫폼의 events.log 가 같아야 한다).
+    public static func sleptLine(sleptMs: UInt64) -> String {
+        return "judge: slept \(sleptMs / 1000)s - absence waits up to \(wakeGraceMs / 1000)s for a fresh sample"
+    }
+
+    /// 유예가 새 샘플 없이 끝났을 때 한 번 (Windows 와 같은 글자).
+    public static let wakeGraceExpiredLine =
+        "judge: no sample within \(wakeGraceMs / 1000)s of waking - absence applies"
 
     public private(set) var state: ProxState = .far
     public private(set) var lastNearTick: UInt64 = 0
+    /// 깨어난 것을 안 판정 시각. 0 = 유예 없음. 새 샘플이 오거나 12 s 가 지나면 0 으로 돌아간다.
+    public private(set) var resumeTick: UInt64 = 0
 
     // 임계값 미만이 연속 몇 "샘플" 이어졌는지. 시간이 아니라 샘플 수로 센다.
     private var belowCount = 0
@@ -118,11 +136,22 @@ public final class ProximityJudge {
 
     public init() {}
 
+    /// 판정 스레드가 잠들었다 깬 것을 알아챘다 (반복 사이의 잠든 시간이 5 s 이상 늘었다).
+    /// 이 뒤로 새 샘플(광고 패킷이나 GATT 보고의 시각 > now)이 올 때까지, 최대 12 s 동안은
+    /// 어느 갈래로도 FAR 로 가지 않는다 - 지금 상태를 그대로 둔다. NEAR 로 가는 것은 막지 않는다.
+    /// 유예 중에 다시 불러도 된다 (기준 시각만 새로 잡는다).
+    public func noteResume(now: UInt64) {
+        resumeTick = now
+    }
+
     /// ScanThread 루프 한 바퀴. 결과의 session 은 0 으로 두고(호출자가 채운다),
     /// becameGattSeen 이 true 면 호출자가 UI 스레드에서 gattSeen 을 저장하고
     /// "companion app seen - GATT connection is now required for NEAR" 를 남긴다.
+    /// wakeGraceExpired 가 true 면 깨어난 뒤 12 s 동안 새 샘플이 없어 유예가 끝났다 - 호출자가
+    /// wakeGraceExpiredLine 을 한 번 남긴다 (이번 판정부터 평소 규칙이다).
     public func step(now: UInt64, scanner: ScannerSnapshot, gatt: GattSnapshot,
-                     settings: JudgeSettings, timeStr: String) -> (result: ProbeResult, becameGattSeen: Bool) {
+                     settings: JudgeSettings, timeStr: String)
+        -> (result: ProbeResult, becameGattSeen: Bool, wakeGraceExpired: Bool) {
         var reachable = false
         let latency: UInt32 = 0          // Mac: latency 경로 없음
         var isNear = false
@@ -210,10 +239,32 @@ public final class ProximityJudge {
             isNear = reachable && latency <= settings.nearLatencyMs
         }
 
+        // 깨어난 뒤의 유예. 잠든 동안의 수신 타임아웃(-100), 끊긴 GATT 연결("absent"), 오래된
+        // lastNearTick(keepAlive) 은 모두 "자는 동안 아무것도 못 들었다" 일 뿐 자리를 비웠다는 증거가
+        // 아니다. 그래서 깨어난 뒤 첫 새 샘플이 올 때까지는 FAR 로 가지 않는다. 새 샘플이 오면 그
+        // 판정부터 평소 규칙이다 (미만 샘플이면 2 샘플 규칙이 바로 센다). 12 s 안에 아무것도 안
+        // 오면 그때는 정말 없는 것이다 - 평소 규칙으로 부재를 적용한다.
+        var holdForWake = false
+        var wakeGraceExpired = false
+        if resumeTick != 0 {
+            let fresh = scanner.lastReceivedTick > resumeTick || gatt.lastReportTick > resumeTick
+            if fresh {
+                resumeTick = 0
+            } else if t &- resumeTick < ProximityJudge.wakeGraceMs {
+                holdForWake = true
+            } else {
+                resumeTick = 0
+                wakeGraceExpired = true
+            }
+        }
+
         if isNear {
             lastNearTick = t
             belowCount = 0; belowFirstTick = 0; belowSampleTick = 0
             if state == .far { state = .near }
+        } else if holdForWake {
+            // 지금 상태를 그대로 둔다. 미만 카운터도 건드리지 않는다 - 잠들기 전의 낡은 샘플을
+            // 새 증거로 세면 안 된다.
         } else if state == .near {
             let goFar: Bool
             if !bleAvail {
@@ -263,6 +314,51 @@ public final class ProximityJudge {
         } else {
             r.timerRemainMs = 0
         }
-        return (r, becameGattSeen)
+        return (r, becameGattSeen, wakeGraceExpired)
+    }
+}
+
+/// 판정 반복 사이에 시스템이 잠들어 있었는지 본다 (Windows: GetTickCount64() -
+/// QueryUnbiasedInterruptTime()/10000, Mac: CLOCK_MONOTONIC - CLOCK_UPTIME_RAW = Mono.asleepMs()).
+/// 두 값의 차이는 부팅 뒤 잠들어 있던 시간의 합이라, 반복 사이에 그것이 늘었으면 그만큼 잤다.
+///
+/// 알림(NSWorkspace.didWakeNotification)을 쓰지 않는 까닭: 알림은 메인으로 오고 판정 스레드와
+/// 순서가 정해져 있지 않다 - 깨어난 판정 스레드가 알림보다 먼저 낡은 스캐너 상태로 판정할 수 있다.
+/// 판정 스레드가 자기 반복에서 직접 재면 깨어난 뒤 첫 판정부터 유예가 걸린다.
+public struct SleepWatch {
+    /// 이만큼 이상 늘어야 "잤다" 로 본다. 두 시계를 한 번에 읽지 못해 생기는 흔들림(µs)과
+    /// NTP 가 CLOCK_MONOTONIC 을 미는 몫(반복 2 s 동안 ms 미만)보다 한참 크다.
+    public static let minSleptMs: UInt64 = 5000
+
+    private var lastAsleepMs: UInt64?
+
+    public init() {}
+
+    /// 이번 반복에서 읽은 누적 잠든 시간(ms). 지난 반복보다 5000 ms 이상 늘었으면 늘어난 만큼을
+    /// 돌려준다. 첫 호출은 기준만 잡는다. 줄었으면(시계 흔들림) 새 값을 기준으로 삼을 뿐이다 -
+    /// 늘 직전 반복과 비교하므로 느린 밀림이 쌓이지 않는다.
+    public mutating func observe(asleepMs: UInt64) -> UInt64? {
+        defer { lastAsleepMs = asleepMs }
+        guard let last = lastAsleepMs, asleepMs > last else { return nil }
+        let grew = asleepMs - last
+        return grew >= SleepWatch.minSleptMs ? grew : nil
+    }
+}
+
+/// GATT TICK 간격 정책 (Windows client/ble_gatt.cpp DesiredIntervalMs 와 같은 순서).
+/// RSSI 가 필요한 건 "자리를 떴을지도 모를 때" 뿐 -> 입력 중에는 폰 앱을 깨우지 않는다 (배터리).
+public enum GattPollPolicy {
+    /// blackActive: 화면이 가려져 있다. measuring: 재보기 마법사가 재는 중.
+    /// idleMs: 마지막 키보드/마우스 입력 뒤로 지난 시간.
+    /// 0 = TICK 을 보내지 않는다 (판정은 "입력 중 = 자리에 있음" 으로 읽는다).
+    public static func intervalMs(blackActive: Bool, measuring: Bool, idleMs: UInt64) -> UInt32 {
+        if blackActive { return 2000 }        // 잠김 상태: 복귀 감시
+        // 재보기는 입력과 무관하게 1 초마다 잰다. 입력 5 초 규칙을 그대로 두면 앉아서 재는 1 분 동안
+        // 타자를 친 사람은 TICK 이 멎어 연결 표본이 0 개다 ("연결 신호 못 쟀어요"). 재는 동안은
+        // 잠금이 꺼져 있으므로 판정이 연결 RSSI 를 읽어 FAR 로 가도 화면은 가려지지 않는다.
+        if measuring { return 1000 }
+        if idleMs < 5000 { return 0 }         // 입력 중 = 자리에 있음
+        if idleMs < 120_000 { return 1000 }   // 입력 멈춤 직후: 빠르게 확인
+        return 3000                           // 오래 가만히 있음: 느리게
     }
 }
