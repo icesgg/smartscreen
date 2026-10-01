@@ -284,6 +284,9 @@ bool IsRemoteSession() {
 
 void ActivateBlackScreen() {
     if (g_bBlackActive) return;
+    // Q6: [중지] 뒤에는 자동으로 가리지 않는다. 중지 직전에 보낸 판정 결과나 남은 타이머가
+    // 늦게 도착해도 감시를 멈춘 PC 의 화면을 가리면 안 된다 (직접 잠금은 이 경로로 오지 않는다).
+    if (!g_monitoring) return;
     // 방금 마우스/키보드를 썼다 = 사람이 앞에 있다 → RSSI와 무관하게 잠그지 않음
     if (g_lastInputTick != 0 && (GetTickCount64() - g_lastInputTick) < 5000) return;
     // 재보기 중에는 자리를 비우는 것이 절차의 일부다. 여기서 잠그면 측정이
@@ -306,6 +309,9 @@ void ActivateBlackScreen() {
     }
     g_bBlackActive = true;
     g_bManualLock = false;
+    // Q2: 지난 잠금에서 남은 해제 카운트다운을 지운다. 남겨 두면 1초 타이머가 그 숫자를
+    // 마저 세고 이번 잠금을 폰이 돌아오지도 않았는데 풀어 버린다.
+    g_unlockTimer = 0;
     g_lockStartTick = GetTickCount64();
     DbgEvent(L"BLACK ON  (idleCountdown=%d)", g_nCountdown);
 
@@ -323,15 +329,25 @@ void ActivateBlackScreen() {
 void DeactivateBlackScreen() {
     if (!g_bBlackActive) return;
 
-    SYSTEMTIME stNow; GetLocalTime(&stNow);
+    // Q1: 지금(UTC) - 잠긴 시간을 한 번만 지역 시각으로
+    // 예전에는 지역 시각에서 빼고 그 결과를 또 지역 시각으로 바꿔서, "Lock" 이
+    // UTC 오프셋만큼 (한국이면 9시간) 어긋나 보였다.
+    SYSTEMTIME stUtcNow; GetSystemTime(&stUtcNow);
+    SYSTEMTIME stNow;
+    if (!SystemTimeToTzSpecificLocalTime(nullptr, &stUtcNow, &stNow)) GetLocalTime(&stNow);
     DWORD durationSec = (g_lockStartTick > 0) ? (DWORD)((GetTickCount64() - g_lockStartTick) / 1000) : 0;
     DWORD durMin = durationSec / 60, durSec = durationSec % 60;
-    FILETIME ftNow; SystemTimeToFileTime(&stNow, &ftNow);
-    ULARGE_INTEGER u; u.LowPart = ftNow.dwLowDateTime; u.HighPart = ftNow.dwHighDateTime;
-    u.QuadPart -= (ULONGLONG)durationSec * 10000000ULL;
-    ftNow.dwLowDateTime = u.LowPart; ftNow.dwHighDateTime = u.HighPart;
-    SYSTEMTIME stLock; FileTimeToSystemTime(&ftNow, &stLock);
-    SystemTimeToTzSpecificLocalTime(nullptr, &stLock, &stLock);
+    SYSTEMTIME stLock = stNow;
+    FILETIME ftLock;
+    if (SystemTimeToFileTime(&stUtcNow, &ftLock)) {
+        ULARGE_INTEGER u; u.LowPart = ftLock.dwLowDateTime; u.HighPart = ftLock.dwHighDateTime;
+        u.QuadPart -= (ULONGLONG)durationSec * 10000000ULL;
+        ftLock.dwLowDateTime = u.LowPart; ftLock.dwHighDateTime = u.HighPart;
+        SYSTEMTIME stUtcLock, stLocalLock;
+        if (FileTimeToSystemTime(&ftLock, &stUtcLock) &&
+            SystemTimeToTzSpecificLocalTime(nullptr, &stUtcLock, &stLocalLock))
+            stLock = stLocalLock;
+    }
     swprintf_s(g_ovlInfo, L"Lock %02d:%02d -> Unlock %02d:%02d (%dm%02ds)",
         stLock.wHour, stLock.wMinute, stNow.wHour, stNow.wMinute, durMin, durSec);
 
