@@ -73,4 +73,5 @@ jobs:
             app-build.log
             swift-test.log
             swift-build.log
+            mac/dist/icon-preview.png
           if-no-files-found: ignore

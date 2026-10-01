@@ -48,10 +48,19 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/SmartScreen"
 sed "s/__VERSION__/$VERSION/g" "$HERE/Resources/Info.plist" > "$APP/Contents/Info.plist"
 plutil -lint "$APP/Contents/Info.plist"
-if [ -f "$HERE/Resources/AppIcon.icns" ]; then
-    cp "$HERE/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+# 아이콘은 코드로 그린다 (mac/tools/make_icon.swift - 저장소에 그림 파일을 두지 않는다).
+# 실패해도 빌드는 계속한다 - 아이콘이 없으면 Finder 가 기본 아이콘을 보일 뿐이다.
+# 서명보다 먼저여야 한다: 서명 뒤에 묶음에 파일을 더하면 서명이 깨진다.
+ICONSET="$DIST/AppIcon.iconset"
+if swift "$HERE/tools/make_icon.swift" "$ICONSET" \
+   && iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"; then
     /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string AppIcon" "$APP/Contents/Info.plist"
+    # 눈으로 확인할 수 있게 큰 그림 하나를 남긴다 (CI 의 logs artifact 에 실린다)
+    cp "$ICONSET/icon_512x512@2x.png" "$DIST/icon-preview.png" || true
+else
+    echo "아이콘을 만들지 못했다 - 기본 아이콘으로 간다" >&2
 fi
+rm -rf "$ICONSET"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 # 임시(ad-hoc) 서명. 개발자 인증서가 없으므로 Gatekeeper 는 처음 한 번 막는다
