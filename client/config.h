@@ -76,6 +76,15 @@ struct AppConfig {
     bool loadFailed = false;
 };
 
+// gattRssiOffset 이 가질 수 있는 범위 (dB). config.ini 를 읽을 때도, 재보기가 잰 차이를
+// 남길 때도 이 함수 하나로 자른다 - events.log 에 적힌 차이, 저장된 값, 실제로 쓰는
+// 연결 임계값이 늘 같은 숫자가 되도록. 실측 차이는 15dB 안팎이다.
+const int kGattOffsetMin = -40;
+const int kGattOffsetMax = 40;
+inline int ClampGattOffset(int v) {
+    return (v < kGattOffsetMin) ? kGattOffsetMin : (v > kGattOffsetMax) ? kGattOffsetMax : v;
+}
+
 std::wstring GetConfigDir();
 
 // 진단용 이벤트 로그 (events.log). g_debugEvents가 true일 때만 기록

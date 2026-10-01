@@ -185,9 +185,8 @@ bool LoadAppConfig(AppConfig& cfg) {
     if (m.count(L"gattRssiThreshold")) cfg.gattRssiThreshold = _wtoi(m[L"gattRssiThreshold"].c_str());
     if (m.count(L"gattRssiOffset")) {
         // 손으로 고친 값이 터무니없어도 임계값이 화면 끝까지 밀리지 않게.
-        // 실측 차이는 15dB 안팎이다.
-        int v = _wtoi(m[L"gattRssiOffset"].c_str());
-        cfg.gattRssiOffset = (v < -40) ? -40 : (v > 40) ? 40 : v;
+        // 재보기가 남길 때도 같은 범위로 자른다 (config.h ClampGattOffset).
+        cfg.gattRssiOffset = ClampGattOffset(_wtoi(m[L"gattRssiOffset"].c_str()));
     }
     if (m.count(L"bleLostMeansFar")) cfg.bleLostMeansFar = (_wtoi(m[L"bleLostMeansFar"].c_str()) != 0);
     if (m.count(L"keepAliveSec")) cfg.keepAliveSec = _wtoi(m[L"keepAliveSec"].c_str());

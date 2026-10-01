@@ -1117,8 +1117,12 @@ static void OnResult(ProbeResult* r) {
         swprintf_s(ev,L"unreachable (fail=%d, err=%d)",g_consecutiveFails,r->wsaError);
     else if(!r->reachable) swprintf_s(ev,L"unreachable (err=%d)",r->wsaError);
     else if(r->bleAvailable) {
-        // BLE RSSI 기반 이벤트 메시지
-        if(r->state==ProxState::Near&&r->rssiDbm>=g_nearRssiThreshold)
+        // BLE RSSI 기반 이벤트 메시지. 기준은 이 행의 경로가 실제로 쓰는 설정값이다
+        // (광고 기준, 또는 연결 기준 = 광고 기준 + gattRssiOffset) - 판정, STATE 로그,
+        // 상태 줄과 같다. NEAR 행이라 히스테리시스는 없다. 광고 기준만 보면, 차이를 잰
+        // 뒤에는 멀쩡한 연결 NEAR 행이 "weak" 로 찍힌다.
+        int rowThr=r->gatt?g_gattRssiThreshold:g_nearRssiThreshold;
+        if(r->state==ProxState::Near&&r->rssiDbm>=rowThr)
             swprintf_s(ev,L"near (%d dBm, reset %ds)",r->rssiDbm,(int)(r->timerRemainMs/1000));
         else if(r->state==ProxState::Near&&inW)
             swprintf_s(ev,L"near (warmup, %d dBm)",r->rssiDbm);
@@ -3007,6 +3011,9 @@ static void WzJudge() {
     // 남긴다. 어댑터가 세기를 흉내 내는지는 보지 않는다: 이 값은 폰이 잰다.
     // 못 쟀거나 겹치면 지금 config 의 차이를 그대로 둔다 - 이번 재보기가 연결 쪽에
     // 대해서는 아무것도 말해 주지 않았으니, 예전에 잰 값을 0 으로 지울 이유가 없다.
+    // 잰 차이는 config 를 읽을 때와 같은 범위로 자른다. 자르지 않으면 로그에는
+    // -45 가 남고, [이대로 쓰기] 뒤 막대가 config 를 다시 읽으면서 -40 을 쓴다.
+    // 잰 구간(착석/비움 최저~최고)은 그대로 남기니 자르기 전 차이도 거기서 보인다.
     int gsLo, gsHi, gaLo, gaHi;
     WzRange(g_wzGSeated, gsLo, gsHi);
     WzRange(g_wzGAway, gaLo, gaHi);
@@ -3014,7 +3021,8 @@ static void WzJudge() {
     bool gMeasured = (gsn >= 15 && gan >= 8);
     bool gOverlap  = gMeasured && (gsLo - 2 <= gaHi);
     AppConfig cur; LoadAppConfig(cur);
-    g_wzGattOffset = (gMeasured && !gOverlap) ? (gsLo - 2) - g_wzBase : cur.gattRssiOffset;
+    g_wzGattOffset = (gMeasured && !gOverlap) ? ClampGattOffset((gsLo - 2) - g_wzBase)
+                                              : cur.gattRssiOffset;
 
     if (gMeasured && !gOverlap) {
         swprintf_s(buf,

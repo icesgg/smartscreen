@@ -463,7 +463,10 @@ advertisement series is judged exactly as before (too few, flat, overlap)
 and any failure there fails the whole run. If it passes, the GATT series
 gets the same seated-floor rule — at least 15 seated and 8 away samples,
 no overlap, GATT base = seated floor − 2 — and what is stored is the
-difference, `gattRssiOffset` = GATT base − advertisement base. There is no
+difference, `gattRssiOffset` = GATT base − advertisement base, clamped to
+[−40, 40] — the same limit the config reader applies, so the difference in
+`events.log`, the saved key and the threshold in use are one number (the
+measured ranges are logged unclipped beside it). There is no
 flat check on GATT: the phone measures it, not this adapter. When GATT was
 not measured (the phone was linked elsewhere) or overlapped, the previous
 offset is kept rather than reset, since the run said nothing about it.
