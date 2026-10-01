@@ -804,6 +804,18 @@ static void PopulateCombo() {
 // ---------------------------------------------------------------------------
 // Start / Stop
 // ---------------------------------------------------------------------------
+
+// [연결] 경로의 임계값. 따로 묻는 숫자가 아니라, 보이는 숫자 하나(광고 기준)를 재보기가
+// 잰 차이(gattRssiOffset)만큼 옮긴 값이다. [연결] 임계값을 정하는 곳은 전부 이걸 쓴다:
+// [시작], 간단 화면의 거리 막대, 재보기의 [이대로 쓰기] (막대를 거친다).
+// 차이를 안 잰 config 는 0 이라 예전처럼 두 경로가 같은 값이다.
+static int GattThresholdFor(int nearThr, int gattOffset) {
+    int v = nearThr + gattOffset;
+    if (v > -30) v = -30;
+    if (v < -100) v = -100;
+    return v;
+}
+
 static void StartMon() {
     int sel = (int)SendMessageW(g_hCombo, CB_GETCURSEL, 0, 0);
     int pairedIdx = ComboSelToPaired(sel);
@@ -818,12 +830,15 @@ static void StartMon() {
     if (latVal > -30) latVal = -30;
     if (latVal < -100) latVal = -100;
     g_nearRssiThreshold = latVal;
-    // 연결(GATT) 경로도 같은 값이다. 처음에는 "폰이 잰 값이라 눈금이 다르다" 고 따로
-    // 뒀지만, 실측에서 두 경로는 2dB 안에서 같이 움직였고(PROXIMITY.md) 간단 창의
-    // 슬라이더는 이미 둘을 같이 바꾼다. 이 칸만 광고 쪽을 바꾸게 두면 폰 앱이 붙어
-    // 있는 PC 는 화면에 보이는 것과 다른 값으로 판정한다 - 실제로 광고 -67 / 연결 -61
+    // 연결(GATT) 경로의 임계값은 따로 묻지 않는다. 이 칸의 숫자에서 재보기가 잰
+    // 차이만큼 옮긴 값을 쓴다 - 아래에서 config 를 읽은 뒤에 맞춘다.
+    // 두 경로가 늘 같이 움직이는 것이 아니어서다. 윈도우 노트북에서는 2dB 안에서
+    // 같이 움직였지만(PROXIMITY.md) M1 맥에서는 같은 순간 연결 쪽이 12~15dB 낮았다
+    // (광고 -41 / 연결 -58). 그래서 재보기가 둘의 차이를 재고, 연결 임계값은 보이는
+    // 숫자 하나를 그 차이만큼 따라간다.
+    // 둘을 따로 고치게 두지 않는 이유: 이 칸만 광고 쪽을 바꾸게 두었더니 폰 앱이 붙어
+    // 있는 PC 가 화면에 보이는 것과 다른 값으로 판정했다 - 실제로 광고 -67 / 연결 -61
     // 로 갈라진 채 앉은 자리에서 잠겼다 (2026-10-01).
-    g_gattRssiThreshold = latVal;
     swprintf_s(latBuf, L"%d", latVal); SetWindowTextW(g_hEditLatency, latBuf);
     // latency fallback용 (호환성)
     g_nearLatencyMs = 200;
@@ -863,6 +878,8 @@ static void StartMon() {
     // Save config (load first to preserve enterprise settings)
     AppConfig cfg;
     LoadAppConfig(cfg);
+    // 위 주석: 보이는 숫자 + 재보기가 잰 차이. 차이를 안 잰 config 는 0 이라 같은 값이다.
+    g_gattRssiThreshold = GattThresholdFor(g_nearRssiThreshold, cfg.gattRssiOffset);
 
     // BLE RSSI 스캐너 시작 (기기 이름으로 BLE 광고 매칭)
     // config.ini에 bleDebugLog=1 이면 주변 광고를 ble_scan_log.csv로 기록
@@ -878,8 +895,8 @@ static void StartMon() {
     DbgEvent(L"ident: token=%d ovfBit=%d",
         cfg.phoneToken.empty() ? 0 : 1, cfg.phoneOvfBit);
     // v2: GATT 서버를 먼저 시작 (폰 앱이 연결해 오면 1Hz RSSI 보고를 받음. 실패해도 v1/latency로 동작)
-    // g_gattRssiThreshold 는 위에서 "신호 강도" 칸의 값으로 맞췄다. config 의
-    // gattRssiThreshold 는 그 값의 사본일 뿐이라 여기서 다시 읽지 않는다.
+    // g_gattRssiThreshold 는 위에서 "신호 강도" 칸 + gattRssiOffset 으로 맞췄다. config 의
+    // gattRssiThreshold 는 그렇게 나온 값의 사본일 뿐이라 여기서 다시 읽지 않는다.
     g_gattSeen = cfg.gattSeen;
     g_gattGraceSec = cfg.gattGraceSec;
     g_monStartTick = GetTickCount64();
@@ -913,7 +930,7 @@ static void StartMon() {
     cfg.btAddress = g_targetAddr;
     cfg.nearLatencyMs = g_nearLatencyMs;
     cfg.nearRssiThreshold = g_nearRssiThreshold;
-    cfg.gattRssiThreshold = g_gattRssiThreshold;   // 같은 값 (위 주석)
+    cfg.gattRssiThreshold = g_gattRssiThreshold;   // 파생된 사본 (위 주석)
     cfg.gattSeen = g_gattSeen;
     cfg.keepAliveSec = g_keepAliveSec;
     cfg.scanIntervalSec = g_scanIntervalSec;
@@ -2660,8 +2677,11 @@ static int SimpleDistStep() {
 
 static void SimpleApplyDist(int step) {
     if (step < 0 || step > 2) return;
+    AppConfig c; LoadAppConfig(c);
     g_nearRssiThreshold = SimpleBaseRssi() + kDistOffset[step];
-    g_gattRssiThreshold = g_nearRssiThreshold;   // 두 경로를 따로 물어볼 화면이 아니다
+    // 두 경로를 따로 물어볼 화면이 아니다. 연결 경로는 재보기가 잰 차이만큼 따라간다
+    // (GattThresholdFor). 차이를 안 쟀으면 0 이라 같은 값이다.
+    g_gattRssiThreshold = GattThresholdFor(g_nearRssiThreshold, c.gattRssiOffset);
     // 고급 창의 "신호 강도" 칸도 같은 값으로. 그 칸은 [시작] 때 다시 읽히므로, 여기서
     // 안 맞춰 두면 슬라이더로 바꾼 값이 다음 [시작] 에 예전 숫자로 되돌아간다 -
     // 실제로 그래서 두 창이 다른 값을 보여 줬다 (2026-10-01).
@@ -2669,11 +2689,11 @@ static void SimpleApplyDist(int step) {
         wchar_t b[16]; swprintf_s(b, L"%d", g_nearRssiThreshold);
         SetWindowTextW(g_hEditLatency, b);
     }
-    AppConfig c; LoadAppConfig(c);
     c.nearRssiThreshold = g_nearRssiThreshold;
     c.gattRssiThreshold = g_gattRssiThreshold;
     SaveAppConfig(c);
-    DbgEvent(L"간단 화면: 거리 %d단계 -> %d dBm", step + 1, g_nearRssiThreshold);
+    DbgEvent(L"간단 화면: 거리 %d단계 -> %d dBm (연결 %d dBm)", step + 1,
+             g_nearRssiThreshold, g_gattRssiThreshold);
 }
 
 // 업데이트 상태를 보고 할 일을 한다 (UI 스레드). 1분 타이머와 WM_UPDATE_STATE 가
@@ -2876,7 +2896,16 @@ static void SimpleRefresh() {
 // BARROT 두 종이 지원한다고 보고하고 동작하지 않았다) 실제로 재 보는 것
 // 말고는 확인할 방법이 없다. 여기서 안 걸러지면 사용자는 "왜 안 잠기지"를
 // 영영 알 수 없다.
-static constexpr int WZ_W = 440, WZ_H = 330;
+//
+// 신호는 두 경로로 따로 잰다: 광고(PC 가 잰 폰의 광고) 와 연결(폰이 잰 연결 RSSI,
+// GATT 로 보고). 같은 순간에도 둘이 같은 숫자를 내지 않는다 - 윈도우 노트북에서는
+// 2dB 안이었지만 M1 맥에서는 연결 쪽이 12~15dB 낮았다. 보이는 숫자는 광고 기준
+// 하나이고, 연결 경로는 여기서 잰 차이(gattRssiOffset)만큼 옮겨 쓴다.
+//
+// 높이: 결과 화면 본문이 광고 두 줄 + 연결 두 줄 + 끝 문단이라 9줄쯤 된다 (14px 글꼴
+// 한 줄 13px, DrawText 로 재면 117px). 본문 칸을 166px 로 잡아 숫자가 길어지거나
+// 글꼴이 조금 달라도 잘리지 않게 했다. 예전 330 에서는 본문 칸이 116px 이었다.
+static constexpr int WZ_W = 440, WZ_H = 380;
 static constexpr int IDW_NEXT = 701, IDW_CANCEL = 702;
 static constexpr int IDT_WIZ = 31;
 
@@ -2891,10 +2920,12 @@ static constexpr int kWzSeated = 60, kWzAway = 45;
 static HWND g_hWiz = nullptr, g_hWizProg = nullptr, g_hWizNext = nullptr;
 static int  g_wzPhase = 0;      // 0 안내 / 1 착석 / 2 이동 / 3 비움 / 4 결과
 static int  g_wzLeft = 0;
-static std::vector<int> g_wzSeated, g_wzAway;
-static ULONGLONG g_wzLastTick = 0;
+static std::vector<int> g_wzSeated, g_wzAway;     // 광고 경로
+static std::vector<int> g_wzGSeated, g_wzGAway;   // 연결(GATT) 경로
+static ULONGLONG g_wzAdvTick = 0, g_wzGattTick = 0;   // 경로마다 마지막으로 센 표본
 static std::wstring g_wzTitle, g_wzBody;
 static int  g_wzBase = 0;
+static int  g_wzGattOffset = 0;   // [이대로 쓰기] 가 저장할 gattRssiOffset
 static bool g_wzOk = false;
 
 static void WzRange(const std::vector<int>& v, int& lo, int& hi) {
@@ -2904,17 +2935,20 @@ static void WzRange(const std::vector<int>& v, int& lo, int& hi) {
 
 // 새 패킷이 왔을 때만 한 번 센다. 같은 값을 반복해서 담으면 표본이 부풀어
 // 어댑터가 멀쩡한 것처럼 보인다 - 바로 그걸 찾으려는 참인데.
-static void WzCollect(std::vector<int>* into) {
-    ULONGLONG tick; int rssi;
-    if (g_bleGatt.IsHealthy() && g_bleGatt.LastReportTick() != 0) {
-        tick = g_bleGatt.LastReportTick(); rssi = g_bleGatt.GetRawRssi();
-    } else {
-        tick = g_bleScanner.LastReceivedTick(); rssi = g_bleScanner.GetRawRssi();
-    }
-    if (tick == 0 || tick == g_wzLastTick) return;
-    g_wzLastTick = tick;
+static void WzCollectOne(ULONGLONG tick, int rssi, ULONGLONG& last, std::vector<int>* into) {
+    if (tick == 0 || tick == last) return;
+    last = tick;
     if (rssi <= -100 || rssi >= 0) return;   // 측정값이 아니라 표식이다
     if (into) into->push_back(rssi);
+}
+
+// 두 경로를 따로, 각자 자기 경로에 새 표본이 왔을 때만 담는다. 예전에는 연결이
+// 살아 있으면 연결 값만, 아니면 광고 값만 담아서 한 줄에 두 눈금이 섞였다.
+// 연결은 폰 앱이 이 PC 에 붙어 보고하고 있을 때만 잰다.
+static void WzCollect(std::vector<int>* adv, std::vector<int>* gatt) {
+    WzCollectOne(g_bleScanner.LastReceivedTick(), g_bleScanner.GetRawRssi(), g_wzAdvTick, adv);
+    if (g_bleGatt.IsHealthy() && g_bleGatt.LastReportTick() != 0)
+        WzCollectOne(g_bleGatt.LastReportTick(), g_bleGatt.GetRawRssi(), g_wzGattTick, gatt);
 }
 
 static void WzJudge() {
@@ -2967,22 +3001,73 @@ static void WzJudge() {
     g_wzBase = sLo - 2;
     g_wzOk = true;
     g_wzTitle = L"다 됐어요";
-    swprintf_s(buf,
-        L"앉아 있을 때  %d ~ %d\n"
-        L"자리 비웠을 때  %d ~ %d\n\n"
-        L"이 자리에 맞게 \"보통\" 을 맞췄어요. "
-        L"\"가까이\" 는 더 빨리 잠기고, \"멀리\" 는 더 늦게 잠깁니다.",
-        sLo, sHi, aLo, aHi);
+
+    // 연결 경로. 광고가 통과했을 때만 본다 - 광고가 실패하면 위에서 이미 끝났다.
+    // 같은 규칙(착석 최저값 - 2)으로 연결 쪽 "보통" 을 구하고, 광고 기준과의 차이를
+    // 남긴다. 어댑터가 세기를 흉내 내는지는 보지 않는다: 이 값은 폰이 잰다.
+    // 못 쟀거나 겹치면 지금 config 의 차이를 그대로 둔다 - 이번 재보기가 연결 쪽에
+    // 대해서는 아무것도 말해 주지 않았으니, 예전에 잰 값을 0 으로 지울 이유가 없다.
+    int gsLo, gsHi, gaLo, gaHi;
+    WzRange(g_wzGSeated, gsLo, gsHi);
+    WzRange(g_wzGAway, gaLo, gaHi);
+    int gsn = (int)g_wzGSeated.size(), gan = (int)g_wzGAway.size();
+    bool gMeasured = (gsn >= 15 && gan >= 8);
+    bool gOverlap  = gMeasured && (gsLo - 2 <= gaHi);
+    AppConfig cur; LoadAppConfig(cur);
+    g_wzGattOffset = (gMeasured && !gOverlap) ? (gsLo - 2) - g_wzBase : cur.gattRssiOffset;
+
+    if (gMeasured && !gOverlap) {
+        swprintf_s(buf,
+            L"광고 신호\n"
+            L"  앉아 있을 때  %d ~ %d\n"
+            L"  자리 비웠을 때  %d ~ %d\n"
+            L"연결 신호\n"
+            L"  앉아 있을 때  %d ~ %d\n"
+            L"  자리 비웠을 때  %d ~ %d\n\n"
+            L"이 자리에 맞게 \"보통\" 을 맞췄어요. "
+            L"\"가까이\" 는 더 빨리 잠기고, \"멀리\" 는 더 늦게 잠깁니다.",
+            sLo, sHi, aLo, aHi, gsLo, gsHi, gaLo, gaHi);
+        DbgEvent(L"재보기: 착석 %d..%d (%d개), 비움 %d..%d (%d개) -> 기준 %d dBm"
+                 L"; 연결 착석 %d..%d (%d개), 비움 %d..%d (%d개) -> 차이 %+d dB",
+                 sLo, sHi, sn, aLo, aHi, an, g_wzBase,
+                 gsLo, gsHi, gsn, gaLo, gaHi, gan, g_wzGattOffset);
+    } else if (!gMeasured) {
+        swprintf_s(buf,
+            L"광고 신호\n"
+            L"  앉아 있을 때  %d ~ %d\n"
+            L"  자리 비웠을 때  %d ~ %d\n"
+            L"연결 신호\n"
+            L"  이번에는 못 쟀어요 (폰 앱이 이 컴퓨터에 연결돼 있지 않았어요)\n\n"
+            L"이 자리에 맞게 \"보통\" 을 맞췄어요. "
+            L"\"가까이\" 는 더 빨리 잠기고, \"멀리\" 는 더 늦게 잠깁니다.",
+            sLo, sHi, aLo, aHi);
+        DbgEvent(L"재보기: 착석 %d..%d (%d개), 비움 %d..%d (%d개) -> 기준 %d dBm"
+                 L"; 연결 못 잼 (착석 %d개, 비움 %d개) - 차이 %+d dB 그대로",
+                 sLo, sHi, sn, aLo, aHi, an, g_wzBase,
+                 gsn, gan, g_wzGattOffset);
+    } else {
+        swprintf_s(buf,
+            L"광고 신호\n"
+            L"  앉아 있을 때  %d ~ %d\n"
+            L"  자리 비웠을 때  %d ~ %d\n"
+            L"연결 신호\n"
+            L"  앉아 있을 때 %d~%d, 비웠을 때 %d~%d 로 겹쳐서 이번 값은 쓰지 않았어요\n\n"
+            L"이 자리에 맞게 \"보통\" 을 맞췄어요. "
+            L"\"가까이\" 는 더 빨리 잠기고, \"멀리\" 는 더 늦게 잠깁니다.",
+            sLo, sHi, aLo, aHi, gsLo, gsHi, gaLo, gaHi);
+        DbgEvent(L"재보기: 착석 %d..%d (%d개), 비움 %d..%d (%d개) -> 기준 %d dBm"
+                 L"; 연결 겹침 (착석 %d..%d, 비움 %d..%d) - 차이 %+d dB 그대로",
+                 sLo, sHi, sn, aLo, aHi, an, g_wzBase,
+                 gsLo, gsHi, gaLo, gaHi, g_wzGattOffset);
+    }
     g_wzBody = buf;
-    DbgEvent(L"재보기: 착석 %d..%d (%d개), 비움 %d..%d (%d개) -> 기준 %d dBm",
-             sLo, sHi, sn, aLo, aHi, an, g_wzBase);
 }
 
 static void WzSetPhase(int ph) {
     g_wzPhase = ph;
-    // 스캐너에 남아 있던 직전 패킷을 새 구간의 첫 표본으로 세지 않는다.
-    g_wzLastTick = g_bleGatt.IsHealthy() ? g_bleGatt.LastReportTick()
-                                         : g_bleScanner.LastReceivedTick();
+    // 스캐너에 남아 있던 직전 패킷을 새 구간의 첫 표본으로 세지 않는다. 두 경로 모두.
+    g_wzAdvTick  = g_bleScanner.LastReceivedTick();
+    g_wzGattTick = g_bleGatt.LastReportTick();
     switch (ph) {
     case 1: g_wzLeft = kWzSeated; break;
     case 3: g_wzLeft = kWzAway;   break;
@@ -3049,7 +3134,8 @@ static LRESULT CALLBACK WizProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             title = L"1/3  자리에 앉아 계세요";
             body  = L"폰은 평소 두는 자리에 그대로 두세요.\n"
                     L"컴퓨터는 건드리지 않아도 돼요.";
-            swprintf_s(live, L"%d초 남음   ·   %d번 받음", g_wzLeft, (int)g_wzSeated.size());
+            swprintf_s(live, L"%d초 남음   ·   광고 %d번   ·   연결 %d번", g_wzLeft,
+                       (int)g_wzSeated.size(), (int)g_wzGSeated.size());
             break;
         case 2:
             title = L"2/3  폰을 두고 오세요";
@@ -3060,7 +3146,8 @@ static LRESULT CALLBACK WizProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         case 3:
             title = L"3/3  거의 다 됐어요";
             body  = L"그대로 기다려 주세요.\n폰을 가지러 가지 마세요.";
-            swprintf_s(live, L"%d초 남음   ·   %d번 받음", g_wzLeft, (int)g_wzAway.size());
+            swprintf_s(live, L"%d초 남음   ·   광고 %d번   ·   연결 %d번", g_wzLeft,
+                       (int)g_wzAway.size(), (int)g_wzGAway.size());
             break;
         default:
             title = g_wzTitle.c_str();
@@ -3104,9 +3191,9 @@ static LRESULT CALLBACK WizProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_TIMER: {
         if (wParam != IDT_WIZ) break;
-        if (g_wzPhase == 1) WzCollect(&g_wzSeated);
-        else if (g_wzPhase == 3) WzCollect(&g_wzAway);
-        else if (g_wzPhase == 2) WzCollect(nullptr);   // 옮기는 중: 버린다
+        if (g_wzPhase == 1) WzCollect(&g_wzSeated, &g_wzGSeated);
+        else if (g_wzPhase == 3) WzCollect(&g_wzAway, &g_wzGAway);
+        else if (g_wzPhase == 2) WzCollect(nullptr, nullptr);   // 옮기는 중: 버린다
 
         if (g_wzPhase == 1 || g_wzPhase == 3) {
             static int half = 0;
@@ -3128,6 +3215,7 @@ static LRESULT CALLBACK WizProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (LOWORD(wParam) == IDW_NEXT) {
             if (g_wzPhase == 0) {
                 g_wzSeated.clear(); g_wzAway.clear();
+                g_wzGSeated.clear(); g_wzGAway.clear();
                 WzSetPhase(1);
             } else if (g_wzPhase == 2) {
                 WzSetPhase(3);
@@ -3135,12 +3223,15 @@ static LRESULT CALLBACK WizProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (g_wzOk) {
                     AppConfig c; LoadAppConfig(c);
                     c.measuredBaseRssi = g_wzBase;
+                    // 연결 경로를 못 쟀거나 겹쳤으면 WzJudge 가 예전 차이를 담아 두었다
+                    c.gattRssiOffset = g_wzGattOffset;
                     SaveAppConfig(c);
                     // 방금 잰 값이 "보통" 이다. 여기서 SimpleDistStep() 을 쓰면
                     // 안 된다 - 그건 예전 절대 임계값에 가장 가까운 단계를 찾는데,
                     // 기준이 방금 바뀌었으니 그 비교는 뜻이 없다. 실제로 연달아
                     // 재면 "가까이" 가 잡혔고, 그 값은 착석 최저값보다 위여서
                     // 앉아 있는 사람 앞에서 화면이 꺼진다.
+                    // 연결 임계값도 여기서 방금 저장한 차이로 맞춰진다.
                     SimpleApplyDist(1);
                     SimpleRefresh();
                 }
@@ -3195,6 +3286,7 @@ static void OpenWizard(HWND parent) {
     RECT pr; GetWindowRect(parent, &pr);
     g_wzPhase = 0; g_wzOk = false;
     g_wzSeated.clear(); g_wzAway.clear();
+    g_wzGSeated.clear(); g_wzGAway.clear();
     // 재는 동안 화면이 꺼지면 측정이 끊긴다. 자리를 비우는 것이 절차의 일부라
     // 그냥 두면 반드시 꺼진다.
     g_measuring = true;

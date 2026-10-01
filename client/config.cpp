@@ -183,6 +183,12 @@ bool LoadAppConfig(AppConfig& cfg) {
     if (m.count(L"gattSeen")) cfg.gattSeen = (_wtoi(m[L"gattSeen"].c_str()) != 0);
     if (m.count(L"gattGraceSec")) cfg.gattGraceSec = _wtoi(m[L"gattGraceSec"].c_str());
     if (m.count(L"gattRssiThreshold")) cfg.gattRssiThreshold = _wtoi(m[L"gattRssiThreshold"].c_str());
+    if (m.count(L"gattRssiOffset")) {
+        // 손으로 고친 값이 터무니없어도 임계값이 화면 끝까지 밀리지 않게.
+        // 실측 차이는 15dB 안팎이다.
+        int v = _wtoi(m[L"gattRssiOffset"].c_str());
+        cfg.gattRssiOffset = (v < -40) ? -40 : (v > 40) ? 40 : v;
+    }
     if (m.count(L"bleLostMeansFar")) cfg.bleLostMeansFar = (_wtoi(m[L"bleLostMeansFar"].c_str()) != 0);
     if (m.count(L"keepAliveSec")) cfg.keepAliveSec = _wtoi(m[L"keepAliveSec"].c_str());
     if (m.count(L"scanIntervalSec")) cfg.scanIntervalSec = _wtoi(m[L"scanIntervalSec"].c_str());
@@ -267,6 +273,7 @@ bool SaveAppConfig(const AppConfig& cfg) {
     m[L"gattSeen"] = cfg.gattSeen ? L"1" : L"0";
     swprintf_s(buf, L"%lu", cfg.gattGraceSec); m[L"gattGraceSec"] = buf;
     swprintf_s(buf, L"%d", cfg.gattRssiThreshold); m[L"gattRssiThreshold"] = buf;
+    swprintf_s(buf, L"%d", cfg.gattRssiOffset); m[L"gattRssiOffset"] = buf;
     m[L"bleLostMeansFar"] = cfg.bleLostMeansFar ? L"1" : L"0";
     swprintf_s(buf, L"%lu", cfg.keepAliveSec); m[L"keepAliveSec"] = buf;
     swprintf_s(buf, L"%lu", cfg.scanIntervalSec); m[L"scanIntervalSec"] = buf;

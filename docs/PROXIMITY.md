@@ -442,11 +442,39 @@ just changed, so the comparison means nothing, and measuring twice in a
 row was enough to land on the near step, which sits above the seated floor
 and blanks the screen in front of someone sitting still.
 
-The two paths track each other closely: matched within two seconds, the
-GATT reading is a median 2 dB stronger than the advertisement reading
-(p5 −4, p95 +8, n=245). Measuring one and borrowing the other is
-defensible for a first guess, which is where −60 came from, but the
-borrowing is what left the GATT threshold unverified for a day.
+On the Windows laptop the two paths track each other closely: matched
+within two seconds, the GATT reading is a median 2 dB stronger than the
+advertisement reading (p5 −4, p95 +8, n=245). Measuring one and borrowing
+the other is defensible for a first guess there, which is where −60 came
+from, but the borrowing is what left the GATT threshold unverified for a
+day.
+
+It does not hold everywhere. On the M1 MacBook the GATT reading runs 12 to
+15 dB *below* the advertisement reading at the same moment (16:52:
+advertisement −41, GATT −58). The wizard there ran over GATT and set a base
+of −59, which fits GATT; but the phone links to one computer only, and
+whenever it was linked to the other PC the Mac judged by adverts, which
+stayed above −59 with the user away, so the screen never went dark.
+
+So the wizard now records **both series in every timed phase**,
+independently, each counting only a new sample of its own path: adverts
+from the scanner, GATT reports only while the link is healthy. The
+advertisement series is judged exactly as before (too few, flat, overlap)
+and any failure there fails the whole run. If it passes, the GATT series
+gets the same seated-floor rule — at least 15 seated and 8 away samples,
+no overlap, GATT base = seated floor − 2 — and what is stored is the
+difference, `gattRssiOffset` = GATT base − advertisement base. There is no
+flat check on GATT: the phone measures it, not this adapter. When GATT was
+not measured (the phone was linked elsewhere) or overlapped, the previous
+offset is kept rather than reset, since the run said nothing about it.
+
+There is still one number for the user. The advertisement threshold is
+the visible one, and the GATT threshold is derived wherever a threshold
+is set (Start, the distance slider, the wizard's apply):
+`gatt = clamp(near + gattRssiOffset, −100, −30)`. `gattRssiThreshold` in
+`config.ini` is only a saved copy of that. A config written before this
+has no offset, reads as 0, and behaves exactly as before — both paths on
+the same number — until the wizard is run again.
 
 ---
 
