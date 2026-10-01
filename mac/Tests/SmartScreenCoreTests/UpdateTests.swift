@@ -493,6 +493,78 @@ final class UpdateTests: XCTestCase {
         XCTAssertEqual(UpdateMarker.decode(Data((long + "\n").utf8)).utf16.count, 511)
     }
 
+    /// RG-0: "macOS 가 낮다" 는 기록은 macOS 를 올린 뒤 거짓이 된다. 기록에서 버전을 다시 읽어 지금
+    /// macOS 와 견준다 - 쓰고 읽어도 그 버전이 그대로 나와야 한다.
+    func testNeedsNewerMacOSMarkerRoundTrip() {
+        for x in ["14.0", "14", "13.6.2", "15.1"] {
+            let stored = UpdateMarker.decode(UpdateMarker.encode(UpdateText.needsNewerMacOS(x)))
+            XCTAssertEqual(UpdateText.needsNewerMacOSMinimum(stored), x)
+        }
+        // 정확히 needsNewerMacOS(x) 모양만 (가운데는 공백 없는 macOS 버전). 다른 기록은 평범한 실패다.
+        let others = [
+            "", UpdateText.noPermission, UpdateText.appMismatch, UpdateText.newBuildDidNotStart,
+            UpdateText.needsNewerMacOS(""), UpdateText.needsNewerMacOS("abc"), UpdateText.needsNewerMacOS("14.0.1.2"),
+            UpdateText.needsNewerMacOS(" 14.0"), UpdateText.needsNewerMacOS("14.0") + " ",
+            "x" + UpdateText.needsNewerMacOS("14.0"),
+            UpdateText.applyFailedPrefix + UpdateText.needsNewerMacOS("14.0"),
+            UpdateText.lastApplyFailedPrefix + UpdateText.needsNewerMacOS("14.0"),
+            "이 macOS 에서는 새 버전을 쓸 수 없어요 (macOS 14.0)",
+        ]
+        for s in others {
+            XCTAssertNil(UpdateText.needsNewerMacOSMinimum(s), "'\(s)'")
+        }
+
+        // 아직 낮은 macOS: 기록은 그대로 (nil). 그 버전에 닿았거나 넘었으면 버전을 돌려준다 = 지운다.
+        let marker = UpdateMarker.decode(UpdateMarker.encode(UpdateText.needsNewerMacOS("14.0")))
+        let os14 = OperatingSystemVersion(majorVersion: 14, minorVersion: 0, patchVersion: 0)
+        let os15 = OperatingSystemVersion(majorVersion: 15, minorVersion: 1, patchVersion: 0)
+        XCTAssertNil(UpdateLogic.obsoleteMacOSMarker(marker, running: os13))
+        XCTAssertEqual(UpdateLogic.obsoleteMacOSMarker(marker, running: os14), "14.0")
+        XCTAssertEqual(UpdateLogic.obsoleteMacOSMarker(marker, running: os15), "14.0")
+        // 빌드에 달린 이유는 macOS 가 바뀌어도 남는다 ([다시 시도] 나 더 새 버전을 기다린다)
+        XCTAssertNil(UpdateLogic.obsoleteMacOSMarker(UpdateText.appMismatch, running: os15))
+        XCTAssertNil(UpdateLogic.obsoleteMacOSMarker(UpdateText.newBuildDidNotStart, running: os15))
+
+        // 시나리오: 기업 Mac 이 13 에서 14 로 올라갔다. 기록을 지운 확인은 승인된 버전을 바로 받는다.
+        let json = body("[" + row("1.2.0", minMacOS: "\"13.0\"") + "]")
+        let scan14 = UpdateLogic.scan(json, enterprise: true, approved: ["1.2.0"], current: SemVer(1, 1, 8), macOS: os14)
+        XCTAssertEqual(scan14.best?.version, "1.2.0")
+        let kept = UpdateLogic.outcome(scan14, failedWhy: marker, enterprise: true, manual: false, running: "1.1.8")
+        XCTAssertEqual(kept.phase, .failed)                 // 지우지 않았다면 이렇게 멎어 있었다
+        XCTAssertFalse(kept.downloadNow)
+        XCTAssertNotNil(UpdateLogic.obsoleteMacOSMarker(marker, running: os14))
+        let cleared = UpdateLogic.outcome(scan14, failedWhy: nil, enterprise: true, manual: false, running: "1.1.8")
+        XCTAssertEqual(cleared.phase, .available)
+        XCTAssertTrue(cleared.downloadNow)
+    }
+
+    /// RG-1: 복사본은 바꾼 뒤 새 앱을 띄우기 전에 임시 기록을 남기고, 새 빌드는 뜨면 자기 버전의
+    /// 기록을 지운다. 새 빌드가 안 떠서 .bak 을 되돌린 예전 앱은 그 기록을 보고 다시 적용하지 않는다.
+    func testProvisionalMarkerStopsRestoredOldAppFromReapplying() {
+        XCTAssertEqual(UpdateText.newBuildDidNotStart,
+                       "새 버전이 뜨지 않았어요 - 예전 앱으로 되돌렸다면 [다시 시도] 를 누르세요")
+        let stored = UpdateMarker.decode(UpdateMarker.encode(UpdateText.newBuildDidNotStart))
+        XCTAssertEqual(stored, UpdateText.newBuildDidNotStart)
+        XCTAssertEqual(UpdateMarker.fileName("1.2.0"), "failed-1.2.0.txt")
+
+        // 되돌린 예전 앱 (1.1.8): 1.2.0 이 승인돼 있어도 받지 않고 실패를 보인다
+        let json = body("[" + row("1.2.0") + "]")
+        let old = UpdateLogic.scan(json, enterprise: true, approved: ["1.2.0"], current: SemVer(1, 1, 8), macOS: os13)
+        XCTAssertEqual(old.best?.version, "1.2.0")
+        let out = UpdateLogic.outcome(old, failedWhy: stored, enterprise: true, manual: false, running: "1.1.8")
+        XCTAssertEqual(out.phase, .failed)
+        XCTAssertTrue(out.fromMarker)
+        XCTAssertFalse(out.downloadNow)
+        XCTAssertEqual(out.msg, "지난번 적용 실패: 새 버전이 뜨지 않았어요 - 예전 앱으로 되돌렸다면 [다시 시도] 를 누르세요")
+
+        // 잘 뜬 새 빌드 (1.2.0): 자기 버전의 행은 후보가 아니다 - 지우기 전의 기록이 이 빌드를 막을 일은 없다
+        let fresh = UpdateLogic.scan(json, enterprise: true, approved: ["1.2.0"], current: SemVer(1, 2, 0), macOS: os13)
+        XCTAssertNil(fresh.best)
+        XCTAssertNil(fresh.newest)
+        // 디렉터리 청소는 기록을 지우지 않는다 (지금 버전의 기록은 cleanupAfterStart 가 따로 지운다)
+        XCTAssertFalse(UpdateLogic.cleanupTarget("failed-1.2.0.txt", running: SemVer(1, 2, 0)))
+    }
+
     // MARK: - 정리
 
     func testCleanupTargets() {

@@ -247,7 +247,14 @@ extension Updater {
 
         try? fm.removeItem(at: zip)
         try? fm.removeItem(at: Disk.stagedDir(ver))
+        // 바꾸기는 됐지만 새 앱이 뜰지는 아직 모른다. 기록을 지우기만 하면, 새 앱이 시작하자마자
+        // 죽거나 open 이 실패했을 때 아무 흔적이 없다. 그러면 안내대로 .bak 을 되돌린 예전 앱이 같은
+        // 버전을 기록 없이 보고 곧바로 다시 받아 적용한다 (기업 PC 는 묻지 않는다). 그래서 지난 기록을
+        // 지우고 임시 기록을 남긴다. 새 빌드는 뜨자마자 자기 버전의 기록을 지운다 (cleanupAfterStart).
+        // 지금 버전의 기록은 확인이 보지 않으므로 (scan 은 지금 버전 이하를 건너뛴다) 잘 뜬 새 빌드에는
+        // 아무 영향이 없다. 임시 기록을 못 쓰면 예전처럼 기록 없이 간다 (RG-1).
         Disk.clearMarker(ver)
+        Disk.writeMarker(ver, UpdateText.newBuildDidNotStart)
         EventLog.write("update: applied \(ver) -> \(dst.path) (old kept as .bak until the new build starts)")
         if a.relaunch && !Applier.launch(dst) {
             Applier.alert(UpdateText.relaunchNewFailedDialog(app: dst.path))

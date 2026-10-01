@@ -218,9 +218,18 @@ enum Updater {
     /// 새 빌드가 무사히 떴을 때 지난 것들을 치운다: <앱>.bak, 받은 zip, 푼 묶음, updater 복사본,
     /// *.part. 실패 기록(failed-*.txt)은 지우지 않는다 - 실패한 뒤 다시 뜬 예전 앱이 그걸 봐야 한다.
     /// 지금 버전보다 새 버전의 zip/묶음/.bak 은 남긴다 (UpdateLogic.cleanupTarget 의 이유).
+    /// 예외는 지금 버전의 기록 하나다: 복사본이 띄우기 직전에 남긴 임시 기록이다 (아래).
     static func cleanupAfterStart() {
         let running = SemVer(BuildInfo.version) ?? SemVer(0, 0, 0)
         let fm = FileManager.default
+        // 이 빌드는 떴다 ("start: SmartScreen <버전>" 다음에 불린다). 복사본이 바꾸기에 성공하고 띄우기
+        // 직전에 남긴 failed-<이 버전>.txt (UpdateText.newBuildDidNotStart) 는 이제 거짓이다 - 지운다.
+        // 지금 버전의 기록은 확인이 어차피 보지 않는다 (scan 은 지금 버전 이하의 행을 건너뛴다). 남아
+        // 있으면 이 빌드가 안 떴다는 뜻이라, .bak 에서 되돌린 예전 앱이 같은 버전을 다시 적용하는
+        // 대신 실패를 보인다 (RG-1).
+        if let marker = Disk.markerURL(BuildInfo.version), unlink(marker.path) == 0 {
+            EventLog.write("update: removed \(marker.lastPathComponent) (this build started)")
+        }
         let bundle = Bundle.main.bundleURL.standardizedFileURL
         if bundle.pathExtension.lowercased() == "app" {
             let bak = URL(fileURLWithPath: bundle.path + ".bak", isDirectory: true)
@@ -369,8 +378,9 @@ enum Updater {
             approved = UpdateLogic.approvedVersions(a.body)
         }
 
+        let macOS = ProcessInfo.processInfo.operatingSystemVersion
         let scan = UpdateLogic.scan(r.body, enterprise: enterprise, approved: approved, current: cur,
-                                    macOS: ProcessInfo.processInfo.operatingSystemVersion)
+                                    macOS: macOS)
         for v in scan.malformed {
             EventLog.write("update: skipping malformed row (version '\(v)')")
         }
@@ -379,7 +389,17 @@ enum Updater {
         }
         // 지난번에 이 버전을 적용하다 실패했나 (더 새 버전에는 기록이 없으니 그대로 진행한다)
         var failedWhy: String? = nil
-        if let b = scan.best { failedWhy = Disk.readMarker(b.version) }
+        if let b = scan.best {
+            failedWhy = Disk.readMarker(b.version)
+            // "이 macOS 에서는 새 버전을 쓸 수 없어요 (macOS x 이상)" 은 빌드가 아니라 이 Mac 의 macOS 에
+            // 달린 이유다. 그 뒤 macOS 를 올렸으면 기록은 거짓이다 - 지우고 기록이 없던 것처럼 간다.
+            // 두면 기업 PC 는 승인된 버전을 [다시 시도] 전까지 영영 적용하지 않는다 (RG-0).
+            if let why = failedWhy, let x = UpdateLogic.obsoleteMacOSMarker(why, running: macOS) {
+                Disk.clearMarker(b.version)
+                EventLog.write("update: \(b.version) no longer blocked by macOS \(x) - marker cleared")
+                failedWhy = nil
+            }
+        }
 
         let now = Mono.now()
         locked { machine.adopt(scan, enterprise: enterprise, now: now) }

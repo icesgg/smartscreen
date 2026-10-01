@@ -96,6 +96,10 @@ final class AppController: NSObject, GuardEngineHost {
     /// [폰 등록] 의 첫 질문. 둘째 줄들의 들여쓰기는 7 칸 (Windows 원문 그대로).
     private static let registerQuestion =
         "어떻게 등록할까요?\n\n[예]  구글 계정으로 등록  (권장)\n       아이폰 앱에서도 같은 계정으로 로그인하면 끝납니다.\n       폰을 가까이 둘 필요도, 앱을 띄울 필요도 없습니다.\n\n[아니오]  블루투스로 직접 등록\n       앱을 화면에 띄우고 폰을 PC 가까이 두세요.\n       인터넷 없이 됩니다."
+    /// 등록이 이미 하나 도는 중일 때의 답. 두 방법이 나란히 돌면 나중에 끝난 쪽이 먼저 저장한 토큰을
+    /// 덮는다 (registerPhone).
+    private static let registerBleBusyText = "블루투스 등록이 진행 중입니다. 잠시 기다려 주세요."
+    private static let registerLoginBusyText = "이미 로그인 중입니다.\n브라우저 창을 확인하세요."
     private static let clipTitle = "클립보드 공유"
     /// 계정 값 다시 쓰기 간격: 30 초에서 두 배씩, 10 분까지
     private static let authSaveFirstWaitSec: Double = 30
@@ -1081,6 +1085,15 @@ final class AppController: NSObject, GuardEngineHost {
     ///  - 계정: 폰과 PC 가 같은 구글 계정으로 로그인하면 서버가 같은 토큰을 준다.
     ///  - 블루투스: 예전 방식. 인터넷이 없어도 되고 서버가 죽어도 된다.
     func registerPhone() {
+        // 블루투스 등록(6 초 스캔 + 최대 20 초 토큰 읽기)이 도는 중이면 공통 입구에서 막는다. 고급 창의
+        // [폰 등록] 만 꺼 두면 간단 창 [등록하기]/[바꾸기] 와 마법사가 여전히 이리로 온다. 그때 [아니오] 는
+        // 말없이 아무것도 안 했고, [예] 는 BLE 읽기와 나란히 구글 로그인을 시작해서, 몇 분 뒤 끝난
+        // 로그인이 BLE 가 방금 저장하고 알린 토큰을 덮었다 (RG-3). 부르는 쪽은 모두 단추 동작이다
+        // (main.async 블록이 아니다) - 여기서 바로 알림을 띄워도 뒤의 main 큐 블록이 멎지 않는다.
+        if bleRegisterBusy {
+            Alerts.info(AppController.registerBleBusyText, title: AppController.registerTitle)
+            return
+        }
         // 본문이 [예] / [아니오] 를 이름으로 부르므로 단추도 예 / 아니오 / 취소 여야 한다 (Alerts 가 그렇게 단다)
         let how = Alerts.yesNoCancel(AppController.registerQuestion, title: AppController.registerTitle)
         if how == 0 {
@@ -1094,13 +1107,18 @@ final class AppController: NSObject, GuardEngineHost {
     private func registerViaAccount() {
         // [폰 등록] 은 로그인 중에 꺼져 있지만 간단 창은 여전히 이 명령을 보낼 수 있다
         if loginBusy {
-            Alerts.info("이미 로그인 중입니다.\n브라우저 창을 확인하세요.", title: AppController.registerTitle)
+            Alerts.info(AppController.registerLoginBusyText, title: AppController.registerTitle)
+            return
+        }
+        // 블루투스 등록과 나란히 로그인하지 않는다 - 나중에 끝난 쪽이 먼저 저장한 토큰을 덮는다
+        if bleRegisterBusy {
+            Alerts.info(AppController.registerBleBusyText, title: AppController.registerTitle)
             return
         }
         Alerts.info("브라우저가 열립니다. 구글 계정으로 로그인하세요.\n\n"
                     + "로그인이 끝나면 브라우저 창을 닫고 여기로 돌아오면 됩니다.",
                     title: AppController.registerTitle)
-        if loginBusy || isExiting { return }
+        if loginBusy || bleRegisterBusy || isExiting { return }
         loginBusy = true
         updateRegisterButton()
         startLoginWorker()
@@ -1201,12 +1219,18 @@ final class AppController: NSObject, GuardEngineHost {
         // 폰이 GATT 로 내주는 토큰을 한 번 읽어 저장해 둔다. 앱을 화면에 띄워 두는 것이 조건이다 -
         // 포그라운드 광고에만 서비스 UUID 가 실려 후보가 모호하지 않다. 잠긴 폰으로 등록하면 남의 폰을
         // 집을 수 있다.
+        // 구글 로그인이 도는 중이면 하지 않는다. 그 로그인이 끝나면 계정의 토큰을 저장하므로 여기서
+        // 읽어 저장한 토큰을 덮는다 (registerViaAccount 가 BLE 등록 중에 거절하는 것과 같은 이유).
+        if loginBusy {
+            Alerts.info(AppController.registerLoginBusyText, title: AppController.registerTitle)
+            return
+        }
         if monitoring {
             Alerts.info("먼저 중지를 누른 뒤 등록하세요.\n스캔과 연결이 같은 안테나를 나눠 쓰면 연결이 실패합니다.",
                         title: AppController.registerTitle)
             return
         }
-        if bleRegisterBusy { return }   // 이미 도는 중 (단추는 꺼져 있다)
+        if bleRegisterBusy { return }   // 이미 도는 중 (registerPhone 이 먼저 알리고 막는다)
         if !Alerts.okCancel("아이폰에서 SSBeacon 앱을 실행해 화면에 띄우세요.\n폰을 PC 가까이 두고, 준비되면 확인을 누르세요.",
                             title: AppController.registerTitle) {
             return
@@ -1217,7 +1241,7 @@ final class AppController: NSObject, GuardEngineHost {
                         title: AppController.registerTitle)
             return
         }
-        if bleRegisterBusy || isExiting { return }
+        if bleRegisterBusy || loginBusy || isExiting { return }
         // Windows 는 여기서 모래시계를 띄우고 UI 스레드를 6 초 넘게 막았다. Mac 은 단추만 끄고 기다린다.
         bleRegisterBusy = true
         updateRegisterButton()

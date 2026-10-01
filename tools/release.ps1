@@ -531,17 +531,34 @@ try {
             $status = git status --porcelain
             if ($status) {
                 Write-Host ($status -join "`n")
-                git add -A
                 # 메모는 인자로 넘기지 않는다 (머리말 함정 4 - git 도 따옴표에서 갈라 나머지를
-                # pathspec 으로 읽는다). 파일에 UTF-8(BOM 없음)로 적어 -F 로 준다.
+                # pathspec 으로 읽는다). 파일에 UTF-8(BOM 없음)로 적어 -F 로 준다. git add 보다 먼저
+                # 만든다 - add 가 실패해도 아래 마무리 명령이 이 파일을 쓴다.
                 $msgFile = Join-Path $env:TEMP ("smartscreen-release-msg-$script:newVer-" + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.txt')
                 $msgText = "Release $script:newVer`n`n" + (($Notes -replace "`r`n", "`n") -replace "`r", "`n") + "`n"
                 [IO.File]::WriteAllText($msgFile, $msgText, $utf8)
+                git add -A
+                $addRc = $LASTEXITCODE
+                if ($addRc -ne 0) {
+                    # IDE 의 git 이 .git\index.lock 을 잠깐 잡고 있었거나 (죽은 git 이 남겼거나), 읽을 수 없는
+                    # 파일이 있다. 그러면 아무것도 stage 되지 않았다 - 그대로 commit 하면 'no changes added'
+                    # 로 또 실패하고, "전부 stage 돼 있다" 는 말과 git commit 부터 시작하는 마무리 명령은
+                    # 틀린다. 그래서 여기서 멈추고, 첫 명령을 git add -A 로 준다. 메시지 파일은 남긴다.
+                    $script:commitFailed = $true
+                    Fail ("git add 실패 (git exit $addRc - 위의 git 메시지를 보라). 아무것도 stage 되지 않았고 커밋도 하지 않았다.`n" +
+                          "    Windows $script:newVer 은 이미 게시됐다 - 서버에 있고 PC 들이 받아 간다.`n" +
+                          "    release.bat 을 다시 돌리지 말 것 (번호가 하나 더 오른다). 원인(.git\index.lock 같은 것)을 고친 뒤 저장소 맨 위에서 이 순서로:`n" +
+                          "      git add -A`n" +
+                          "      git commit -F `"$msgFile`"`n" +
+                          "      git push`n" +
+                          "      release-mac.bat $script:newVer")
+                }
                 git commit -q -F $msgFile
                 $commitRc = $LASTEXITCODE
                 if ($commitRc -ne 0) {
                     # 메시지 파일은 남긴다 - 손으로 하는 커밋이 같은 메시지를 쓰도록 (메모를 명령줄에
-                    # 다시 적으면 같은 따옴표 문제가 난다).
+                    # 다시 적으면 같은 따옴표 문제가 난다). 여기는 git add 가 성공한 뒤에만 온다 (위에서
+                    # 멈춘다) - 그래서 "전부 stage 돼 있다" 고 말할 수 있다.
                     $script:commitFailed = $true
                     Fail ("커밋 실패 (git exit $commitRc - 위의 git 메시지를 보라).`n" +
                           "    Windows $script:newVer 은 이미 게시됐다 - 서버에 있고 PC 들이 받아 간다. 바뀐 것은 전부 stage 돼 있다.`n" +

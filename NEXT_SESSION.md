@@ -1,12 +1,13 @@
 SmartScreen 프로젝트를 이어서 개발한다. 저장소: C:\work\smartscreen (main 브랜치, 최신 푸시됨)
 
 설계 배경은 docs/PROXIMITY.md, 식별 구조는 docs/IDENTIFICATION.md,
-클립보드 공유는 docs/CLIPBOARD.md, 자동 업데이트는 docs/UPDATE.md 에 있다. 먼저 읽어라.
+클립보드 공유는 docs/CLIPBOARD.md, 자동 업데이트는 docs/UPDATE.md, Mac 판은 docs/MAC.md 에
+있다. 먼저 읽어라.
 
 ## 지금 상태
 
-자리 비움을 감지해 화면을 가리는 Windows 앱 + iOS 컴패니언 앱(ios/SSBeacon).
-BLE 신호 세기(RSSI)로 거리를 판단한다.
+자리 비움을 감지해 화면을 가리는 Windows 앱 + **Mac 앱(mac/, 2026-10-01 새로)** + iOS
+컴패니언 앱(ios/SSBeacon). BLE 신호 세기(RSSI)로 거리를 판단한다.
 
 여기에 붙은 기능이 둘 더 있다. 둘 다 자리비움 감지와 아무 상관이 없고, 계정
 로그인과 Supabase 배관이 이미 여기 있어서 같은 앱에 들어왔다.
@@ -14,7 +15,68 @@ BLE 신호 세기(RSSI)로 거리를 판단한다.
 - 같은 구글 계정으로 로그인한 PC 끼리 클립보드를 주고받는다 (docs/CLIPBOARD.md)
 - 새 버전을 서버에 올리면 모든 PC 가 스스로 받아 간다 (docs/UPDATE.md)
 
-## 직전 세션: 서버와 주고받는 면 전체 검토 + 고치기, 그리고 1.1.5 · 1.1.6 (2026-09-30 ~ 10-01)
+## 직전 세션: Mac 판 (2026-10-01)
+
+"이 프로그램을 맥북에서도 동일하게" 를 한 세션에 했다. `mac/` 에 Swift 네이티브 앱
+(AppKit + CoreBluetooth, macOS 13+, 유니버설)이 있고, **Windows 판과 같은 화면 문구·설정 키·로그
+줄·서버 규약·폰 규약**으로 돈다. 설계와 Windows 와 다르게 한 곳마다의 이유는 **docs/MAC.md**,
+사용자 설명서는 `mac/README.txt` (zip 안의 `설치 안내.txt`).
+
+**이 PC 에는 Mac 이 없다. 컴파일러는 GitHub Actions 의 macOS 러너 하나뿐이다**
+(`.github/workflows/mac.yml`, `mac` / `main` 에 푸시하면 돈다). 단계를 나눠 두었다: Core 빌드 →
+앱 빌드 → `swift test` (판단 로직 시험) → `mac/build_app.sh` (유니버설 빌드, 아이콘, 서명, zip,
+실행 파일의 `--version` 대조). 결과물은 artifact `SmartScreen-mac` (`SmartScreen-mac.zip` +
+`VERSION`). **Mac 실기에서는 아직 한 번도 돌지 않았다** - 아래 "남은 작업 Mac".
+
+### 어떻게 만들었나
+
+- Windows 소스를 8 갈래로 읽어 명세를 쓰고(문구·상수·알고리즘·로그 줄 전부), 모듈 계약을 정한
+  뒤 13 갈래로 나눠 짰다. 첫 전체 빌드가 컴파일 오류 0 이었다
+- `SmartScreenCore` 에 AppKit 없이 판단 로직을 모았다 - Windows ScanThread 를 한 줄씩 옮긴
+  `ProximityJudge`, 잠금/해제 상태 기계 `GuardEngine`, config.ini, 문구, 재보기 판정, PKCE, 기업 콘텐츠
+  검증, 클립보드 해시·줄바꿈, 업데이트 후보 고르기. **PROXIMITY.md 의 시간표(2샘플, 6초 상한,
+  히스테리시스, 입력 5초 보호, 유휴 "바로")가 그대로 단위 시험이다** - 178개, CI 에서 통과
+- 검토를 세 번 돌렸다 (모듈별 검토자 → 발견마다 반박 검증자 둘). 1차 10건 중 확정 3, 2차 22건 중
+  확정 10 (같은 문제 다섯 개 포함), 3차 7건 중 확정 5. 전부 고친 뒤 고친 것만 다시 검토해
+  회귀 7건 중 확정 5 (창 순서 되돌리기가 업데이트 띠까지 묻던 것 등) - 그것도 고쳤다.
+  가장 큰 것은 "경고창이 떠 있으면 판정이 멈춘다" (아래 함정 첫 항목)
+- 완결성 점검: Windows 설명서의 장마다, 창의 단추마다 Mac 쪽을 찾아 대조했다. 빠진 기능은 없었고
+  빈틈은 Mac 설명서 쪽이었다 (고쳤다)
+
+### Windows 와 다르게 한 것 (이유는 docs/MAC.md)
+
+- 없는 것: IRK·[기기 키], overflow 비트 학습(`phoneOvfBit` 는 -1 그대로), 페어링된 Classic 기기 목록,
+  RFCOMM 지연 경로, [재연결]. 스캔은 신원 서비스 UUID 로 필터를 걸고 macOS 가 overflow 를 맞춘다
+- 입력 감시는 `CGEventSource` 유휴 시간을 100 ms 마다 (권한 창이 없는 유일한 길). 원격 세션은
+  `kCGSSessionOnConsoleKey`. 잠금 창은 모니터마다 하나 (`CGShieldingWindowLevel`)
+- refresh 토큰은 키체인이 아니라 AES-GCM + 이 Mac 의 하드웨어 UUID 로 봉해 `authRefresh` 에 넣는다
+  (`seal.salt`). 임시 서명이라 업데이트마다 키체인이 암호를 묻기 때문이다
+- 서명의 designated requirement 를 `identifier "com.icesgg.smartscreen"` 로 둔다 (업데이트 뒤
+  블루투스 허용을 다시 묻지 않게 - **실기 미확인**)
+- Windows 결함 중 Mac 에서는 고쳐서 옮긴 것: 오버레이 잠금 시각(Q1), 지연 해제 타이머 잔여(Q2),
+  [중지] 뒤 오버레이(Q4), 고른 그림 즉시 저장(Q5), [중지] 직후 결과(Q6), **GATT 구독 순간의 거짓
+  NEAR**, **`--clip-test` 의 토큰 회전**. **Windows 판(client/)은 그대로다** - 아래 "남은 작업 3"
+
+### 서버: Mac 은 표가 따로다 (`supabase/mac_releases.sql`, **아직 적용 안 됨**)
+
+깔린 Windows 1.1.x 는 `releases` 의 켜진 행을 플랫폼을 묻지 않고 받아 해시만 보고 exe 자리에
+놓는다. 그 표에 Mac zip 을 넣으면 모든 Windows PC 가 망가진다. 그래서 `mac_releases` /
+`org_mac_release_approvals` 를 새로 만들고(같은 정책, 같은 `releases` 버킷의 `mac/<버전>/`),
+덤으로 `releases.storage_path` 에 `<버전>/SmartScreen.exe` 모양 제약을 건다 - 라이브의 켜진 행
+8개(1.1.0~1.1.7)가 그 모양인 것을 anon 으로 읽어 확인했다. `release_admins` 의 쓰기 권한도 걷는다.
+대시보드(`docs/dashboard.html`)는 Windows / Mac 목록과 승인이 따로이고, Mac 표가 없으면 "Mac
+업데이트 표가 아직 없습니다" 만 보인다 (Windows 목록은 그대로).
+
+### 내놓는 길 (release.bat 이 둘 다)
+
+Windows 판을 지금까지처럼 내놓고 푸시한 뒤, 그 커밋의 CI 를 `gh` 로 기다려 artifact 를 받고
+`VERSION` 과 zip 안 Info.plist 를 대조해 `Publish.exe --platform mac` 으로 올린다 (브라우저 로그인 한
+번 더). Mac 표가 없으면 기다리지 않고 건너뛴다. Mac 단계가 실패해도 Windows 는 그대로이고
+`release-mac.bat <버전>` 으로 다시 한다. `-NoMac` 으로 건너뛸 수 있다. `Publish.exe` 는 Windows
+모드에서 `MZ` 로 시작하지 않는 파일을 거절하고, Mac 모드에서는 zip 안의 번들 id·버전을 직접 읽는다.
+`gh` 가 있어야 한다 (이 노트북에는 있고 로그인돼 있다).
+
+## 그 앞 세션: 서버와 주고받는 면 전체 검토 + 고치기, 그리고 1.1.5 · 1.1.6 (2026-09-30 ~ 10-01)
 
 "anon 이 `contents` 에 쓸 수 있나" 를 보러 들어갔다가, 서버와 주고받는 면 전체를
 검토하고 고쳤다. **1.1.5 로 나갔고**, 그 뒤 설정 창 문제 셋을 고쳐 **1.1.6 으로 나갔다**
@@ -261,6 +323,26 @@ A 에서 스크린캡처하면 B 에서 Ctrl+V 로 붙는다. 연결고리는 �
 
 ## 남은 작업
 
+### Mac. 실기 시험 (최우선 - 한 번도 Mac 에서 돈 적이 없다)
+
+순서대로. 앞의 것이 안 되면 뒤는 의미가 없다. 무엇을 보면 되는지는 docs/MAC.md "확인하지 못한 것".
+
+1. **잠긴 아이폰을 찾는가.** 폰을 잠근 채 터미널에서
+   `/Applications/SmartScreen.app/Contents/MacOS/SmartScreen --probe-scan`. `>>> 토큰` 이 나오면 된다.
+   안 나오면 이 포팅 전체의 전제(macOS 가 서비스 필터로 overflow 광고를 맞춰 준다)가 틀린 것이다 -
+   필터 없이 스캔해 `4C 00 01 <16바이트>` 를 Windows 처럼 직접 읽도록 `AdvScanner` 를 바꾼다
+   (ble 명세 8.3-1. 명세는 이번 세션의 scratchpad 에만 있었다 - 필요하면 client/ble_rssi.cpp 의
+   SingleOverflowBit 를 다시 읽을 것)
+2. 등록(구글 계정) → [보호 켜짐] → 폰 들고 떠나기/돌아오기. events.log 의 `START thr=`, `ident: bound
+   to`, `STATE`, `BLACK ON/OFF`. **검은 화면이 뜨자마자 스스로 풀리면** 창을 띄우는 것이 입력 유휴
+   시간을 되돌리는 것이다 (InputWatcher)
+3. 재보기 마법사 - Mac 안테나는 Windows 와 10~20 dB 다르다. Windows 값을 옮기지 말 것
+4. 고급 창 아래 `GATT: linked` (잠긴 폰이 Mac 의 GATT 서비스에 붙는가)
+5. 클립보드: Windows ↔ Mac 글(한글, 여러 줄)과 그림. macOS 15.4+ 의 "붙여넣기 허용" 창
+6. 업데이트: `mac_releases.sql` 을 적용하고 1.1.8 을 내놓은 뒤 Mac 이 받는가. **업데이트 뒤
+   블루투스 허용을 다시 묻는가, "앱 관리" 에 막히는가** - 물으면 기업 Mac 자동 적용은 서명을 바꾸기
+   (Developer ID) 전까지 끌 것
+
 ### 0. 1.1.6/1.1.7 에서 아직 안 본 것
 
 1.1.6 은 나갔고(1.1.7 은 같은 코드) 노트북에서 1.1.7 로 뜬다 (시작 경로: 세션 복구, 회전 토큰 저장, 기업 동기화
@@ -321,6 +403,11 @@ provider 를 지원한다. 사내 배포(TestFlight 내부)면 해당 없다.
 
 ### 3. 검토해 볼 것
 
+- **Mac 에서 고친 Windows 결함을 client/ 에도**: GATT 구독 순간의 거짓 NEAR
+  (`client/ble_gatt.cpp` SubscribedClientsChanged 가 폴링 간격을 정하기 전에 reportEvent 를
+  울린다 → 간격 0 = "입력 중" 으로 읽혀 잠긴 화면이 한 샘플 풀릴 수 있다), `--clip-test` 의
+  토큰 회전(켜진 앱의 로그인이 풀릴 수 있다), lockscreen 명세의 Q1·Q2·Q4·Q5·Q6. 목록과
+  근거는 docs/MAC.md "일부러 바꾼 것"
 - **`contents` 와 `content` 버킷은 여전히 로그인 없이 읽힌다** (전 org 의 행, 파일
   바이트, 목록). 쓰기는 닫혔다 (위 "직전 세션"). 조이려면 기업 PC 에 로그인이나 그에
   준하는 것이 필요해진다 (`org_release_approvals` 도 같은 이유로 anon 읽기다) - 그
@@ -341,6 +428,13 @@ provider 를 지원한다. 사내 배포(TestFlight 내부)면 해당 없다.
 
 ## 작업 환경
 
+- **Mac 판 빌드는 CI 에서만 된다.** `mac` 이나 `main` 에 `mac/**` 를 바꿔 푸시하면
+  `mac.yml` 이 돈다. 오류 보기: `gh run view <id> --log` 에서 `.swift:<줄>:<칸>: error:` 줄.
+  zip 받기: `gh run download <id> -n SmartScreen-mac`. 판단 로직을 고치면 `mac/Tests` 에 시험을
+  더할 것 - Mac 이 없는 곳에서 행동을 확인하는 유일한 길이다
+- Mac 앱의 진단 모드: `--version`, `--probe-scan`, `--adv-scan`, `--bt-check`, `--clip-test`
+  (`SmartScreen.app/Contents/MacOS/SmartScreen` 에 붙인다). config 와 로그는
+  `~/Library/Application Support/SmartScreen/`
 - **새 버전 내놓기: `release.bat` 더블클릭** (위 "release.bat"). 낱개로는
   `cmd.exe /c do_build.bat` → `publish.bat --notes "..."` (`--list`, `--deactivate 1.2.3`,
   `--channel beta`, `--force`). `.env` 를 읽는다. `build\Publish.exe --selftest` 는
@@ -383,6 +477,21 @@ provider 를 지원한다. 사내 배포(TestFlight 내부)면 해당 없다.
   따옴표가 깨진다 - cmd 에서 돌리거나 `build\Publish.exe` 를 직접 부를 것
 
 ## 함정
+
+### macOS 에서 경고창을 메인 큐 블록 안에서 띄우지 말 것
+
+`DispatchQueue.main.async { ... NSAlert.runModal() ... }` 는 그 창이 닫힐 때까지 메인 큐의 다른
+블록을 하나도 돌리지 않는다 (메인 큐는 직렬이고, 중첩 런 루프는 그것을 다시 비우지 않는다).
+Windows 의 MessageBox 는 떠 있는 동안에도 `WM_SCAN_RESULT` 를 돌리므로 같은 모양으로 옮기면
+틀린다 - Mac 첫 판에서 로그인 결과 창을 띄워 둔 채 자리를 떠도 화면이 바로 가려지지 않았다.
+판정 결과는 `MainLoop.perform` (CFRunLoopPerformBlock, common modes) 으로 보내고, 다른 스레드의
+결과로 경고창을 띄울 때는 `MainTimer.once(after: 0)` 로 한 번 건넌다. 타이머는 `.common` 모드로.
+
+### Mac 의 "확인하지 못한 것" 은 진짜로 확인하지 못한 것이다
+
+CI 는 컴파일과 시험까지만 한다. 블루투스, 잠금 화면, 권한(TCC), 서명, 자기 업데이트는 Mac 에서
+한 번도 돈 적이 없다. "컴파일된다" 를 "된다" 로 읽지 말 것 - 이 저장소의 "쓰인 적 없는 코드는
+틀린 줄 모른다" 가 Mac 판 전체에 해당한다.
 
 ### 빌드 스크립트의 보고를 믿지 말 것 (release.ps1 에서 세 번)
 
@@ -529,6 +638,9 @@ Disconnected / Closed 로 보고됐다. `GattDeviceService` 는 반드시 `Close
 
 ## 현재 기기 상태
 
+- **Mac: 아직 없음.** `SmartScreen-mac.zip` (1.1.7, CI 빌드) 이 저장소 맨 위에 있다. 맥북에
+  깔았는지는 확인 못 했다. `supabase/mac_releases.sql` 은 **적용 전** (라이브의 `mac_releases`
+  는 404)
 - 노트북(LG gram 14Z990, Intel 내장): **1.1.7**, 기업 등록(`enterpriseRegistered=1`,
   orgId `0dca070f-…`), **`measuredBaseRssi=-67`, `nearRssiThreshold=-67` =
   `gattRssiThreshold=-67` (거리 3단계의 [보통])**, `idleCountdownSec=15`, `bleDebugLog=0`.

@@ -25,6 +25,14 @@ zip 안의 `설치 안내.txt`), `supabase/mac_releases.sql`, `tools/release.ps1
   검증(`<org>/<sha256>.<ext>`), 클립보드 행과 버킷 경로, 되울림 방지 해시
 - 폰과의 BLE 규약: UUID 다섯 개, TICK 1바이트, RSSI 2바이트, 토큰 16바이트 = 대문자 hex 32자
 
+맥북(M1)에서 직접 빌드할 수도 있다. Xcode 명령줄 도구가 있으면:
+
+```
+git clone https://github.com/icesgg/smartscreen.git && cd smartscreen
+bash mac/build_app.sh --native     # mac/dist/SmartScreen.app, mac/dist/SmartScreen-mac.zip
+cd mac && swift test               # 판단 로직 시험
+```
+
 판단 로직은 `SmartScreenCore` 에 AppKit/CoreBluetooth 없이 두었다. CI 가 `swift test` 로
 PROXIMITY.md 의 시간표(2샘플, 6초 상한, 히스테리시스, 입력 보호...)를 그대로 돌려 본다 -
 Mac 이 없는 곳에서 행동을 확인하는 유일한 방법이다.
@@ -43,7 +51,7 @@ Mac 이 없는 곳에서 행동을 확인하는 유일한 방법이다.
 | 전역 입력 훅 (`WH_MOUSE_LL`) | `CGEventSource` 유휴 시간을 100 ms 마다 본다 | 권한 없이 모든 입력을 보는 방법이 이것뿐이다. 이벤트 탭은 "입력 모니터링" 권한을 묻는다 |
 | `SM_REMOTESESSION` (RDP) | `kCGSSessionOnConsoleKey == false` | 가장 가까운 뜻. 같은 세션을 보는 화면 공유는 Windows 의 TeamViewer 처럼 못 알아챈다 |
 | 가상 화면 전체를 덮는 창 하나 | 모니터마다 창 하나 | "디스플레이마다 별도의 Space" 가 켜진 Mac 에서는 창이 모니터를 넘지 못한다. Windows 도 내용은 모니터마다 따로 그린다 |
-| MFPlay (avi/wmv/mkv/webm 포함) | AVFoundation (mp4/mov) | macOS 는 앞의 넷을 기본으로 재생하지 못한다. 확장자 목록은 서버·대시보드와 같이 두고, 재생 실패는 그림 없는 화면으로 넘어간다 |
+| MFPlay (avi/wmv/mkv/webm 포함) | AVFoundation (mp4/mov) | macOS 는 앞의 넷을 기본으로 재생하지 못한다. 확장자 목록은 서버·대시보드와 같이 두고, 재생에 실패하면 그림이 없을 때의 어두운 상자로 넘어간다 (`lock: video could not be played` 줄) |
 
 ### 일부러 바꾼 것
 
@@ -71,9 +79,14 @@ Mac 이 없는 곳에서 행동을 확인하는 유일한 방법이다.
   Windows 판은 점검이 토큰을 회전시키고 버려서, 켜져 있는 앱의 로그인이 풀릴 수 있다
   (clipsync 명세 10-1). 역시 Windows 는 그대로다.
 - 잠금 화면은 자기 창만 앞으로 올린다. 앱 전체를 활성화하면 열어 둔 설정 창까지 다른 앱
-  창들 위로 올라온다 (Windows 의 SetForegroundWindow 는 잠금 창 하나만 올린다).
-- 블루투스 권한이 없으면 [시작] 에서 한 번, BLE 직접 등록에서 매번 그렇게 말한다. Windows 에는
-  권한이라는 것이 없어서 대응하는 문구가 없다.
+  창들 위로 올라온다 (Windows 의 SetForegroundWindow 는 잠금 창 하나만 올린다). 풀 때는 잠그기
+  전에 다른 앱 창 **아래** 있던 우리 창만 그 창 아래로 되돌린다 - 처음 판은 우리 창을 전부 맨
+  뒤로 보내서, 업데이트를 알리려고 일부러 앞에 띄운 간단 창까지 묻었다 (회귀 검토)
+- 블루투스 권한이 없으면 감시 중에 처음 알아챈 때 한 번 (macOS 의 허용 창에서 "허용 안 함" 을
+  누른 직후 포함), BLE 직접 등록에서는 매번 그렇게 말한다. Windows 에는 권한이라는 것이 없어서
+  대응하는 문구가 없다.
+- 그림을 고르지 않았을 때의 기본 그림 자리: Windows 는 exe 옆의 `images\`, Mac 은 설정 폴더의
+  `images/` (앱 묶음 안은 서명돼 있고 업데이트마다 바뀐다).
 - 앱을 다시 열면(Finder, Launchpad) 간단 창이 나온다. Windows 는 두 번째 실행이 "이미
   실행 중" 으로 끝나지만, macOS 는 같은 앱을 다시 띄우지 않고 떠 있는 앱을 깨운다.
   오버레이 [설정] 말고도 돌아오는 길이 하나 더 생긴 것뿐이다.
@@ -127,8 +140,17 @@ Mac 단계는 CI 를 기다리느라 10~20분 걸릴 수 있고, 그 사이 창�
 받는 단계에서 한다 - 잘못된 zip 을 앱이 꺼지기 전에 알아채고 실패로 기록한다) → 자기 실행
 파일을 `update/updater` 로 복사해 `--apply-update` 로 띄우고 정상 종료 → 복사본이 원래
 프로세스가 끝나기를 기다렸다가 zip 의 해시를 **다시 재고 다시 풀어** 그것을 놓는다 (풀어 둔
-폴더가 그 사이에 바뀌었으면 해시 검사가 무의미하다) → `SmartScreen.app` 을 `.bak` 으로 옮기고
-새 앱을 놓고 다시 띄운다. 실패는 Windows 와 같이 `failed-<버전>.txt` 로 기억한다.
+폴더가 그 사이에 바뀌었으면 해시 검사가 무의미하다) → 새 앱을 먼저 **옛 앱 옆**
+(`.SmartScreen.app.incoming`, 같은 볼륨)에 놓고 확인한 뒤 `RENAME_SWAP` 으로 맞바꾼다 → 옛 앱은
+`.bak` 이 된다 → 다시 띄운다. 어느 순간에도 `SmartScreen.app` 이나 `.bak` 중 하나는 온전한 앱이다
+(앱이 외장 볼륨에 있으면 처음 판은 복사하는 몇 초 동안 앱이 없었다). 실패는 Windows 와 같이
+`failed-<버전>.txt` 로 기억한다. 다시 띄우기 전에 "새 버전이 뜨지 않았다" 는 기록을 미리 써 두고 새
+버전이 무사히 뜨면 지운다 - 새 버전이 뜨자마자 죽어서 `.bak` 으로 되돌렸을 때 같은 버전을 곧바로
+다시 받지 않게.
+
+더 높은 macOS 가 필요한 버전은 받지 않는다: 행의 `min_macos` 와 받은 앱의 `LSMinimumSystemVersion`
+을 둘 다 본다. **첫 Mac 판부터 들어 있어야 했다** - 깔린 클라이언트의 조회는 나중에 못 바꾼다
+(Windows `releases` 가 그 함정이다). macOS 를 올리면 그 기록은 다음 확인에서 저절로 풀린다.
 
 Windows 와 다른 실패 사유가 셋 있다. 앱 이름이 `SmartScreen.app` 이 아닐 때, 다운로드 폴더에서
 바로 실행 중일 때(macOS 가 읽기 전용 임시 위치로 옮겨 실행한다 - App Translocation), 그리고
@@ -158,7 +180,7 @@ Windows 의 MessageBox 는 떠 있는 동안에도 메시지를 돌린다 - 로�
 
 ## 확인하지 못한 것 (Mac 실기가 필요하다)
 
-CI 는 컴파일, 판단 로직 시험(174개), 유니버설 빌드, 서명, zip 까지 한다. 아래는 Mac 과
+CI 는 컴파일, 판단 로직 시험(180개 남짓), 유니버설 빌드, 서명, zip 까지 한다. 아래는 Mac 과
 아이폰이 있어야 알 수 있다. 중요한 순서다.
 
 1. **macOS 가 잠긴 아이폰의 overflow 광고를 서비스 필터로 찾아 주는가.** 이 포팅 전체가

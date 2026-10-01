@@ -168,8 +168,31 @@ public enum UpdateText {
     /// Mac 만: 받은 앱의 LSMinimumSystemVersion 이 이 Mac 의 macOS 보다 높다. LaunchServices 가 그 앱을
     /// 열지 않으므로 바꾸면 아무것도 안 뜬다 - 바꾸기 전에 멈추고 기록한다 (같은 버전을 되풀이하지 않게).
     public static func needsNewerMacOS(_ minimum: String) -> String {
-        return "이 macOS 에서는 새 버전을 쓸 수 없어요 (macOS \(minimum) 이상)"
+        return needsNewerMacOSHead + minimum + needsNewerMacOSTail
     }
+    /// needsNewerMacOS(x) 로 만든 글이면 x, 아니면 nil (RG-0). 이 이유만은 받은 빌드가 아니라 지금 도는
+    /// macOS 에 달려 있어서, 기록(failed-<버전>.txt)으로 남은 뒤 macOS 를 올리면 거짓이 된다. 그래서
+    /// 확인할 때마다 기록에서 x 를 다시 읽어 지금 macOS 와 견준다 (UpdateLogic.obsoleteMacOSMarker).
+    /// 정확히 그 모양만 받는다: 앞뒤 글이 바이트까지 같고, 가운데가 공백 없는 macOS 버전 모양이어야
+    /// 한다 (unmetMacOS 가 돌려주는 x 는 언제나 그렇다). 다른 글은 평범한 기록으로 남는다.
+    public static func needsNewerMacOSMinimum(_ reason: String) -> String? {
+        let r = Array(reason.utf8)
+        let h = Array(needsNewerMacOSHead.utf8)
+        let t = Array(needsNewerMacOSTail.utf8)
+        if r.count <= h.count + t.count { return nil }
+        if !r.starts(with: h) || !r[(r.count - t.count)...].elementsEqual(t) { return nil }
+        let x = String(decoding: r[h.count..<(r.count - t.count)], as: UTF8.self)
+        if x != x.trimmingCharacters(in: .whitespacesAndNewlines) { return nil }
+        if UpdateLogic.parseMacOSVersion(x) == nil { return nil }
+        return x
+    }
+    private static let needsNewerMacOSHead = "이 macOS 에서는 새 버전을 쓸 수 없어요 (macOS "
+    private static let needsNewerMacOSTail = " 이상)"
+    /// 복사본이 새 앱을 놓은 뒤, 띄우기 직전에 남기는 임시 기록 (RG-1). 새 빌드가 뜨면 자기 버전의
+    /// 기록을 지운다 (Updater.cleanupAfterStart). 남아 있다면 새 빌드는 뜨지 않은 것이다 (시작하자마자
+    /// 죽었거나, open 이 실패했다). 그때 .bak 에서 되돌린 예전 앱이 기록 없이 켜지면 같은 버전을 곧바로
+    /// 다시 받아 적용한다 - 기업 PC 는 묻지 않으므로 1분 안에 다시 아무것도 화면을 지키지 않는다.
+    public static let newBuildDidNotStart = "새 버전이 뜨지 않았어요 - 예전 앱으로 되돌렸다면 [다시 시도] 를 누르세요"
     /// macOS 13+ 의 "앱 관리" 보호가 다른 앱이 고치는 것을 막을 때 (EPERM)
     public static let appManagement = "시스템 설정 > 개인정보 보호 및 보안 > 앱 관리 에서 SmartScreen 을 허용해 주세요"
     public static func moveOldFailed(_ code: Int) -> String { return "기존 파일을 옮기지 못했어요 (오류 \(code))" }
@@ -389,7 +412,8 @@ public enum UpdateLogic {
     /// 내려받는 중이던 *.part 와 updater 복사본은 언제나 지운다 (돌고 있는 복사본이 있어도 지우는
     /// 것은 된다). 받은 zip 과 푼 묶음은 지금 버전 이하일 때만 - 더 새 버전의 것은 예전 앱이
     /// 적용 도중에 다시 켜졌을 때 그 적용이 쓰는 중일 수 있다. failed-*.txt 는 두어야 한다: 실패한
-    /// 뒤 다시 뜬 예전 앱이 그걸 봐야 한다.
+    /// 뒤 다시 뜬 예전 앱이 그걸 봐야 한다. (지금 버전의 기록 하나만은 cleanupAfterStart 가 따로
+    /// 지운다 - 복사본이 남긴 임시 기록이다, UpdateText.newBuildDidNotStart.)
     public static func cleanupTarget(_ name: String, running: SemVer) -> Bool {
         if name.hasSuffix(".part") { return true }
         if name.hasPrefix(updaterName) { return true }
@@ -467,6 +491,16 @@ public enum UpdateLogic {
         let need = (m.majorVersion, m.minorVersion, m.patchVersion)
         let have = (running.majorVersion, running.minorVersion, running.patchVersion)
         return need > have ? t : nil
+    }
+
+    /// 실패 기록의 이유가 UpdateText.needsNewerMacOS(x) 인데 지금 macOS 가 x 이상이면 x, 아니면 nil (RG-0).
+    /// x 가 나오면 그 기록은 더는 맞지 않는다: 부르는 쪽이 지우고 기록이 없던 것처럼 간다 (기업 PC 는
+    /// 승인된 버전을 다시 받는다). 그러지 않으면 IT 가 macOS 를 올린 뒤에도 [다시 시도] 를 누르거나 더
+    /// 새 버전이 승인될 때까지 적용이 멎고, 띠는 거짓이 된 이유를 보인다. 다른 이유는 받은 빌드에 달린
+    /// 실패라 그대로 둔다.
+    public static func obsoleteMacOSMarker(_ reason: String, running: OperatingSystemVersion) -> String? {
+        guard let x = UpdateText.needsNewerMacOSMinimum(reason) else { return nil }
+        return unmetMacOS(x, running: running) == nil ? x : nil
     }
 
     // ---- private ----
@@ -628,6 +662,8 @@ public struct ReleaseMachine {
 /// 적용에 실패하면 복사본은 예전 앱을 다시 띄운다. 그 앱이 아무것도 모르면 같은 버전을 다시 받아
 /// 다시 적용하러 종료하고, 그게 끝없이 반복된다 - 기업 PC 는 묻지 않고 적용하므로 특히 그렇다.
 /// 그래서 실패한 버전과 이유를 적어 두고, 다음 확인은 그 버전을 "실패함" 으로만 보여 준다.
+/// 바꾸기에 성공해도 새 빌드가 실제로 뜰 때까지는 임시 기록이 남는다 (UpdateText.newBuildDidNotStart).
+/// macOS 가 낮아서 난 기록은 확인할 때마다 다시 본다 (UpdateLogic.obsoleteMacOSMarker).
 public enum UpdateMarker {
     /// "failed-<ver>.txt". 버전 모양(a.b.c)이 아니면 nil - 파일 이름에 아무 글자나 넣지 않는다.
     public static func fileName(_ ver: String) -> String? {

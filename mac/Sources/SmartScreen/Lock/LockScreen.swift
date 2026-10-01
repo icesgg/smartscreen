@@ -43,9 +43,10 @@ final class LockScreen {
     private var bannerPath = ""
     private var previousApp: NSRunningApplication?
     private weak var previousKeyWindow: NSWindow?
-    /// 다른 앱을 쓰던 중에 잠겼을 때, 그 뒤에 깔려 보이던 우리 창 (간단/고급 설정 창).
-    /// 앞에서 뒤 순서. 풀 때 다시 뒤로 보낸다 (restoreFrontmost). 창을 붙잡지 않게 약하게 쥔다.
-    private var windowsBehind: [WeakWindow] = []
+    /// 다른 앱을 쓰던 중에 잠겼을 때, 다른 앱의 창 아래에 깔려 있던 우리 창 (간단/고급 설정 창)과
+    /// 그 바로 위에 겹쳐 있던 다른 앱의 창 번호. 앞에서 뒤 순서. 풀 때 그 창 바로 아래로 되돌린다
+    /// (restoreFrontmost). 위에 겹친 다른 앱 창이 없던 우리 창은 여기 없다 - 풀 때 건드리지 않는다.
+    private var windowsUnder: [WindowUnder] = []
     private var rebuildQueued = false
     private var screenObserver: NSObjectProtocol?
 
@@ -243,41 +244,111 @@ final class LockScreen {
 
     // MARK: - 앞에 있던 앱
 
-    /// 창을 붙잡지 않고 가리키기만 한다 (잠긴 동안 설정 창이 닫혀도 남지 않게).
-    private struct WeakWindow {
+    /// 우리 창 하나와, 잠글 때 그 위에 가장 가까이 겹쳐 있던 다른 앱의 창 번호.
+    /// 창은 붙잡지 않고 가리키기만 한다 (잠긴 동안 설정 창이 닫혀도 남지 않게).
+    private struct WindowUnder {
         weak var window: NSWindow?
+        let above: Int
+    }
+
+    /// 화면에 보이는 0 층(보통 창) 창 하나 (CGWindowListCopyWindowInfo 의 항목).
+    /// bounds 는 전역 좌표다: 주 화면 왼쪽 위가 원점, 아래로 +y.
+    private struct ScreenWindow {
+        let number: Int
+        let pid: Int
+        let bounds: CGRect
     }
 
     private func rememberFrontmost() {
         previousApp = nil
         previousKeyWindow = nil
-        windowsBehind = []
+        windowsUnder = []
         let me = NSRunningApplication.current
         if let front = NSWorkspace.shared.frontmostApplication,
            front.processIdentifier != me.processIdentifier {
             previousApp = front
-            // 다른 앱을 쓰던 중이었다. 그 앱 뒤에 보이던 우리 설정 창을 적어 둔다 - 잠글 때의
-            // 활성화가 그 창을 앞으로 끌어올렸으면 풀 때 다시 뒤로 보낸다.
-            windowsBehind = LockScreen.visibleSettingsWindows()
+            // 다른 앱을 쓰던 중이었다. 다른 앱의 창 아래에 깔려 있던 우리 설정 창과, 그 바로 위의
+            // 창을 적어 둔다 - 잠글 때의 활성화가 그 창을 끌어올렸으면 풀 때 제자리로 돌려놓는다.
+            windowsUnder = LockScreen.settingsWindowsUnderOthers(pid: Int(me.processIdentifier))
         } else {
             // 우리 창(간단 창의 "지금 가리기" 등)을 쓰던 중이었다.
             previousKeyWindow = NSApp.keyWindow
         }
     }
 
-    /// 보이는 우리 일반 창 (커튼, 오버레이 같은 패널, 알림 창, 지금의 키 창은 뺀다), 앞에서 뒤 순서.
-    private static func visibleSettingsWindows() -> [WeakWindow] {
-        let key = NSApp.keyWindow
-        func eligible(_ w: NSWindow) -> Bool {
-            return w.isVisible && !(w is LockWindow) && !(w is NSPanel) && w.level == .normal && w !== key
+    /// 잠그는 순간의 실제 z-순서에서, 우리 설정 창마다 그 위에 가장 가까이 있으면서 겹치는 다른 앱의
+    /// 창을 찾는다. 그런 창이 없는 우리 창(다른 앱 창들 위에 있던 창, 다른 Space 에 있어 화면 목록에
+    /// 없는 창)은 목록에 넣지 않는다 - 풀 때 건드리지 않는다.
+    ///
+    /// 왜 이렇게까지 하나: R1-1 - 잠글 때의 활성화가 다른 앱 뒤에 있던 간단/고급 창을 그 앱들 위로
+    /// 끌어올려, 풀어도 그대로 남았다. 그 고침은 풀 때 보이는 우리 창을 전부 orderBack 으로 맨 뒤에
+    /// 보냈는데 (RG-2), 그러면 다른 앱 창들 위에 있던 창까지 묻힌다. 특히 updateTick 이 일부러
+    /// orderFrontRegardless 로 올린 업데이트 띠가 묻혀서 다시는 보이지 않았다. Windows 는 잠금 창이
+    /// 사라져도 다른 창의 z-순서를 건드리지 않는다 (spec 6.5) - 그래서 잠그기 전 자리로만 되돌린다.
+    /// CGWindowListCopyWindowInfo 는 번호·주인·층·위치만 쓰므로 화면 기록 권한을 묻지 않는다.
+    private static func settingsWindowsUnderOthers(pid me: Int) -> [WindowUnder] {
+        let ours = visibleSettingsWindows()
+        if ours.isEmpty { return [] }
+        let list = onScreenNormalWindows()
+        let primaryHeight = primaryScreenHeight()
+        var out: [WindowUnder] = []
+        // 목록은 앞에서 뒤 순서다. 우리 창마다 그보다 앞(위)의 항목을 가까운 것부터 본다.
+        for (i, entry) in list.enumerated() where entry.pid == me {
+            guard let w = ours[entry.number] else { continue }
+            // NSWindow 의 frame 은 주 화면 왼쪽 아래가 원점이고 위로 +y 다. 전역 좌표로 바꾼다.
+            let f = w.frame
+            let mine = CGRect(x: f.minX, y: primaryHeight - f.maxY, width: f.width, height: f.height)
+            for j in stride(from: i - 1, through: 0, by: -1) {
+                let other = list[j]
+                if other.pid != me && overlaps(other.bounds, mine) {
+                    out.append(WindowUnder(window: w, above: other.number))
+                    break
+                }
+            }
         }
-        // orderedWindows 는 앞에서 뒤 순서다. 거기 빠진 창이 있으면 (스크립트용 목록이라 빠질 수
-        // 있다) 뒤에 붙인다.
-        var list = NSApp.orderedWindows.filter { eligible($0) }
-        for w in NSApp.windows where eligible(w) && !list.contains(where: { $0 === w }) {
-            list.append(w)
+        return out
+    }
+
+    /// 보이는 우리 일반 창 (커튼, 오버레이 같은 패널, 알림 창은 뺀다), 창 번호로.
+    private static func visibleSettingsWindows() -> [Int: NSWindow] {
+        var out: [Int: NSWindow] = [:]
+        for w in NSApp.windows where w.isVisible && !(w is LockWindow) && !(w is NSPanel)
+            && w.level == .normal && w.windowNumber > 0 {
+            out[w.windowNumber] = w
         }
-        return list.map { WeakWindow(window: $0) }
+        return out
+    }
+
+    /// 화면에 보이는 0 층 창들, 앞에서 뒤 순서 (CGWindowListCopyWindowInfo 가 주는 순서 그대로).
+    private static func onScreenNormalWindows() -> [ScreenWindow] {
+        guard let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                                   kCGNullWindowID) as? [[String: Any]] else { return [] }
+        var out: [ScreenWindow] = []
+        for d in raw {
+            guard let layer = d[kCGWindowLayer as String] as? Int, layer == 0,
+                  let number = d[kCGWindowNumber as String] as? Int,
+                  let pid = d[kCGWindowOwnerPID as String] as? Int else { continue }
+            var bounds = CGRect.null
+            if let bd = d[kCGWindowBounds as String] as? NSDictionary,
+               let r = CGRect(dictionaryRepresentation: bd as CFDictionary) {
+                bounds = r
+            }
+            out.append(ScreenWindow(number: number, pid: pid, bounds: bounds))
+        }
+        return out
+    }
+
+    /// 두 사각형이 넓이가 있게 겹치는가 (모서리만 닿는 것은 겹친 것이 아니다).
+    private static func overlaps(_ a: CGRect, _ b: CGRect) -> Bool {
+        if a.isNull || b.isNull || a.isEmpty || b.isEmpty { return false }
+        let i = a.intersection(b)
+        return !i.isNull && i.width > 0 && i.height > 0
+    }
+
+    /// 주 화면(메뉴 막대가 있는 화면)의 높이. AppKit 좌표와 전역(CG) 좌표를 오가는 데 쓴다.
+    private static func primaryScreenHeight() -> CGFloat {
+        if let s = NSScreen.screens.first { return s.frame.height }
+        return CGDisplayBounds(CGMainDisplayID()).height
     }
 
     /// Windows 는 SetForegroundWindow(잠금 창). 거절되어도 커튼은 맨 위에 보인다 - 여기도 같다.
@@ -286,7 +357,8 @@ final class LockScreen {
     /// Mac 의 NSApp.activate(ignoringOtherApps:) 는 앱의 창을 전부 앞으로 올려서, 다른 앱 뒤에 있던
     /// 간단/고급 창이 잠글 때마다 그 앱들 위로 올라왔다 (풀어도 그대로 남았다). 그래서 커튼을 먼저
     /// 키 창이자 주 창으로 만든 뒤, 키/주 창만 앞으로 올리는 방식으로 활성화한다
-    /// (.activateAllWindows 를 넣지 않는다). 그래도 올라온 창은 restoreFrontmost 가 뒤로 보낸다.
+    /// (.activateAllWindows 를 넣지 않는다). 그래도 올라온 창은 restoreFrontmost 가 잠그기 전의
+    /// 자리(그 위에 겹쳐 있던 다른 앱 창 바로 아래)로 돌려놓는다.
     private func activateSelf() {
         if let w = windows.first {
             w.makeKeyAndOrderFront(nil)
@@ -302,20 +374,22 @@ final class LockScreen {
 
     /// Windows 는 잠금 창이 사라지면 z-순서상 다음 창(보통 쓰던 앱)이 저절로 활성화된다.
     /// Mac 은 그런 것이 없으므로 기억해 둔 앱을 직접 되돌린다.
-    /// 다른 앱을 쓰다가 잠겼으면 우리 설정 창도 그 앱 뒤로 돌려보낸다 - Windows 에서는 잠금 창이
-    /// 사라져도 다른 창의 z-순서가 잠그기 전 그대로다 (spec 6.5). 우리 앱을 쓰던 중이었으면
-    /// 예전 그대로 그 키 창을 다시 앞으로 한다.
+    /// 다른 앱을 쓰다가 잠겼으면, 다른 앱 창 아래에 있던 우리 설정 창을 그 창 바로 아래로 되돌린다 -
+    /// Windows 에서는 잠금 창이 사라져도 다른 창의 z-순서가 잠그기 전 그대로다 (spec 6.5). 다른 앱
+    /// 창들 위에 있던 우리 창(업데이트 띠를 보이려고 올린 간단 창 같은 것)은 건드리지 않는다.
+    /// 우리 앱을 쓰던 중이었으면 예전 그대로 그 키 창을 다시 앞으로 한다.
     private func restoreFrontmost() {
         let app = previousApp
         let keyWindow = previousKeyWindow
-        let behind = windowsBehind.compactMap { $0.window }
+        let under = windowsUnder
         previousApp = nil
         previousKeyWindow = nil
-        windowsBehind = []
+        windowsUnder = []
         guard NSApp.isActive else {
             // 그 사이 다른 앱이 앞으로 나왔다면 사용자가 고른 것이니 활성화는 건드리지 않는다.
-            // 잠글 때 같이 올라온 우리 창만 다시 뒤로 보낸다.
-            if app != nil { LockScreen.sendBack(behind) }
+            // 잠글 때 같이 올라왔을 수 있는 우리 창만 제자리로 돌려놓는다 (우리 앱을 쓰던 중에
+            // 잠겼으면 목록이 비어 있다).
+            LockScreen.restoreOrder(under)
             return
         }
         if let app = app {
@@ -324,19 +398,26 @@ final class LockScreen {
                 NSApp.yieldActivation(to: app)
             }
             _ = app.activate(options: [])
-            LockScreen.sendBack(behind)
+            LockScreen.restoreOrder(under)
         } else if let w = keyWindow, w.isVisible, !(w is LockWindow) {
             w.makeKeyAndOrderFront(nil)
         }
     }
 
-    /// 잠그기 전에 다른 앱 뒤에 있던 우리 창을 다시 뒤로 보낸다. 앞에서 뒤 순서로 하나씩 맨 뒤로
-    /// 보내므로 우리 창끼리의 순서는 그대로다. orderBack 은 키/주 창도, 활성 앱도 바꾸지 않는다.
-    /// (그 앱의 창 바로 뒤가 아니라 같은 층의 맨 뒤로 간다 - 다른 앱의 창 순서를 모르므로
-    /// 가장 안전한 쪽을 고른다.)
-    private static func sendBack(_ list: [NSWindow]) {
-        for w in list where w.isVisible && !(w is LockWindow) {
-            w.orderBack(nil)
+    /// 잠글 때 적어 둔 우리 창을 각각 그 위에 겹쳐 있던 다른 앱 창 바로 아래로 놓는다. 그 창이 이제
+    /// 화면에 없으면 (닫혔거나, 숨었거나, 다른 Space) 그 우리 창은 그대로 둔다. orderBack 은 쓰지
+    /// 않는다 - 같은 층의 맨 뒤로 가서, 다른 앱 창들 위에 있던 창까지 묻는다 (RG-2).
+    /// order(.below, relativeTo:) 는 키/주 창도, 활성 앱도 바꾸지 않는다.
+    private static func restoreOrder(_ list: [WindowUnder]) {
+        if list.isEmpty { return }
+        let onScreen = Set(onScreenNormalWindows().map { $0.number })
+        // 뒤에서 앞 순서로 놓는다. 우리 창 여럿이 같은 창 아래로 가면 나중에 놓인 것이 그 바로 아래에
+        // 오므로, 뒤의 것부터 놓아야 우리 창끼리의 순서가 잠그기 전 그대로다.
+        for item in list.reversed() {
+            guard let w = item.window, w.isVisible, !(w is LockWindow), onScreen.contains(item.above) else {
+                continue
+            }
+            w.order(.below, relativeTo: item.above)
         }
     }
 
