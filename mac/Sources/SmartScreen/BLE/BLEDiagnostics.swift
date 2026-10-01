@@ -588,33 +588,36 @@ enum BLEDiagnostics {
         emit("=====================================")
         emit("찾는 서비스: {\(BLEIds.pcService.uuidString)}")
         emitTerminalPermissionHint()
+        emit("")
+
+        let d = DiagCentral()
+        // 듣지도 못했으면 거기서 끝낸다. 처음 판은 이어서 "주변 BLE 광고가 하나도 안 잡힙니다 - 이 PC 의
+        // 블루투스를 확인하세요" 까지 찍어서, 허용 창에 아직 답하지 않은 사람을 하드웨어 쪽으로 보냈다.
+        if !waitPoweredOn(d) {
+            emitCentralFailure(d)
+            return 1
+        }
+
         emit("\(seconds)초 동안 주변 BLE 광고를 듣습니다...\n")
         emit("다른 PC에서 SmartScreen 을 실행하고 \"시작\" 을 누른 상태여야 합니다.\n")
 
         var total = 0
         var hits = 0
         var seen = Set<UUID>()
-        var code: Int32 = 0
-        let d = DiagCentral()
-        if waitPoweredOn(d) {
-            d.onDiscover = { p, adv, rssi in
-                total += 1
-                let uuids = (adv[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
-                if !uuids.contains(BLEIds.pcService) { return }
-                if !seen.insert(p.identifier).inserted { return }   // 기기별 1회만 출력
-                hits += 1
-                BLEDiagnostics.emit("[발견] \(LocalClock.hhmmss())  주소 \(BLEIds.shortId(p.identifier))  신호 \(rssi) dBm")
-            }
-            // 주변 광고 전체를 센다 (필터 없음) - "주변은 들리는데 SmartScreen 만 안 보인다" 를 가르려고
-            d.manager.scanForPeripherals(withServices: nil,
-                                         options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
-            _ = spin(Double(seconds)) { false }
-            d.manager.stopScan()
-            d.onDiscover = nil
-        } else {
-            emitCentralFailure(d)
-            code = 1
+        d.onDiscover = { p, adv, rssi in
+            total += 1
+            let uuids = (adv[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
+            if !uuids.contains(BLEIds.pcService) { return }
+            if !seen.insert(p.identifier).inserted { return }   // 기기별 1회만 출력
+            hits += 1
+            BLEDiagnostics.emit("[발견] \(LocalClock.hhmmss())  주소 \(BLEIds.shortId(p.identifier))  신호 \(rssi) dBm")
         }
+        // 주변 광고 전체를 센다 (필터 없음) - "주변은 들리는데 SmartScreen 만 안 보인다" 를 가르려고
+        d.manager.scanForPeripherals(withServices: nil,
+                                     options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+        _ = spin(Double(seconds)) { false }
+        d.manager.stopScan()
+        d.onDiscover = nil
 
         emit("\n-------------------------------------")
         emit("주변 광고 \(total)건 수신, 그중 SmartScreen \(hits)대 발견")
@@ -625,11 +628,12 @@ enum BLEDiagnostics {
             emit("\n결과: 주변 BLE 는 잘 들리는데 SmartScreen 광고만 안 보입니다.")
             emit("      그 PC 가 실제로는 광고를 못 내보내고 있습니다.")
         } else {
+            // 여기까지 왔으면 블루투스는 켜져 있고 권한도 있다 (위에서 걸렀다)
             emit("\n결과: 주변 BLE 광고가 하나도 안 잡힙니다.")
-            emit("      이 PC 의 블루투스를 확인하세요.")
+            emit("      이 Mac 의 블루투스를 확인하세요.")
         }
         emit("-------------------------------------")
-        return code
+        return 0
     }
 
     // MARK: - --bt-check
@@ -651,38 +655,52 @@ enum BLEDiagnostics {
 
         let c = DiagCentral()
         let p = DiagPeripheral()
-        _ = spin(10) { c.stateKnown && p.stateKnown }
+        // 허용 창은 다른 두 도구와 같이 중앙 관리자로 기다린다 (같은 안내, 같은 상한). 주변장치 관리자는
+        // 같은 권한을 쓰므로 답이 나면 곧 상태가 온다. 처음 판은 둘을 10초만 기다리고, 그때까지 창에
+        // 답하지 않았으면 "어댑터를 찾을 수 없습니다" 라고 했다.
+        _ = waitPoweredOn(c)
+        _ = spin(3) { p.stateKnown }
         let cs = c.manager.state
         let ps = p.manager.state
-        let denied = BLEIds.authorizationDenied || cs == .unauthorized || ps == .unauthorized
+        // 권한은 앱(여기서는 터미널 앱) 단위라 두 관리자가 같은 답을 받는다. 어느 쪽이 먼저 알아채도 말한다.
+        let prob: BtProblem? = ps == .unauthorized ? .denied : problem(cs)
 
-        var found = false
-        var le = false
+        // 켜져 있거나 꺼져 있을 뿐이면 역할 지원 여부는 안다 (주변장치 관리자가 unsupported 가 아니면 지원)
+        var rolesKnown = false
         var peripheral = false
-        var powered = false
-        if denied {
-            out("[실패] \(permissionText)")
-        } else if !c.stateKnown {
-            out("[실패] 블루투스 어댑터를 찾을 수 없습니다.")
-            out("       블루투스가 꺼져 있거나 어댑터가 없는 PC입니다.")
-        } else {
-            found = true
-            le = cs != .unsupported
-            // 주변장치 관리자가 unsupported 가 아니면 역할을 지원한다 (꺼져 있어도 지원 여부는 안다)
-            peripheral = le && p.stateKnown && ps != .unsupported
-            powered = cs == .poweredOn
-            out("  저전력 블루투스(BLE) 지원 : \(yesNo(le))")
+        switch prob {
+        case .none, .some(.off):
+            rolesKnown = true
+            peripheral = p.stateKnown && ps != .unsupported
+        default:
+            break
+        }
+        if rolesKnown {
+            out("  저전력 블루투스(BLE) 지원 : 예")
             out("  주변장치 역할 지원        : \(yesNo(peripheral))")
-            out("  중앙장치 역할 지원        : \(yesNo(le))")
+            out("  중앙장치 역할 지원        : 예")
             out("  클래식 블루투스 지원      : 예")   // Mac 은 모두 지원한다
+        }
+        // 다른 두 도구와 같은 글자. 이 파일(BtCheck_result.txt)에도 그대로 남는다.
+        if let pr = prob {
+            for line in failureLines(pr) { out(line) }
         }
 
         out("\n-------------------------------------")
-        if denied {
-            out("결과: 블루투스 권한을 켠 뒤 다시 실행해 주세요.")
-        } else if found && le && !powered {
-            out("결과: 블루투스를 켠 뒤 다시 실행해 주세요.")
-        } else if found && le && peripheral {
+        if let pr = prob {
+            switch pr {
+            case .denied:
+                out("결과: 블루투스 권한을 켠 뒤 다시 실행해 주세요.")
+            case .unanswered:
+                out("결과: 블루투스 허용 창에서 [허용] 을 누른 뒤 다시 실행해 주세요.")
+            case .unsupported:
+                out("결과: 이 어댑터로는 SmartScreen을 쓸 수 없습니다. (BLE 미지원)")
+            case .off:
+                out("결과: 블루투스를 켠 뒤 다시 실행해 주세요.")
+            case .notReady:
+                out("결과: 잠시 뒤 다시 실행해 주세요.")
+            }
+        } else if peripheral {
             out("결과: 빠른 모드를 쓸 수 있습니다.\n")
             out("아이폰에 컴패니언 앱(SSBeacon)을 설치하면")
             out("자리를 뜬 뒤 10~15초 안에 화면이 잠깁니다.\n")
@@ -692,15 +710,11 @@ enum BLEDiagnostics {
             out("       일부 USB 동글은 \"예\" 라고 답하면서도 전파를 못 내보냅니다.")
             out("       SmartScreen 을 실행해 폰 앱이 연결되는지로 확인하세요.")
             out("       또는 다른 PC 에서 AdvScan.exe 를 돌려 송출을 확인하세요.")
-        } else if found && le {
+        } else {
             out("결과: 빠른 모드를 쓸 수 없습니다. (주변장치 역할 미지원)\n")
             out("느린 모드로는 동작합니다. 다만 아이폰은 잠금 상태에서")
             out("신호를 거의 안 보내므로 감지가 느리거나 끊깁니다.")
             out("블루투스 5.0 이상 USB 동글을 쓰면 빠른 모드가 될 수 있습니다.")
-        } else if found {
-            out("결과: 이 어댑터로는 SmartScreen을 쓸 수 없습니다. (BLE 미지원)")
-        } else {
-            out("결과: 블루투스를 켠 뒤 다시 실행해 주세요.")
         }
         out("-------------------------------------")
 
@@ -715,25 +729,81 @@ enum BLEDiagnostics {
 
     // MARK: - 공통
 
-    /// 이 명령을 실행한 터미널 앱의 이름. macOS 는 블루투스 권한을 그 앱에 묻고 그 이름으로 보인다.
-    private static var terminalAppName: String {
+    /// 블루투스 허용 창에 답하기를 기다리는 상한 (초). 앱의 BLE 직접 등록은 같은 일을 30초 기다린다
+    /// (AdvScanner.registerWaitCapSec) - 그쪽은 [등록하기] 를 누른 사람이 창을 기다리고 있지만, 이
+    /// 도구는 명령을 붙여 넣은 사람이 설명서와 출력을 읽고 나서야 "터미널" 이름으로 뜬 처음 보는 창을
+    /// 찾는다. 그래서 두 배를 준다. 처음 판은 10초 뒤에야 안내를 찍고 그 뒤 50초만 기다려서, 창이
+    /// 뜬 줄 모르는 동안 시간이 지나갔다.
+    private static let permissionWaitSec = 60
+    /// 허용 창 안내는 실행마다 한 번 (--probe-scan 은 관리자를 둘 만든다).
+    private static var permissionPromptAnnounced = false
+
+    /// 이 명령을 실행한 터미널 앱의 이름 (macOS 가 블루투스 권한을 묻는 이름). 모르는 앱이면 nil.
+    private static var terminalAppName: String? {
         switch ProcessInfo.processInfo.environment["TERM_PROGRAM"] ?? "" {
-        case "", "Apple_Terminal": return "터미널"
+        case "Apple_Terminal": return "터미널"
         case "iTerm.app": return "iTerm"
         case "vscode": return "Visual Studio Code"
         case "WarpTerminal": return "Warp"
-        case let other: return other
+        default: return nil
         }
     }
 
-    /// 권한이 없을 때. 앱의 문구("SmartScreen 을 켜 주세요")와 다르다 - 여기서 켤 것은 터미널 앱이다.
-    private static var permissionText: String {
-        return "블루투스 권한이 없어요. 시스템 설정 > 개인정보 보호 및 보안 > 블루투스에서 "
-            + "\"\(terminalAppName)\" (이 명령을 실행한 앱) 을 켠 뒤 다시 실행하세요."
+    /// 문장에 넣을 이름: 아는 앱은 따옴표로 ("터미널"), 모르면 풀어서 쓴다. 뒤에 조사를 붙이지 않게
+    /// 문장을 짠다 ("터미널" 을 / "Visual Studio Code" 를 처럼 이름마다 조사가 달라진다).
+    private static var terminalAppLabel: String {
+        if let n = terminalAppName { return "\"\(n)\"" }
+        return "이 명령을 실행한 터미널 앱"
+    }
+
+    /// 블루투스를 쓸 수 없는 이유. 세 도구가 같은 갈래, 같은 글자를 쓴다 (emitCentralFailure, --bt-check).
+    private enum BtProblem {
+        case denied              // 허용 안 함 (또는 관리 정책)
+        case unanswered          // 허용 창에 아직 답하지 않았다
+        case unsupported         // 블루투스 하드웨어가 없거나 쓸 수 없다
+        case off                 // 꺼져 있다
+        case notReady(CBManagerState)   // 그 밖의 unknown / resetting
+    }
+
+    /// nil = 켜져 있고 쓸 수 있다.
+    private static func problem(_ st: CBManagerState) -> BtProblem? {
+        if BLEIds.authorizationDenied || st == .unauthorized { return .denied }
+        switch st {
+        case .poweredOn: return nil
+        case .poweredOff: return .off
+        case .unsupported: return .unsupported
+        default:
+            return CBManager.authorization == .notDetermined ? .unanswered : .notReady(st)
+        }
+    }
+
+    /// "[실패] ..." 줄들. Windows 판의 "블루투스가 꺼져 있거나 어댑터가 없는 PC입니다" 는 Mac 에서 맞지
+    /// 않아 쓰지 않는다 - 꺼짐은 .poweredOff 로 따로 오고, 처음 판은 허용 창에 아직 답하지 않은 것(상태
+    /// unknown)까지 "어댑터를 찾을 수 없습니다" 로 말했다.
+    private static func failureLines(_ p: BtProblem) -> [String] {
+        switch p {
+        case .denied:
+            // 앱의 문구("SmartScreen 을 켜 주세요")와 다르다 - 여기서 켤 것은 터미널 앱이다.
+            // 목록에 SmartScreen 도 있으면 사람은 그것을 켜고 왜 안 되는지 모른다.
+            let who: String = terminalAppName.map { "(\"\($0)\")" } ?? ""
+            let where1: String = "       시스템 설정 > 개인정보 보호 및 보안 > 블루투스에서 \(terminalAppLabel) 항목을 켠 뒤 "
+            let where2: String = "같은 명령을 다시 실행하세요."
+            let why1: String = "       SmartScreen 항목이 아닙니다 - 터미널에서 실행한 명령의 블루투스 권한은 그것을 실행한 "
+            let why2: String = "앱\(who)이 받습니다."
+            return ["[실패] 블루투스 권한이 없습니다.", where1 + where2, why1 + why2]
+        case .unanswered:
+            return ["[실패] 블루투스 허용 창에 답하지 않았습니다. [허용] 을 누른 뒤 같은 명령을 다시 실행하세요."]
+        case .unsupported:
+            return ["[실패] 블루투스 어댑터를 찾을 수 없습니다."]
+        case .off:
+            return ["[실패] 블루투스가 꺼져 있습니다. 제어 센터나 시스템 설정 > 블루투스에서 켠 뒤 다시 실행하세요."]
+        case .notReady(let st):
+            return ["[실패] 블루투스가 준비되지 않았습니다 (상태 \(BLEIds.stateName(st))). 잠시 뒤 다시 실행하세요."]
+        }
     }
 
     private static func emitTerminalPermissionHint() {
-        emit("※ 블루투스 허용 창이 \"\(terminalAppName)\" 이름으로 뜰 수 있습니다. [허용] 을 누르세요.")
+        emit("※ 블루투스 허용 창이 \(terminalAppLabel) 이름으로 뜰 수 있습니다. [허용] 을 누르세요.")
         emit("  (터미널에서 실행하면 macOS 는 블루투스 권한을 SmartScreen 이 아니라 그 앱에 묻습니다)")
     }
 
@@ -777,27 +847,33 @@ enum BLEDiagnostics {
         return true
     }
 
+    /// 관리자가 켜지기를 기다린다. 켜졌으면 true.
+    /// 처음 실행하면 관리자를 만드는 순간 macOS 가 허용 창을 띄우고, 답할 때까지 권한은 notDetermined,
+    /// 상태는 unknown 이다. 그동안은 그렇다고 한 번 말하고 permissionWaitSec 까지 기다린다.
     private static func waitPoweredOn(_ d: DiagCentral) -> Bool {
-        _ = spin(10) { d.stateKnown }
-        if !d.stateKnown && CBManager.authorization == .notDetermined {
-            // 허용 창이 떠서 답을 기다리는 중이다. 처음 보는 창이라 읽고 누를 시간을 더 준다.
-            emit("블루투스 허용 창이 떴으면 [허용] 을 누르세요. 기다립니다...")
-            _ = spin(50) { d.stateKnown }
+        // 이미 답한 Mac 이면 상태는 곧 온다. 이 짧은 기다림 뒤에도 답이 없으면 창이 떠 있는 것이다.
+        _ = spin(1.5) { d.stateKnown }
+        if d.manager.state != .poweredOn && CBManager.authorization == .notDetermined {
+            if !permissionPromptAnnounced {
+                permissionPromptAnnounced = true
+                let whose = terminalAppName.map { "\"\($0)\" 의" } ?? "이 명령을 실행한 터미널 앱의"
+                emit("\(whose) 블루투스 허용 창에서 [허용] 을 누르세요 - 기다리는 중 (최대 \(permissionWaitSec)초)")
+            }
+            // 답하면 권한이 정해지고 상태가 온다 (허용 = poweredOn, 허용 안 함 = unauthorized)
+            _ = spin(Double(permissionWaitSec)) {
+                d.manager.state == .poweredOn || (d.stateKnown && CBManager.authorization != .notDetermined)
+            }
+        } else if !d.stateKnown {
+            // 권한은 정해졌는데 상태가 아직이다 (재설정 중 등). 예전처럼 10초까지 본다.
+            _ = spin(8.5) { d.stateKnown }
         }
         return d.manager.state == .poweredOn
     }
 
     /// 블루투스를 쓸 수 없을 때의 안내 (Windows 의 "[실패] BLE 오류 0x..." 자리).
     private static func emitCentralFailure(_ d: DiagCentral) {
-        let st = d.manager.state
-        if BLEIds.authorizationDenied || st == .unauthorized {
-            emit("[실패] \(permissionText)")
-        } else if st == .unsupported || !d.stateKnown {
-            emit("[실패] 블루투스 어댑터를 찾을 수 없습니다.")
-            emit("       블루투스가 꺼져 있거나 어댑터가 없는 PC입니다.")
-        } else {
-            emit("결과: 블루투스를 켠 뒤 다시 실행해 주세요.")
-        }
+        let p = problem(d.manager.state) ?? .notReady(d.manager.state)
+        for line in failureLines(p) { emit(line) }
     }
 
     /// 도구용 상태 글자 (Windows ProbeScan 의 StatusText).

@@ -106,7 +106,7 @@ final class CoreCTests: XCTestCase {
 
     func testResultPages() {
         XCTAssertEqual(LoopbackRequest.successBody,
-                       "<!doctype html><meta charset=utf-8><title>SmartScreen</title><body style=\"font-family:sans-serif;text-align:center;padding-top:80px\"><h2>로그인되었습니다</h2><p>이 창을 닫고 SmartScreen 으로 돌아가세요.</p>")
+                       "<!doctype html><meta charset=utf-8><title>SmartScreen</title><body style=\"font-family:sans-serif;text-align:center;padding-top:80px\"><h2>로그인되었습니다</h2><p>이 탭을 닫으세요. 결과 창이 안 보이면 화면 오른쪽 위 작은 상자의 [설정] 을 누르세요.</p>")
         XCTAssertEqual(LoopbackRequest.failureBody,
                        "<!doctype html><meta charset=utf-8><title>SmartScreen</title><body style=\"font-family:sans-serif;text-align:center;padding-top:80px\"><h2>로그인하지 못했습니다</h2><p>SmartScreen 에서 다시 시도하세요.</p>")
 

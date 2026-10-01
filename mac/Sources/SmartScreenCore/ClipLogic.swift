@@ -175,6 +175,16 @@ public enum ClipLogic {
         return false
     }
 
+    /// 다른 Apple 기기(아이폰, 아이패드, 다른 Mac)에서 복사해 유니버설 클립보드로 넘어온 것. macOS 가 그
+    /// 항목에 이 형식을 붙인다. 보내지 않는다: 폰에서 복사한 것(인증 문자, 폰의 암호 관리자에서 꺼낸 값)이
+    /// 사용자가 모르는 사이에 서버를 지나 Windows PC 의 클립보드에까지 붙었다. 형식 목록만 보므로 폰에서
+    /// 내용을 끌어오지 않는다 (약속된 데이터라 읽는 순간 가져온다).
+    /// optOutTypes 에 넣지 않는다 - 거기 들면 "복사한 앱이 공유하지 말라고 표시" 라고 상태 줄에 뜨는데,
+    /// 그런 표시를 단 앱은 없다. 부르는 쪽이 따로 다룬다 (말없이 건너뛰고 로그에 한 번).
+    public static func isRemoteAppleCopy(types: [String]) -> Bool {
+        return types.contains("com.apple.is-remote-clipboard")
+    }
+
     /// 파일 복사. Windows 는 CF_HDROP 만 올라오므로 아무것도 보내지 않는다. Finder 는 파일 URL 옆에
     /// 파일 이름을 글로(그리고 아이콘 그림을) 같이 올리므로, 이걸 먼저 보지 않으면 Mac 만 파일
     /// 이름을 보내게 된다.

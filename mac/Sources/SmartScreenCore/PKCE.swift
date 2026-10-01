@@ -126,8 +126,13 @@ public enum LoopbackRequest {
 
     // 브라우저에 남길 화면. 여기서 창을 닫으라고 말해 주지 않으면 사용자는 로그인이
     // 끝났는지 알 수 없다. (교환 전에 보낸다 - Windows 와 같다.)
+    // 돌아가는 길은 Mac 만 적는다 (Windows 는 "SmartScreen 으로 돌아가세요"). Windows 는 작업 표시줄이
+    // 있지만, 이 앱은 Dock 에도 Cmd-Tab 에도 없고, macOS 14+ 는 브라우저를 쓰는 중인 사용자에게서
+    // 우리 앱으로 초점을 넘기지 않는다 - 결과 상자가 브라우저 뒤에 있으면 돌아갈 곳이 안 보인다.
+    // 결과 상자는 떠 있는 층으로 올리지만(Alerts), 그것도 안 보일 때 남는 길이 오버레이의 [설정] 이다.
     public static let successBody: String =
-        pageHead + "<h2>로그인되었습니다</h2><p>이 창을 닫고 SmartScreen 으로 돌아가세요.</p>"
+        pageHead + "<h2>로그인되었습니다</h2><p>이 탭을 닫으세요. "
+        + "결과 창이 안 보이면 화면 오른쪽 위 작은 상자의 [설정] 을 누르세요.</p>"
 
     public static let failureBody: String =
         pageHead + "<h2>로그인하지 못했습니다</h2><p>SmartScreen 에서 다시 시도하세요.</p>"

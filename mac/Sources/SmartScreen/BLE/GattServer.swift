@@ -11,6 +11,13 @@ import SmartScreenCore
 ///
 /// 보안 (그대로 옮긴 미해결 항목): 이 경로는 폰을 식별하지 않는다. 연결해 오는 SSBeacon 폰은
 /// 누구 것이든 믿는다. 고치려면 iOS/Windows 와 함께 프로토콜을 바꿔야 한다.
+///
+/// [중지] 는 광고와 TICK 만 멈추고 서비스는 내리지 않는다 (stopOnQueue). CBPeripheralManager 는 붙어
+/// 있는 central 을 끊을 수 없어서, 서비스를 지우면 아이폰은 무효가 된 핸들을 든 채 계속 붙어 있고
+/// 다시 구독하지 않는다 - 처음 판은 [중지] -> [시작] 한 번에 그 세션 내내 GATT 경로가 죽었다. 그래서
+/// 서비스와 구독 기록을 그대로 두고, [시작] 이 남아 있는 구독자를 새 구독처럼 받아들인다. 서비스를
+/// 지우고 다시 올리는 것은 블루투스가 꺼졌다 켜졌을 때(그때는 연결도 이미 끊겼다)와 암호화 설정이
+/// 바뀌었을 때뿐이다. 폰 앱이 서비스 변경을 알아채고 다시 구독하게 되더라도 여기는 그것에 기대지 않는다.
 final class GattServer: NSObject, CBPeripheralManagerDelegate {
     static let shared = GattServer()
 
@@ -48,10 +55,11 @@ final class GattServer: NSObject, CBPeripheralManagerDelegate {
     private var running = false
     private var plain = true
     private var kalman = KalmanFilter(processNoise: 4.0, measureNoise: 10.0)   // 1Hz 샘플링: v1(Q=1)보다 빠르게 반응
-    private var subs = Set<UUID>()               // TICK 구독자 (central identifier)
+    private var subs = Set<UUID>()               // TICK 구독자 (central identifier). [중지] 동안에도 적는다
     private var tickChar: CBMutableCharacteristic?
-    private var serviceAdded = false
+    private var serviceAdded = false             // [중지] 를 넘어 남는다 (꺼짐/재설정이 지운다)
     private var addPending = false
+    private var addedPlain = true                // 올렸거나 올리는 중인 서비스의 plain 값
     private var lastAddErrorCode: Int?
     private var advStartPending = false
     private var advStartTick: UInt64 = 0
@@ -87,7 +95,7 @@ final class GattServer: NSObject, CBPeripheralManagerDelegate {
         var waitSem: DispatchSemaphore?
         BLEIds.sync {
             if running { stopOnQueue() }
-            resetState()
+            resetState()   // 구독 기록(subs)은 남긴다 - 아래에서 이어받는다
             self.plain = plain
             if pm == nil {
                 pm = CBPeripheralManager(delegate: self, queue: BLEIds.queue, options: nil)
@@ -123,9 +131,12 @@ final class GattServer: NSObject, CBPeripheralManagerDelegate {
                 lock.lock()
                 pubRunning = true
                 lock.unlock()
-                startTickTimer()
-                if m.state == .poweredOn { addService() }   // 아니면 켜지는 순간 state 콜백이 올린다
+                if m.state == .poweredOn { resumeService() }   // 아니면 켜지는 순간 state 콜백이 올린다
                 EventLog.write("GATT server started (\(plain ? "plain" : "encryption required"))")
+                // [중지] 동안에도 붙어 있던 폰을 새 구독처럼 받아들인 다음에 200 ms 틱을 건다. 구독자 수,
+                // 첫 간격, 기준 시각이 한 번에 게시된 뒤에 틱이 간격을 이어서 고친다 (새 구독과 같은 상태).
+                adoptKeptSubscribers()
+                startTickTimer()
                 ok = true
             }
         }
@@ -168,6 +179,8 @@ final class GattServer: NSObject, CBPeripheralManagerDelegate {
 
     // MARK: - 내부
 
+    /// 세션마다 새로 시작하는 값. subs 는 지우지 않는다: 이어지는 연결이 있으면 start 가
+    /// adoptKeptSubscribers 로 이어받고, 그때 everSubscribed 와 기준 시각을 다시 세운다.
     private func resetState() {
         lock.lock()
         pubSubCount = 0
@@ -179,7 +192,6 @@ final class GattServer: NSObject, CBPeripheralManagerDelegate {
         pubEverSubscribed = false
         pubIntervalMs = 0
         lock.unlock()
-        subs.removeAll()
         kalman.reset()
         seq = 0
         lastSent = 0
@@ -190,6 +202,11 @@ final class GattServer: NSObject, CBPeripheralManagerDelegate {
         firstAdvLogPending = true
     }
 
+    /// 프로세스 안의 [중지]. 광고와 TICK 틱만 멈춘다.
+    /// 서비스(tickChar, serviceAdded)와 구독 기록(subs)은 그대로 둔다 - 클래스 머리말. 처음 판은 여기서
+    /// removeAllServices 하고 subs 를 비웠는데, 아이폰은 끊기지 않은 채 무효가 된 핸들을 들고 남아서
+    /// 다음 [시작] 의 새 서비스에 다시 구독하지 않았다. 멈춰 있는 동안 폰이 쓰는 RSSI 는 버리고
+    /// (didReceiveWrite), 구독이 끊기면 subs 에서만 뺀다 (판정에는 알리지 않는다).
     private func stopOnQueue() {
         guard running else { return }
         running = false
@@ -197,14 +214,9 @@ final class GattServer: NSObject, CBPeripheralManagerDelegate {
         tickTimer = nil
         if let m = pm, m.state == .poweredOn {
             m.stopAdvertising()
-            m.removeAllServices()
         }
-        tickChar = nil
-        serviceAdded = false
-        addPending = false
         advStartPending = false
         pendingRestartLog = nil
-        subs.removeAll()
         // everSubscribed / lostTick 은 여기서 되돌리지 않는다 (Windows 와 같다)
         lock.lock()
         pubRunning = false
@@ -215,12 +227,36 @@ final class GattServer: NSObject, CBPeripheralManagerDelegate {
         csv = nil
     }
 
+    /// [시작] 의 서비스: 올라가 있고 암호화 설정이 같으면 그대로 쓰고 광고만 다시 건다. 그래야 [중지]
+    /// 동안 붙어 있던 폰의 핸들이 살아 있다. 아직 없거나 설정이 바뀌었을 때만 새로 올린다.
+    private func resumeService() {
+        if (serviceAdded || addPending) && addedPlain == plain {
+            if serviceAdded { startAdvertising() }   // 올리는 중이면 didAdd 가 건다
+            return
+        }
+        if (serviceAdded || addPending) && !subs.isEmpty {
+            // 권한이 다른 특성으로 바꿔야 한다. 붙어 있던 폰의 핸들은 무효가 되고, 폰은 다시 구독하지
+            // 않을 수 있다 (끊고 다시 붙어야 한다). 이번 세션에는 이어받지 않는다.
+            subs.removeAll()
+            EventLog.write("GATT service re-added (encryption setting changed) - existing subscription dropped")
+        }
+        addService()
+    }
+
     /// 서비스 7A1C0010 (TICK notify + RSSI write) 를 올린다. 광고는 didAdd 다음에 건다.
+    /// 처음 올릴 때, 꺼졌다 켜졌을 때, 암호화 설정이 바뀌었을 때, 올리기가 실패해 다시 할 때만 온다.
     private func addService() {
         guard running, let m = pm, m.state == .poweredOn else { return }
         // 같은 UUID 서비스가 둘 생기지 않게 먼저 비운다
         if m.isAdvertising { m.stopAdvertising() }
         m.removeAllServices()
+        // 지운 서비스에 걸려 있던 구독도 같이 사라진다 (위 갈래들에서는 이미 비어 있다 - 지키기만 한다)
+        if !subs.isEmpty {
+            let prev = subs.count
+            subs.removeAll()
+            subscribersChanged(from: prev, to: 0)
+        }
+        addedPlain = plain
         // 본딩된 기기의 암호화 연결만 허용하는 모드 (bleGattEncrypt=1, 페어링을 부른다)
         let readPerm: CBAttributePermissions = plain ? [.readable] : [.readEncryptionRequired]
         let writePerm: CBAttributePermissions = plain ? [.writeable] : [.writeEncryptionRequired]
@@ -309,8 +345,19 @@ final class GattServer: NSObject, CBPeripheralManagerDelegate {
         return 3000                                         // 오래 가만히 있음: 느리게
     }
 
-    /// 구독자 수가 바뀌었다 (0->N, N->0 규칙).
-    private func subscribersChanged(from prev: Int, to n: Int) {
+    /// [시작]: [중지] 동안에도 끊기지 않은 구독자가 있으면 새 구독(0 -> N)과 같은 길로 받아들인다 -
+    /// everSubscribed, 폴링 기준 시각, "이번 구독 뒤 보고 없음"(lastReportTick = 0), 그리고 판정을 깨우기
+    /// 전에 간격부터 정하는 순서까지 같다 (subscribersChanged). 판정 쪽 계약(gattExpected / everSubscribed /
+    /// 유예)은 그대로다: 폰이 실제로는 응답하지 않으면 새 구독이 그랬을 때와 같이 보고가 늦어 healthy 가
+    /// 꺼지고, 광고도 안 들리면 부재로 판정된다.
+    private func adoptKeptSubscribers() {
+        if subs.isEmpty { return }
+        subscribersChanged(from: 0, to: subs.count, kept: true)
+    }
+
+    /// 구독자 수가 바뀌었다 (0->N, N->0 규칙). 감시 중에만 부른다.
+    /// kept: [시작] 이 [중지] 를 넘어 이어진 구독을 받아들이는 것 (로그 글자만 다르다).
+    private func subscribersChanged(from prev: Int, to n: Int, kept: Bool = false) {
         let now = Mono.now()
         let firstSub = n > 0 && prev == 0
         // 새 구독이면 폴링 간격을 여기서 바로 정해 구독과 한 번에 내놓는다 (200 ms 틱과 같은 규칙).
@@ -342,7 +389,7 @@ final class GattServer: NSObject, CBPeripheralManagerDelegate {
         lock.unlock()
         if firstSub {
             kalman.reset()
-            EventLog.write("GATT client subscribed")
+            EventLog.write(kept ? "GATT client subscribed (kept across restart)" : "GATT client subscribed")
         }
         if let r = lostRssi {
             EventLog.write("GATT client lost (last rssi=\(r) dBm)")
@@ -383,28 +430,29 @@ final class GattServer: NSObject, CBPeripheralManagerDelegate {
             EventLog.write("GATT peripheral state: \(BLEIds.stateName(st))")
         }
         loggedState = st
-        guard running else { return }
 
         if st == .poweredOn {
-            // 다시 켜졌다: 서비스를 다시 올리고 광고한다
-            if !serviceAdded && !addPending { addService() }
+            // 다시 켜졌다: 서비스를 다시 올리고 광고한다 (멈춰 있으면 다음 [시작] 이 올린다).
+            // 서비스를 지우고 다시 올리는 것은 이 길(꺼짐/재설정 뒤)과 암호화 설정이 바뀐 [시작] 뿐이다.
+            if running && !serviceAdded && !addPending { addService() }
             return
         }
-        // 꺼짐/재설정/권한 없음: 올린 서비스와 연결이 모두 사라진다
+        // 꺼짐/재설정/권한 없음: 올린 서비스와 연결이 모두 사라진다. 멈춰 있을 때도 적어 둔다 - 안 그러면
+        // 다음 [시작] 이 사라진 서비스와 끊긴 구독을 그대로 쓴다고 믿는다.
         serviceAdded = false
         addPending = false
         advStartPending = false
         if !subs.isEmpty {
             let prev = subs.count
             subs.removeAll()
-            subscribersChanged(from: prev, to: 0)
+            if running { subscribersChanged(from: prev, to: 0) }
         }
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didAdd service: CBService, error: Error?) {
         addPending = false
-        guard running else { return }
         if let e = error {
+            guard running else { return }
             // 3초 점검이 다시 시도한다. 같은 오류는 한 번만 남긴다.
             let code = (e as NSError).code
             if lastAddErrorCode != code {
@@ -414,8 +462,9 @@ final class GattServer: NSObject, CBPeripheralManagerDelegate {
             return
         }
         lastAddErrorCode = nil
+        // [중지] 사이에 끝났어도 올라간 것은 맞다 - 다음 [시작] 이 그대로 쓴다 (resumeService)
         serviceAdded = true
-        startAdvertising()
+        if running { startAdvertising() }
     }
 
     func peripheralManagerDidStartAdvertising(_ peripheral: CBPeripheralManager, error: Error?) {
@@ -434,20 +483,30 @@ final class GattServer: NSObject, CBPeripheralManagerDelegate {
         }
     }
 
+    // 구독 기록은 [중지] 동안에도 고친다 - 다음 [시작] 이 끊긴 구독을 이어받으면 안 되고, 남은 구독은
+    // 이어받아야 한다 (adoptKeptSubscribers). 판정에 알리는 것(subscribersChanged)은 감시 중에만 한다.
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral,
                            didSubscribeTo characteristic: CBCharacteristic) {
-        guard running, characteristic.uuid == BLEIds.tick else { return }
+        guard characteristic.uuid == BLEIds.tick else { return }
         let prev = subs.count
         subs.insert(central.identifier)
-        subscribersChanged(from: prev, to: subs.count)
+        if running {
+            subscribersChanged(from: prev, to: subs.count)
+        } else if prev == 0 && !subs.isEmpty {
+            EventLog.write("GATT client subscribed while stopped")
+        }
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral,
                            didUnsubscribeFrom characteristic: CBCharacteristic) {
-        guard running, characteristic.uuid == BLEIds.tick else { return }
+        guard characteristic.uuid == BLEIds.tick else { return }
         let prev = subs.count
         subs.remove(central.identifier)
-        subscribersChanged(from: prev, to: subs.count)
+        if running {
+            subscribersChanged(from: prev, to: subs.count)
+        } else if prev > 0 && subs.isEmpty {
+            EventLog.write("GATT client lost while stopped")
+        }
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {

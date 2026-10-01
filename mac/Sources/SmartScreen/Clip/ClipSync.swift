@@ -31,8 +31,10 @@ import SmartScreenCore
 // Windows 와 다른 점 (spec clipsync §7)
 // ---------------------------------------------------------------------------
 //  - 알림이 없다 (WM_CLIPBOARDUPDATE 없음). 전용 직렬 큐에서 300 ms 마다 changeCount 를 본다.
-//    메인이 아니라 전용 큐인 이유: 약속된 데이터(Universal Clipboard, 늦은 제공자)를 읽는 데
-//    몇 초가 걸릴 수 있고, 그동안 메인(잠금 화면)이 멎으면 안 된다.
+//    메인이 아니라 전용 큐인 이유: 약속된 데이터(늦은 제공자)를 읽는 데 몇 초가 걸릴 수 있고,
+//    그동안 메인(잠금 화면)이 멎으면 안 된다.
+//  - 다른 Apple 기기에서 넘어온 것(유니버설 클립보드, com.apple.is-remote-clipboard)은 보내지 않는다.
+//    Windows 판에는 이 갈래가 없다. 형식 목록만 보고 거르므로 폰에서 내용을 끌어오지도 않는다.
 //  - 받은 것을 붙이기 직전에 한 번 더 본다 (pasteboardTick). Windows 에서는 "부치기 전에 한 복사" 의
 //    알림이 붙이기 메시지보다 큐 앞에 있어서 저절로 먼저 처리된다. 폴링에서는 그 복사를 아직 못 봤을
 //    수 있으므로 직접 본다.
@@ -255,6 +257,8 @@ private enum ClipRead {
     case optedOut
     /// macOS 가 이 앱의 읽기를 막았다 (Mac 만).
     case denied
+    /// 다른 Apple 기기에서 복사해 유니버설 클립보드로 넘어왔다 (Mac 만). 보내지 않는다.
+    case remoteApple
     /// 넘길 수 있는 형식이 없다 (파일 복사, PDF 만 등). 늘 있는 일이라 말하지 않는다.
     case nothing
 }
@@ -267,6 +271,9 @@ private enum ClipBoardIO {
 
         // 1. 무엇이든 읽기 전에 본다. 형식 목록만 보므로 내용을 읽지 않고, 해시도 남지 않는다.
         if ClipLogic.isOptedOut(types: names) { return .optedOut }
+        // 1-1. 아이폰·아이패드에서 복사해 넘어온 것(유니버설 클립보드)은 다른 PC 로 보내지 않는다. 역시 어떤
+        //      내용도 읽기 전에 본다 - 그 내용은 약속된 데이터라, 읽는 순간 폰에서 끌어온다.
+        if ClipLogic.isRemoteAppleCopy(types: names) { return .remoteApple }
         // 2. 파일 복사는 넘기지 않는다 (Windows 의 CF_HDROP). Finder 가 같이 올리는 파일 이름 글을
         //    보내지 않게 글보다 먼저 본다.
         if ClipLogic.isFileCopy(types: names) { return .nothing }
@@ -411,6 +418,7 @@ private final class ClipRun {
     var lastSeenChangeCount = 0
     var timer: DispatchSourceTimer?
     var deniedLogged = false
+    var remoteLogged = false
 
     // ---- 일꾼만 ----
     /// 조회가 연달아 실패한 횟수.
@@ -747,6 +755,15 @@ private final class ClipEngine {
         case .nothing:
             // 넘길 형식이 없는 것은 늘 있는 일이라 상태를 흔들지 않는다 (파일 복사 등).
             locked { localGen &+= 1 }
+        case .remoteApple:
+            // .nothing 과 같이 다룬다: 상태 줄은 그대로, 다만 새 복사이기는 하다 (폰에서 방금 복사한 것
+            // 위에 가지러 갔던 남의 것을 덮으면 안 된다). 로그는 실행마다 한 번 - 폰에서 복사할 때마다
+            // 남기면 줄이 쌓인다. 내용은 읽지 않았으므로 로그에도 없다.
+            locked { localGen &+= 1 }
+            if !run.remoteLogged {
+                run.remoteLogged = true
+                EventLog.write("clip: not sent - copied on another Apple device (Universal Clipboard)")
+            }
         case .payload(let p):
             // 이 비교에는 일부러 기한을 두지 않았다.
             //

@@ -99,6 +99,16 @@ enum Alerts {
             }
         }
 
+        // macOS 14 부터 activate() 는 부탁일 뿐이고, 사용자가 다른 앱(로그인하던 브라우저)을 쓰는 중이면
+        // 거절된다. 이 앱은 LSUIElement 라 Dock 에도 Cmd-Tab 에도 없어서, 거절되면 알림이 브라우저 뒤에
+        // 열린 채 아무도 못 본다 (로그인 결과 상자가 그랬다). 그때만 알림 창을 떠 있는 층에 올려 앞에
+        // 놓는다 - 초점은 빼앗지 못해도 보이기는 한다. 활성화가 된 경우에는 손대지 않는다.
+        if !NSApplication.shared.isActive {
+            alert.layout()
+            alert.window.level = .floating
+            alert.window.orderFrontRegardless()
+        }
+
         let response = alert.runModal()
         let index = response.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
         if index >= 0 && index < buttons.count {

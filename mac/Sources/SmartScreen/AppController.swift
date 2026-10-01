@@ -131,6 +131,8 @@ final class AppController: NSObject, GuardEngineHost {
     private var startAfterRegister = false
     /// 로그인 결과의 이메일 (등록 완료 상자에 쓴다)
     private var lastLoginEmail = ""
+    /// 잠자기 / 화면 꺼짐 알림의 구독 (observePowerEvents). 앱이 사는 동안 쥔다.
+    private var powerObservers: [NSObjectProtocol] = []
 
     // 업데이트 (UpdateTick)
     private var updLastCheck: UInt64 = 0
@@ -180,6 +182,7 @@ final class AppController: NSObject, GuardEngineHost {
         // 로그를 읽을 때 이 줄로 실행을 가른다. Mac 은 세션 복원이 백그라운드에서 끝나므로 그 결과
         // 줄보다 먼저, 이 실행의 첫 줄로 남긴다.
         EventLog.write("start: SmartScreen \(BuildInfo.version)")
+        observePowerEvents()
         Updater.cleanupAfterStart()
         // 창이 하나도 안 보이는 앱이라 자동 종료 대상이 되면 안 된다 (화면을 지키는 프로그램이다)
         ProcessInfo.processInfo.disableAutomaticTermination("SmartScreen guards the screen")
@@ -244,6 +247,28 @@ final class AppController: NSObject, GuardEngineHost {
         // (Mac 에는 페어링된 Classic 기기 목록이 없으므로 btAddress 로 고르는 갈래는 없다.)
         if hasPhoneEntry {
             DispatchQueue.main.async { [weak self] in self?.startMon() }
+        }
+    }
+
+    /// 잠자기와 화면 꺼짐을 events.log 에 남긴다 ("SLEEP" / "WAKE" / "DISPLAY OFF" / "DISPLAY ON").
+    /// 행동은 바꾸지 않는다 (잠자기를 막는 전원 assertion 도 잡지 않는다) - 기록만 한다.
+    ///
+    /// 왜: 맥북은 배터리로 쓰면 2분쯤 뒤 화면을 끄고 곧 잠든다 (전원을 꽂으면 10분). 그 뒤에는 이 앱도
+    /// 멎어 있어서 돌아와도 아무것도 풀 수 없고, macOS 가 Touch ID / 암호를 묻는다 - 정상인데 사용자는
+    /// "안 풀렸다" 고 알려 온다. 이 줄들이 있으면 events.log 만 보고 "그때 Mac 이 자고 있었다 / 화면이
+    /// 꺼져 있었다" 를 가를 수 있다. NSWorkspace 의 알림은 메인으로 온다 (queue: .main).
+    private func observePowerEvents() {
+        let nc = NSWorkspace.shared.notificationCenter
+        let lines: [(Notification.Name, String)] = [
+            (NSWorkspace.willSleepNotification, "SLEEP"),
+            (NSWorkspace.didWakeNotification, "WAKE"),
+            (NSWorkspace.screensDidSleepNotification, "DISPLAY OFF"),
+            (NSWorkspace.screensDidWakeNotification, "DISPLAY ON"),
+        ]
+        for (name, line) in lines {
+            powerObservers.append(nc.addObserver(forName: name, object: nil, queue: .main) { _ in
+                EventLog.write(line)
+            })
         }
     }
 
@@ -1171,6 +1196,16 @@ final class AppController: NSObject, GuardEngineHost {
         }
     }
 
+    /// 등록·로그인 결과 상자를 띄우기 직전에 간단 창도 초점을 빼앗지 않고 앞에 놓는다 (업데이트 띠와 같은
+    /// orderFrontRegardless). 결과는 사용자가 브라우저에 있을 때 오는데, macOS 14+ 는 그때 우리 앱의
+    /// 활성화를 거절하고 이 앱은 Dock 도 Cmd-Tab 도 없다. 상자는 Alerts 가 떠 있는 층으로 올리지만,
+    /// 상자를 닫은 뒤 바뀐 "내 폰" 줄을 보여 줄 창도 앞에 있어야 돌아올 곳이 보인다.
+    /// 부르는 곳은 모두 타이머 콜백이나 단추 동작이다 (main.async 블록 안이 아니다).
+    private func showSimpleForResult() {
+        guard !isExiting, let s = simple else { return }
+        s.showWithoutActivating()
+    }
+
     /// WM_LOGIN_RESULT
     private func onLoginResult(_ r: LoginResult) {
         loginBusy = false
@@ -1178,6 +1213,7 @@ final class AppController: NSObject, GuardEngineHost {
 
         if !r.ok {
             EventLog.write("google login failed: \(r.err)")
+            showSimpleForResult()
             Alerts.warning("로그인하지 못했습니다.\n\n\(r.err)", title: AppController.registerTitle)
             return
         }
@@ -1211,6 +1247,8 @@ final class AppController: NSObject, GuardEngineHost {
                                           probeFloor: Shared.shared.nearRssiThreshold - 10)
         }
 
+        // config.ini 에 쓴 뒤라 간단 창이 새 계정과 "내 폰" 줄을 읽는다
+        showSimpleForResult()
         if !r.err.isEmpty {
             // 로그인은 됐는데 토큰 조회가 실패했다. 다시 로그인시킬 일은 아니다.
             Alerts.warning("\(r.email) 로 로그인했습니다.\n\n다만 폰 정보를 가져오지 못했습니다:\n\(r.err)"
@@ -1272,6 +1310,7 @@ final class AppController: NSObject, GuardEngineHost {
             onRegisteredPhoneToken(token, viaLogin: false)
         case .failure(let why):
             EventLog.write("register phone: \(why)")
+            showSimpleForResult()
             Alerts.warning("등록하지 못했습니다.\n\n\(why)\n\n앱이 화면에 떠 있는지, 폰이 PC 가까이 있는지 확인하세요.",
                            title: AppController.registerTitle)
         }
@@ -1294,6 +1333,8 @@ final class AppController: NSObject, GuardEngineHost {
             ConfigStore.save(c)
         }
         populateDevices()
+        // 토큰을 저장한 뒤라 간단 창의 "내 폰" 줄이 "등록됨" 으로 바뀌어 보인다
+        showSimpleForResult()
         let head = Texts.tokenPrefix(token)
         if viaLogin {
             let email = lastLoginEmail.isEmpty ? AccountSession.shared.email : lastLoginEmail
