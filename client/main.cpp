@@ -687,6 +687,10 @@ static DWORD WINAPI ScanThread(LPVOID param) {
             g_lastNearTick = now;
             belowCount = 0; belowFirstTick = 0; belowSampleTick = 0;
             if (g_proxState == ProxState::Far) g_proxState = ProxState::Near;
+        } else if (wakeHold) {
+            // 지금 상태를 그대로 둔다. 미만 카운터도 건드리지 않는다 - 잠들기 전의 낡은 샘플을
+            // 새 증거로 세면, 깬 뒤 첫 미만 샘플 하나로 2샘플 규칙이 차거나 6초 상한이 이미
+            // 지나 있다 (Mac ProximityJudge 와 같다).
         } else if (g_proxState == ProxState::Near) {
             bool goFar;
             if (!bleAvail) {
@@ -713,7 +717,7 @@ static DWORD WINAPI ScanThread(LPVOID param) {
                 goFar = (belowCount >= 2) ||
                         (now - belowFirstTick) >= BELOW_SAMPLE_CAP_MS;
             }
-            if (goFar && !wakeHold) g_proxState = ProxState::Far;
+            if (goFar) g_proxState = ProxState::Far;
         }
         auto* r = new ProbeResult{};
         r->gen = gen;
