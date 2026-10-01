@@ -15,7 +15,85 @@ SmartScreen 프로젝트를 이어서 개발한다. 저장소: C:\work\smartscre
 - 같은 구글 계정으로 로그인한 PC 끼리 클립보드를 주고받는다 (docs/CLIPBOARD.md)
 - 새 버전을 서버에 올리면 모든 PC 가 스스로 받아 간다 (docs/UPDATE.md)
 
-## 직전 세션: Mac 판 (2026-10-01)
+## 직전 세션: Mac 실기 준비, iOS 컴파일 CI, Windows 결함 6건 (2026-10-01 오후)
+
+사용자가 맥북 결과 칸을 **하나도 채우지 않은 채** 왔다 (`mac_releases` 를 anon 으로 읽어 보니 404 = SQL 도
+아직). 결과를 기다리지 않고, **맥북 시험 한 번으로 최대한 많이 갈리게** 준비했다. 전부 main 에 있다.
+Mac·아이폰 실기에서는 **여전히 한 번도 돌지 않았다.** Windows 6건은 사용자가 "모두 넣기" 로 정해 main 에
+합쳤고 **아직 내놓지 않았다** - 사용자가 직접 release.bat 하기로 했다 (아래 "현재 기기 상태").
+
+### Mac: 스캔을 둘로 (필터 + 직접 읽기)
+
+- 포팅 전체의 전제(macOS 서비스 필터가 잠긴 폰의 overflow 광고를 맞춰 준다)가 미확인이라, 필터 없는 두 번째
+  CBCentralManager 를 같이 돌린다. 제조사 데이터 `4C 00 01` + 16바이트에서 비트 하나짜리를 후보로 삼고, 번호는
+  Windows `SingleOverflowBit` 와 같다 (b*8+k). 어느 쪽이 되든 앱은 폰을 찾는다
+- 비트는 Windows 처럼 배워 `phoneOvfBit` 에 저장한다. **노트북 Windows 가 배운 값은 31** - 서비스 UUID 의
+  해시라 폰마다 같을 것이지만 박아 넣지는 않았다
+- 묶인 폰의 샘플은 400 ms 사본 제거(`DualSourceDedupe`)를 거친다. 두 스캔이 같은 패킷을 주면 2샘플 규칙이
+  샘플을 두 번 센다
+- events.log: `scan: filter=on raw=on`, `ident: bound to X (..., via raw bit 31[, app on screen])`
+  (via = 묶기 직전 10초 안에 그 폰을 준 스캔만), `ident: X locked adverts via filter + raw bit 31`
+  (잠긴 폰을 실제로 주는 스캔 - 처음과 바뀔 때만), `ident: overflow bit is now N`
+- `--probe-scan` 은 세 단계(필터만 20초 / 직접 읽기만 20초 / 둘 다 10초) 뒤 후보 최대 6대에 붙어 토큰을
+  읽고, 붙여 넣을 `요약` 블록을 찍는다. 판정은 SmartScreenCore `ProbeScanResult` (시험 있음). 결과 줄:
+  - `둘 다` / `필터 경로` / `직접 읽기 경로` - 그 길로 잠긴 폰의 토큰을 읽었다
+  - `판정 못 함` - 폰은 봤는데 토큰을 못 읽었다 (연결 실패, 남의 토큰뿐). **결론 내지 말고 1~2분 뒤 다시**
+  - `둘 다 안 됨` - 어느 스캔도 후보를 못 봤다. 그때만 GATT 경로뿐이다. `Apple 광고 키:` 줄에 비공개 키
+    (`HashedServiceUUIDs` 따위)가 있으면 macOS 가 overflow 를 다른 키로 주는 것일 수 있다 - 그것부터 볼 것
+- 결과가 `필터 경로` 만이면 직접 읽기 스캔은 주변 광고를 전부 받아 CPU 를 쓰므로 끌지 정할 것 (지금은 늘 켠다)
+
+### Mac: 첫 실행에 걸릴 것들 (검토 → 반박 검증 둘로 확정한 것만 고쳤다)
+
+- 터미널에서 돌린 진단은 블루투스 권한을 **터미널** 이 받는다. 허용 창을 60초 기다리고, 거부되면 그 터미널
+  앱 이름을 댄다 (`__CFBundleIdentifier`). "어댑터 없음" 은 정말 `.unsupported` 일 때만
+- 로그인 결과 창이 macOS 14+ 에서 브라우저 뒤에 숨는다 (`activate()` 는 요청일 뿐이고, Dock 도 Cmd-Tab 도
+  없는 앱이다) → 앱이 비활성이면 `.floating` + `orderFrontRegardless`, 잠금 중에 뜬 창은 풀릴 때 올린다.
+  로그인 성공 페이지가 "[설정] 을 누르라" 고 말한다 (Mac 만)
+- [중지]→[시작] 이 GATT 서비스를 지웠다 다시 올려서, 붙어 있던 폰이 다시 구독하지 않았다 → 서비스와
+  구독자를 그대로 둔다 (`GATT client subscribed (kept across restart)`)
+- `SLEEP` / `WAKE` / `DISPLAY OFF` / `DISPLAY ON` 줄. 배터리의 맥북은 2분 뒤 화면을 끄고 잠든다 -
+  그 뒤에 돌아오면 저절로 안 풀리는 것이 정상이다 (설명서에도 적었다)
+- 유니버설 클립보드(아이폰에서 복사한 것)는 다른 PC 로 보내지 않는다 (`com.apple.is-remote-clipboard`)
+- 반박된 것: macOS 15.4 "붙여넣기 허용" 창 (개발자 미리보기로만 켜진다), 잠금 그림의 폴더 권한 창 (열기
+  패널로 고른 파일은 `com.apple.macl` 로 다음 실행에도 열린다)
+
+### iOS: 처음으로 컴파일 확인 (`.github/workflows/ios.yml`)
+
+- `ios/**` 를 main / mac / ios 에 푸시하면 iOS SDK 로 typecheck + SIL 까지 (최소 iOS 15.0, Xcode 16.4,
+  Xcode 26 새 프로젝트 설정, 26.6, 27 미리보기). iOS 16 API 를 넣은 카나리아가 거절되는지도 본다
+- 기준선: "컴파일 검증 못 했음" 이던 코드(adoptToken 등)는 Xcode 16.4 에서 그대로 컴파일됐다. Xcode 26 새
+  프로젝트 설정(MemberImportVisibility)에서만 `import Combine` 이 빠져 있었다 (고침)
+- **PC 가 GATT 서비스를 지웠다 다시 올리면 폰이 다시 구독하지 않던 것.** Windows 에서도 보인다: 노트북
+  events.log 의 08:15 / 08:19 재시작 뒤 08:47 (폰이 범위를 나갔다 올 때)까지 `GATT client subscribed` 가
+  없고, 그동안 프로버는 같은 후보 `4E33E1C031B2` 에 18초마다 Unreachable 이었다. 주변장치는 central 을
+  끊을 API 가 없어 폰이 묵은 연결을 쥐고 있던 것으로 본다
+  → `didModifyServices` 로 다시 찾기 + TICK 감시 (60초 TICK 이 없으면 서비스를 다시 찾고, 그래도 없으면
+  끊고 다시 붙는다. PC 는 입력 중에 TICK 을 안 보내므로 끊는 간격은 점점 늘린다). **잠긴 채 정지된 앱은
+  깨울 사건이 없어 감시가 못 돈다** - 앱을 열거나 링크가 끊길 때 풀린다
+- 런타임은 미확인이다. 사용자가 Xcode 로 다시 설치해야 폰에 들어간다
+
+### Windows: Mac 에서만 고쳤던 결함 6건 (main, 아직 안 내놓음)
+
+- **GATT 거짓 NEAR**: 구독 콜백이 폴링 간격을 정하기 전에 판정을 깨워서 간격 0 = "입력 중" 으로 읽혔다 →
+  잠긴 화면이 0~9초 풀린다. 노트북 events.log 에 BLACK ON 중 **12번** (`GATT client subscribed` 바로 뒤
+  `STATE FAR -> NEAR (GATT ... thr=X set=X)`). 잠금 해제 지연 10초라 가려졌을 뿐, 기본값 "즉시" 면 실제로
+  풀린다. 이제 `pollMutex` 아래 간격·시각을 구독자 수보다 먼저 쓰고, 판정은 간격 → 보고 나이 → RSSI 순으로
+  읽는다 (새 연결의 첫 보고가 지난 연결의 RSSI 와 짝지어지지 않게)
+- Q1 오버레이 잠근 시각 (9시간 어긋남), Q2 남은 해제 카운트다운이 수동 잠금을 풂 (`ManualLockNow` 하나로),
+  Q4 [중지] 뒤 오버레이, Q5 고른 그림 즉시 저장, Q6 [중지] 뒤 결과 무시
+- **`--clip-test` 토큰 회전은 반박됐다.** Supabase(GoTrue)는 바로 전 세대 refresh 토큰을 받아 준다 (v1:
+  활성 토큰의 부모면 그 활성 토큰을 돌려줌, v2: `counterDifference == 1` 허용). 한 번 버린 회전은 다음
+  갱신에 저절로 낫는다. Windows 동작은 그대로 두고, Mac 의 거절(앱이 떠 있으면)은 "config.ini 를 쓰는
+  쪽은 하나" 로 이유를 고쳤다 (아래 함정)
+- 확인은 MSVC 로컬 빌드(실행 중인 앱을 건드리지 않는 별도 폴더)까지. 실기 시험은 "남은 작업 0"
+
+### 어떻게 했나
+
+워크플로 셋, 반박 검증은 건마다 둘. (1) Mac 이중 스캔 구현(CI 반복) + Windows 결함 7건 분석·반박 + Mac
+첫 실행 검토 4갈래 (9건 → 확정 7) (2) 이중 스캔 검토 3갈래 (9건 → 확정 8) + Mac 첫 실행 수정 + iOS + Windows
+수정 (3) 확정 건 적용 + 세 변경을 다시 검토 (13건 → 확정 12) + 적용. Mac 시험 180 → 237개.
+
+## 그 앞 세션: Mac 판 (2026-10-01 오전)
 
 "이 프로그램을 맥북에서도 동일하게" 를 한 세션에 했다. `mac/` 에 Swift 네이티브 앱
 (AppKit + CoreBluetooth, macOS 13+, 유니버설)이 있고, **Windows 판과 같은 화면 문구·설정 키·로그
@@ -45,8 +123,9 @@ SmartScreen 프로젝트를 이어서 개발한다. 저장소: C:\work\smartscre
 
 ### Windows 와 다르게 한 것 (이유는 docs/MAC.md)
 
-- 없는 것: IRK·[기기 키], overflow 비트 학습(`phoneOvfBit` 는 -1 그대로), 페어링된 Classic 기기 목록,
-  RFCOMM 지연 경로, [재연결]. 스캔은 신원 서비스 UUID 로 필터를 걸고 macOS 가 overflow 를 맞춘다
+- 없는 것: IRK·[기기 키], 페어링된 Classic 기기 목록, RFCOMM 지연 경로, [재연결]. 스캔은 신원 서비스
+  UUID 로 필터를 걸고 macOS 가 overflow 를 맞춘다고 봤다 (→ 오후: 필터 없는 스캔도 같이 돌리고 overflow
+  비트도 Windows 처럼 배운다 - 위)
 - 입력 감시는 `CGEventSource` 유휴 시간을 100 ms 마다 (권한 창이 없는 유일한 길). 원격 세션은
   `kCGSSessionOnConsoleKey`. 잠금 창은 모니터마다 하나 (`CGShieldingWindowLevel`)
 - refresh 토큰은 키체인이 아니라 AES-GCM + 이 Mac 의 하드웨어 UUID 로 봉해 `authRefresh` 에 넣는다
@@ -55,7 +134,8 @@ SmartScreen 프로젝트를 이어서 개발한다. 저장소: C:\work\smartscre
   블루투스 허용을 다시 묻지 않게 - **실기 미확인**)
 - Windows 결함 중 Mac 에서는 고쳐서 옮긴 것: 오버레이 잠금 시각(Q1), 지연 해제 타이머 잔여(Q2),
   [중지] 뒤 오버레이(Q4), 고른 그림 즉시 저장(Q5), [중지] 직후 결과(Q6), **GATT 구독 순간의 거짓
-  NEAR**, **`--clip-test` 의 토큰 회전**. **Windows 판(client/)은 그대로다** - 아래 "남은 작업 3"
+  NEAR**, **`--clip-test` 의 토큰 회전**. (→ 오후: 앞의 여섯은 Windows 도 고쳐 main 에 있다. 토큰 회전은
+  반박됐다 - 위)
 
 ### 서버: Mac 은 표가 따로다 (`supabase/mac_releases.sql`, **아직 적용 안 됨**)
 
@@ -325,25 +405,68 @@ A 에서 스크린캡처하면 B 에서 Ctrl+V 로 붙는다. 연결고리는 �
 
 ### Mac. 실기 시험 (최우선 - 한 번도 Mac 에서 돈 적이 없다)
 
-순서대로. 앞의 것이 안 되면 뒤는 의미가 없다. 무엇을 보면 되는지는 docs/MAC.md "확인하지 못한 것".
+2026-10-01 오후 세션에 사용자에게 준 절차 (명령어 그대로). 결과 줄의 뜻은 docs/MAC.md "확인하지 못한
+것" 1. 앞의 것이 안 되면 뒤는 의미가 없다.
 
-1. **잠긴 아이폰을 찾는가.** 폰을 잠근 채 터미널에서
-   `/Applications/SmartScreen.app/Contents/MacOS/SmartScreen --probe-scan`. `>>> 토큰` 이 나오면 된다.
-   안 나오면 이 포팅 전체의 전제(macOS 가 서비스 필터로 overflow 광고를 맞춰 준다)가 틀린 것이다 -
-   필터 없이 스캔해 `4C 00 01 <16바이트>` 를 Windows 처럼 직접 읽도록 `AdvScanner` 를 바꾼다
-   (ble 명세 8.3-1. 명세는 이번 세션의 scratchpad 에만 있었다 - 필요하면 client/ble_rssi.cpp 의
-   SingleOverflowBit 를 다시 읽을 것)
-2. 등록(구글 계정) → [보호 켜짐] → 폰 들고 떠나기/돌아오기. events.log 의 `START thr=`, `ident: bound
-   to`, `STATE`, `BLACK ON/OFF`. **검은 화면이 뜨자마자 스스로 풀리면** 창을 띄우는 것이 입력 유휴
-   시간을 되돌리는 것이다 (InputWatcher)
-3. 재보기 마법사 - Mac 안테나는 Windows 와 10~20 dB 다르다. Windows 값을 옮기지 말 것
-4. 고급 창 아래 `GATT: linked` (잠긴 폰이 Mac 의 GATT 서비스에 붙는가)
-5. 클립보드: Windows ↔ Mac 글(한글, 여러 줄)과 그림. macOS 15.4+ 의 "붙여넣기 허용" 창
-6. 업데이트: `mac_releases.sql` 을 적용하고 1.1.8 을 내놓은 뒤 Mac 이 받는가. **업데이트 뒤
-   블루투스 허용을 다시 묻는가, "앱 관리" 에 막히는가** - 물으면 기업 Mac 자동 적용은 서명을 바꾸기
-   (Developer ID) 전까지 끌 것
+1. 설치 - 노트북의 `SmartScreen-mac.zip` 을 맥북 "다운로드" 로 옮긴 뒤 터미널에서
+   `ditto -x -k ~/Downloads/SmartScreen-mac.zip ~/Downloads/SmartScreen-mac` →
+   `rm -rf /Applications/SmartScreen.app` → `mv ~/Downloads/SmartScreen-mac/SmartScreen.app /Applications/` →
+   `xattr -dr com.apple.quarantine /Applications/SmartScreen.app` →
+   `/Applications/SmartScreen.app/Contents/MacOS/SmartScreen --version` (= `SmartScreen 1.1.7`)
+2. **잠긴 폰을 어느 길로 찾는가.** SSBeacon 을 켜고 폰을 잠근 채
+   `/Applications/SmartScreen.app/Contents/MacOS/SmartScreen --probe-scan 2>&1 | tee ~/Desktop/probe-scan.txt`.
+   "터미널" 의 블루투스 허용 창에 [허용]. `요약` 블록을 받는다. `판정 못 함` 이면 다시
+3. 앱 실행(`open /Applications/SmartScreen.app`) → [등록하기] → [예] → 구글 로그인. 결과 창이 브라우저 앞에
+   뜨는가
+4. [보호 꺼짐] → SmartScreen 의 블루투스 허용 창 → [보호 켜짐]
+5. 전원 어댑터를 꽂거나 `caffeinate -di` 를 켠 채, 폰을 들고 떠나기 → 가려짐 → 1분 안에 돌아와 손대지
+   않고 → 풀림. **가려지자마자 스스로 풀리면** 창을 띄우는 것이 입력 유휴 시간을 되돌리는 것이다
+   (InputWatcher)
+6. 재보기 마법사 - Mac 안테나는 Windows 와 10~20 dB 다르다. Windows 값을 옮기지 말 것
+7. 고급 창 아래 `GATT:`. linked 면 [중지] → 5초 → [시작] 뒤 다시 linked 되는가
+8. 클립보드: Windows ↔ Mac 글(한글, 여러 줄)과 그림, 아이폰에서 복사한 것은 Windows 로 안 가야 한다
+9. 로그: `grep -E "START thr=|scan:|ident:|STATE|BLACK|GATT|SLEEP|WAKE|DISPLAY|register|BLE central|clip:"
+   ~/Library/Application\ Support/SmartScreen/events.log | tail -150`
+10. (release.bat 1.1.8 뒤) 업데이트: 간단 창 띠 [업데이트]. **업데이트 뒤 블루투스 허용을 다시 묻는가,
+    "앱 관리" 에 막히는가** - 물으면 기업 Mac 자동 적용은 서명을 바꾸기(Developer ID) 전까지 끌 것
+11. (선택) 아이폰 앱 다시 설치 - `ios/SSBeacon/SSBeaconApp.swift` 를 Xcode 프로젝트에 덮어쓰고 실행.
+    그 뒤 7번을 다시 (Mac [보호 꺼짐→켜짐] 에 폰 화면이 "PC 서비스 꺼짐 - 다시 켜지길 기다리는 중" → "보고 중")
 
-### 0. 1.1.6/1.1.7 에서 아직 안 본 것
+결과를 받는 틀 (사용자가 다음 세션 첫 메시지에 채워 오게):
+
+```
+- supabase/mac_releases.sql 적용: [했다 / 안 했다]    release.bat 1.1.8: [했다 / 안 했다]
+- 설치: [됐다 / 막혔다 - 무엇이]
+- --probe-scan 요약 블록: [붙여넣기]
+- 구글 계정 등록: [됐다 / 실패 - 문구]   결과 창: [브라우저 앞 / 뒤에 숨음]
+- [보호 켜짐] 후 블루투스 허용 창: [떴다 / 안 떴다]
+- 떠나기 → 가려짐: [됐다 / 안 됐다 / 바로 다시 풀렸다]   돌아오기 → 풀림: [됐다 / 안 됐다]
+- 재보기 마법사 결과: [문구]
+- GATT: [linked / waiting / off]   [중지]→[시작] 뒤: [다시 linked / waiting]
+- 클립보드 글·그림: [됐다 / 안 됐다]   아이폰에서 복사한 것: [Windows 로 안 감 / 감]
+- 9번 grep 결과: [붙여넣기]
+```
+
+### 0. Windows 1.1.8 (main 에 있는 6건) - 내놓은 뒤 볼 것
+
+release.bat 으로 내놓은 뒤 노트북에서 (데스크톱은 받은 뒤). 로그는 PowerShell 에서
+`Get-Content "$env:APPDATA\SmartScreen\events.log" -Tail 30`.
+
+- **GATT 거짓 NEAR** (가장 중요): 고급 창 "잠금 해제 지연" 을 "즉시" → [시작] → 폰을 들고 떠나 가려지게 →
+  먼 곳에서 아이폰 블루투스를 껐다 켠다 → 아무도 PC 에 안 간 채 30초. 화면이 계속 가려져 있어야 한다.
+  `Select-String -Path "$env:APPDATA\SmartScreen\events.log" -Pattern 'GATT client subscribed' -Context 0,1 | Select-Object -Last 5`
+  에서 `GATT client subscribed` 바로 다음 줄이 `STATE FAR -> NEAR (GATT ... thr=X set=X` (thr = set) 면 아직
+  고장. 끝나면 지연을 원래 값(노트북은 10초)으로
+- Q1: 떠나서 가려진 뒤 2분 넘게 있다가 돌아와 손대지 않고 풀리게 → 오버레이 셋째 줄 `Lock hh:mm` =
+  `Unlock hh:mm` - 괄호 안 시간 (예전에는 9시간 어긋남)
+- Q2: 지연 "10초" → 떠났다 돌아와 "잠금 • N초 후 해제" 동안 마우스로 풀기 → 곧바로 [지금 가리기] → 손 떼고
+  20초. 계속 가려져 있고 "[해제] 를 눌러야 풀립니다" 여야 한다
+- Q4: "근처 • 보호 중" 일 때 [중지] → 오버레이가 곧바로 회색 "정지됨"
+- Q5: 감시 중에 [그림 고르기] → `Select-String -Path "$env:APPDATA\SmartScreen\config.ini" -Pattern 'centerImagePath'`
+  에 바로 나오고, 오버레이 [종료] 후 다시 켜도 그 그림
+- Q6: 일부러 일으키기 어렵다. [중지] 뒤 1분 동안 `STATE` / `BLACK ON` 줄이 안 생기는지만
+
+### 0-1. 1.1.6/1.1.7 에서 아직 안 본 것
 
 1.1.6 은 나갔고(1.1.7 은 같은 코드) 노트북에서 1.1.7 로 뜬다 (시작 경로: 세션 복구, 회전 토큰 저장, 기업 동기화
 OK center=1, 업데이트 확인, BLE NEAR, 오버레이 [종료] 로 0.5초 만에 정상 종료. 설정 창
@@ -389,8 +512,8 @@ OK center=1, 업데이트 확인, BLE NEAR, 오버레이 [종료] 로 0.5초 만
 
 폰이 T1 을 내주는지 PC 없이 직접 보려면 `ProbeScan.exe` 를 쓴다.
 
-직전 세션에서 이 경로를 고쳤다 (컴파일 검증 못 했음 - **Xcode 에서 먼저 빌드가 되는지
-볼 것**). 화면이 달라졌다: 서비스를 다시 올리는 동안 `기기 토큰` 줄이 사라졌다가
+이 경로는 2026-10-01 오후에 처음으로 컴파일이 확인됐다 (`ios.yml`, Xcode 16.4 / 26.x). 실행은 아직이다.
+화면이 달라졌다: 서비스를 다시 올리는 동안 `기기 토큰` 줄이 사라졌다가
 `didAdd` 가 성공하면 돌아온다. 올리기가 실패하면 "신원 서비스 등록 실패, 다시
 시도합니다: ..." 가 한 번 뜨고, 두 번째도 실패하면 "신원 서비스 등록 실패: ..." 로
 멈춘다. 그때는 "연동되었습니다" 대신 "계정은 연동됐지만 폰이 토큰을 내주지 못하고
@@ -403,11 +526,16 @@ provider 를 지원한다. 사내 배포(TestFlight 내부)면 해당 없다.
 
 ### 3. 검토해 볼 것
 
-- **Mac 에서 고친 Windows 결함을 client/ 에도**: GATT 구독 순간의 거짓 NEAR
-  (`client/ble_gatt.cpp` SubscribedClientsChanged 가 폴링 간격을 정하기 전에 reportEvent 를
-  울린다 → 간격 0 = "입력 중" 으로 읽혀 잠긴 화면이 한 샘플 풀릴 수 있다), `--clip-test` 의
-  토큰 회전(켜진 앱의 로그인이 풀릴 수 있다), lockscreen 명세의 Q1·Q2·Q4·Q5·Q6. 목록과
-  근거는 docs/MAC.md "일부러 바꾼 것"
+- Mac 에서 고친 Windows 결함은 2026-10-01 오후에 client/ 에도 고쳤다 (main, 1.1.8 대기). 검토에서 보류한 것:
+  - Windows ScanThread 가 StopMon 의 15초 조인을 넘기면 (레거시 RFCOMM 경로만) `g_hStopEvent` 를 닫고
+    null 로 만들어, 스레드의 대기가 즉시 실패하며 영영 안 끝나고 다음 [시작] 에 두 벌이 돈다. 시간 초과면
+    이벤트를 닫지 말고 남겨 두는 것이 싸다
+  - PC 가 입력 중에도 30~45초마다 TICK 을 하나 보내면 (client/ble_gatt.cpp, mac GattServer.swift) 폰이
+    "입력 중" 과 "묵은 링크" 를 가를 수 있어 감시의 끊기 간격을 늘릴 필요가 없다 (폰 배터리와 맞바꿈)
+  - 잠긴 채 정지된 폰 앱은 묵은 구독을 알아챌 사건이 없다. 캐시되지 않는 특성을 하나 두고 PC 가 읽게
+    하면 깨울 수 있을지 모른다 - 프로토콜 변경이고, 실제로 깨우는지 먼저 실기로 볼 것
+  - Windows 1.1.7 의 첫 결과 블록(ProbeScan 의 요약 앞 줄)은 "신원 서비스는 있는데 토큰 읽기 실패" 와
+    "신원 서비스 없음" 을 같은 문구로 말한다 (Mac 요약은 가른다)
 - **`contents` 와 `content` 버킷은 여전히 로그인 없이 읽힌다** (전 org 의 행, 파일
   바이트, 목록). 쓰기는 닫혔다 (위 "직전 세션"). 조이려면 기업 PC 에 로그인이나 그에
   준하는 것이 필요해진다 (`org_release_approvals` 도 같은 이유로 anon 읽기다) - 그
@@ -431,7 +559,13 @@ provider 를 지원한다. 사내 배포(TestFlight 내부)면 해당 없다.
 - **Mac 판 빌드는 CI 에서만 된다.** `mac` 이나 `main` 에 `mac/**` 를 바꿔 푸시하면
   `mac.yml` 이 돈다. 오류 보기: `gh run view <id> --log` 에서 `.swift:<줄>:<칸>: error:` 줄.
   zip 받기: `gh run download <id> -n SmartScreen-mac`. 판단 로직을 고치면 `mac/Tests` 에 시험을
-  더할 것 - Mac 이 없는 곳에서 행동을 확인하는 유일한 길이다
+  더할 것 - Mac 이 없는 곳에서 행동을 확인하는 유일한 길이다 (2026-10-01 오후 현재 237개)
+- **iOS 컴파일은 `ios.yml` 이 본다** (`ios/**` 를 main / mac / ios 에 푸시). typecheck + SIL 까지이고
+  링크·서명·실행은 아니다. 실행은 맥북의 Xcode 로만 (저장소에 .xcodeproj 가 없다 - 사용자의 프로젝트에
+  `SSBeaconApp.swift` 를 덮어쓴다). Swift 를 고치면 "컴파일만 확인, 실행 미확인" 을 분명히 말할 것
+- 작업 브랜치: `mac` (mac.yml), `ios`, `win-fixes` 는 전부 main 에 합쳤다. 워크플로 에이전트는
+  `isolation: worktree` 로 `.claude/worktrees/` 에서 일하고, 각자 브랜치에 푸시한 것을 메인이 main 에
+  올렸다 (이 저장소는 병합 커밋 없이 일자로 간다 - cherry-pick)
 - Mac 앱의 진단 모드: `--version`, `--probe-scan`, `--adv-scan`, `--bt-check`, `--clip-test`
   (`SmartScreen.app/Contents/MacOS/SmartScreen` 에 붙인다). config 와 로그는
   `~/Library/Application Support/SmartScreen/`
@@ -455,8 +589,9 @@ provider 를 지원한다. 사내 배포(TestFlight 내부)면 해당 없다.
 - 업데이트 적용 경로 시험: `SmartScreen.exe --apply-update 0 <src> <dst> --sha <hex>
   --ver 9.9.9 --no-relaunch` (pid 0 = 기다리지 않음). src 는 `%APPDATA%\SmartScreen\update\`
   안에, dst 이름은 `SmartScreen.exe` 여야 받는다
-- 클립보드 점검: `SmartScreen.exe --clip-test` (앱이 떠 있어도 된다). 결과는 창과
-  `%APPDATA%\SmartScreen\clip-test.txt`
+- 클립보드 점검: `SmartScreen.exe --clip-test` (앱이 떠 있어도 된다 - 토큰 회전 걱정은 반박됐다, 아래
+  함정). 결과는 창과 `%APPDATA%\SmartScreen\clip-test.txt`. Mac 판은 앱이 떠 있으면 거절한다
+  (config.ini 를 쓰는 쪽이 둘이 되지 않게)
 - 임계값 분석: `tools\rssi-threshold.ps1`. 구글 로그인 점검: `build\AuthTest.exe`
 - 서버 스키마는 `supabase/*.sql` 을 대시보드 SQL Editor 에 붙여 넣어 적용한다.
   새 프로젝트용 넷(`schema.sql` / `device_tokens.sql` / `clipboard.sql` / `releases.sql`,
@@ -470,8 +605,6 @@ provider 를 지원한다. 사내 배포(TestFlight 내부)면 해당 없다.
   (.gitignore). `do_build.bat` 와 같은 명령을 빌드 폴더만 바꿔 돌린 것이고, 지워도 된다
 - `.env` 에 Supabase URL/anon key 가 있다 (커밋 안 됨, `.env.example` 이 형식)
 - config.ini 편집은 앱을 완전히 종료한 뒤에. 안 그러면 앱이 덮어쓴다
-- iOS 는 Mac + Xcode 로만 빌드된다. **Swift 를 고치면 "컴파일 검증 못 했음"을 분명히
-  말할 것** (저장소에 .xcodeproj 가 없어서 SSBeaconApp.swift 한 파일만 고쳐 왔다)
 - Git Bash 에서 `cmd.exe /c x.bat` 은 `/c` 가 `C:/` 로 바뀌어 **배너만 찍고 끝난다.**
   `MSYS_NO_PATHCONV=1 cmd.exe /c ...`. `publish.bat --notes "한글"` 도 Git Bash 에서는
   따옴표가 깨진다 - cmd 에서 돌리거나 `build\Publish.exe` 를 직접 부를 것
@@ -492,6 +625,36 @@ Windows 의 MessageBox 는 떠 있는 동안에도 `WM_SCAN_RESULT` 를 돌리�
 CI 는 컴파일과 시험까지만 한다. 블루투스, 잠금 화면, 권한(TCC), 서명, 자기 업데이트는 Mac 에서
 한 번도 돈 적이 없다. "컴파일된다" 를 "된다" 로 읽지 말 것 - 이 저장소의 "쓰인 적 없는 코드는
 틀린 줄 모른다" 가 Mac 판 전체에 해당한다.
+
+### 검토가 내린 결론도 반박해 볼 것 (`--clip-test` 토큰 회전)
+
+"Supabase 는 이미 쓴 refresh 토큰이 다시 오면 로그인 전체를 끊는다" 는 Mac 판 검토에서 나와 그대로
+설계(Mac 은 앱이 떠 있으면 점검 거절)와 문서로 들어갔고, Windows "결함" 목록에도 올랐다. 2026-10-01 오후의
+반박 검증자가 supabase/auth 소스를 읽어 보니 **바로 전 세대는 허용**이었다 (v1: 폐기된 토큰이 활성 토큰의
+부모면 활성 토큰을 돌려주고 아무것도 끊지 않는다, v2: `counterDifference == 1`). 그럴듯한 서버 동작 주장은
+소스나 실측으로 확인하기 전까지 가설이다. 설계에 넣었다면 그 근거를 같이 적어 둘 것.
+
+### 주변장치는 central 을 끊지 못한다 - GATT 서비스를 지웠다 올리면 폰이 묵는다
+
+`CBPeripheralManager` 에도 WinRT `GattServiceProvider` 에도 연결된 central 을 끊는 API 가 없다. PC 가
+서비스를 지웠다 다시 올리면 (Mac 의 예전 [중지]→[시작], 두 판의 앱 재시작·자기 업데이트) 아이폰은 붙은
+채로 무효가 된 핸들을 쥐고, 다시 구독하지 않으면 TICK 이 영영 안 온다. Windows 노트북 로그에서 앱 재시작
+뒤 27분 동안 `GATT client subscribed` 가 없었고, 그동안 프로버는 같은 후보에 Unreachable 이었다. 고치는
+쪽은 폰이다 (`didModifyServices` + TICK 감시). PC 쪽은 서비스를 지우지 않는 것만 할 수 있다 (Mac 은 이제
+그렇게 한다).
+
+### 터미널에서 돌린 Mac 진단의 권한은 터미널 것이다
+
+셸에서 실행한 바이너리는 앱 묶음 안에 있어도 TCC 의 "책임 프로세스" 가 터미널이다. 그래서 `--probe-scan`
+의 블루투스 허용 창은 "터미널" 이름으로 뜨고, 거절했다면 시스템 설정에서 SmartScreen 이 아니라 터미널을
+켜야 한다. 허용 창이 떠 있는 동안 `CBManager.authorization` 은 `.notDetermined`, 상태는 `.unknown` 이다.
+Info.plist 에 블루투스 설명 키가 없는 앱(VS Code 등의 터미널)에서 돌리면 묻지도 않고 죽을 수 있다.
+
+### 배터리의 맥북은 2분 뒤 잠든다
+
+macOS 기본값은 배터리에서 2분(전원 10분) 뒤 화면을 끄고, 노트북은 그때 잠든다. 잠든 동안은 스캔도
+판정도 멎으므로 돌아와도 저절로 풀리지 않고 macOS 가 Touch ID / 암호를 묻는다 - 고장이 아니다. 실기
+시험은 전원을 꽂거나 `caffeinate -di` 를 켜고 할 것. events.log 의 `SLEEP` / `WAKE` / `DISPLAY OFF` 줄로 가른다.
 
 ### 빌드 스크립트의 보고를 믿지 말 것 (release.ps1 에서 세 번)
 
@@ -530,7 +693,10 @@ LF: `client/main.cpp`, `ble_rssi.cpp`, `config.cpp`, `enterprise/auth.cpp`, `upd
 CRLF: `client/blackscreen.cpp`, `ble_gatt.cpp`, `common.h`, `enterprise/supabase.cpp`,
       `docs/*.md`, `ios/SSBeacon/SSBeaconApp.swift`, `do_build.bat`
 
-`core.autocrlf=true` 라서 `git ls-files --eol` 의 `w/` 열이 작업본의 실제 상태다.
+**이 목록은 작업본의 그때 상태일 뿐이다.** index 는 전부 LF 이고, `core.autocrlf=true` 라서 git 이
+체크아웃·병합·cherry-pick 으로 다시 쓴 파일은 CRLF 가 된다 (2026-10-01 오후 병합 뒤 `client/main.cpp` 와
+`NEXT_SESSION.md` 가 CRLF 가 됐고, 새 worktree 에서는 전부 CRLF 다). 도구로 새로 쓴 파일만 LF 로 남는다.
+`git ls-files --eol` 의 `w/` 열이 작업본의 실제 상태다.
 `tr -cd '\r' < 파일 | wc -c` 로 CR 바이트를 직접 세고 LF 개수와 같은지 본다. python 으로
 일괄 치환하면 파일 전체가 뒤집힌다 - **수정 전후로 CR/LF 개수를 세서 확인할 것.**
 
@@ -638,9 +804,15 @@ Disconnected / Closed 로 보고됐다. `GattDeviceService` 는 반드시 `Close
 
 ## 현재 기기 상태
 
-- **Mac: 아직 없음.** `SmartScreen-mac.zip` (1.1.7, CI 빌드) 이 저장소 맨 위에 있다. 맥북에
-  깔았는지는 확인 못 했다. `supabase/mac_releases.sql` 은 **적용 전** (라이브의 `mac_releases`
-  는 404)
+- **Mac: 아직 없음.** 저장소 맨 위 `SmartScreen-mac.zip` 은 main `beb82dc` 의 CI 빌드(run 36812981415,
+  1.1.7, SHA-256 `959983ffbe8bf4a750c7ecf8d79715f53a6551cdfa1a66463ab4287c8ec3f800`) - 오전의 1.1.7 zip 과
+  코드가 다르다 (서버에 올라간 적 없는 번호라 겹치는 곳은 없다). 맥북에 깔았는지는 모른다.
+  `supabase/mac_releases.sql` 은 **적용 전** (2026-10-01 오후에도 라이브의 `mac_releases` 는 404)
+- **main 의 client/ 는 1.1.7 보다 앞서 있다** (Windows 6건, 내놓기 전). 사용자가 직접 release.bat 하기로
+  했다: mac_releases.sql 을 먼저 적용하면 같은 번호(1.1.8)로 Mac 도 나간다. 그러면 저장소 맨 위의 두 zip 이
+  1.1.8 로 바뀐다
+- 아이폰 앱: 폰에 깔린 것은 2026-10-01 오후 전의 소스다 (`didModifyServices`·TICK 감시·`import Combine` 없음).
+  사용자가 Xcode 로 다시 설치해야 들어간다
 - 노트북(LG gram 14Z990, Intel 내장): **1.1.7**, 기업 등록(`enterpriseRegistered=1`,
   orgId `0dca070f-…`), **`measuredBaseRssi=-67`, `nearRssiThreshold=-67` =
   `gattRssiThreshold=-67` (거리 3단계의 [보통])**, `idleCountdownSec=15`, `bleDebugLog=0`.
@@ -658,3 +830,4 @@ Disconnected / Closed 로 보고됐다. `GattDeviceService` 는 반드시 `Close
   icesgg@gmail.com. **1.1.7 의 [승인] 을 눌렀는지 확인 안 됨** (노트북은 이미 1.1.7
   이지만, 다른 기업 PC 는 승인이 있어야 받는다)
 - `client/version.h` = 1.1.7 = 서버의 마지막 = `build\` = `dist\` = `SmartScreen-desktop.zip`
+  (SHA-256 `2242253829ef040c2690bfb86fd7d5bf1340ad11e60ca21e7ebc245d89563e3e`). main 의 소스만 앞서 있다 (위)
