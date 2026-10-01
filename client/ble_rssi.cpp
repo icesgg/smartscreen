@@ -665,6 +665,12 @@ uint64_t BleRssiScanner::BoundAddress() const {
     return m_impl->boundAddr.load();
 }
 
+// 확인 연결 조절 - 자리만 잡아 둔다 (구현은 ProberLoop 쪽 작업에서)
+void BleRssiScanner::SetGattLinked(bool) {}
+void BleRssiScanner::ResetProbeBackoff() {}
+std::wstring BleRssiScanner::ProbeTagForLog() const { return std::wstring(); }
+bool BleRssiScanner::IrkRecognisesPhone() const { return false; }
+
 bool BleRssiScanner::SetIrk(const std::wstring& irkHex) {
     if (irkHex.empty()) { m_impl->ClearIrk(); return false; }
     return m_impl->SetIrk(irkHex);

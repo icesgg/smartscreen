@@ -95,6 +95,18 @@ public:
     // 토큰으로 확인된 현재 주소. 아직 못 찾았으면 0
     uint64_t BoundAddress() const;
 
+    // --- 확인 연결(토큰 탐색) 조절 ---
+    // 이 PC 에 폰 앱이 GATT 로 붙어 있는지(IsHealthy) 판정 스레드가 반복마다 알린다.
+    // 붙은 지 60초가 지나면 탐색을 쉬고, 떨어지면 재시도 간격을 처음으로 되돌려 바로 찾는다.
+    void SetGattLinked(bool linked);
+    // 같은 주소의 연속 실패로 늘어난 재시도 간격(15 -> 120초)을 처음으로 되돌린다 (깨어남 등).
+    void ResetProbeBackoff();
+    // STATE 줄 꼬리. 탐색 중이면 ", probing for 1.3s", 끝난 지 3초 안이면
+    // ", probe ended 0.4s ago", 아니면 빈 문자열. Mac AdvScanner.probeTagForLog 와 같은 글자.
+    std::wstring ProbeTagForLog() const;
+    // IRK 가 최근 30초 안에 폰의 광고를 풀었는지. 그동안은 탐색을 쉰다.
+    bool IrkRecognisesPhone() const;
+
     // LE 본딩된 기기의 IRK(32자리 hex) 설정. Start() 전에 호출
     // 설정되면 랜덤 주소(RPA)로 광고하는 기기(iPhone 등)를 이름 없이도 식별
     bool SetIrk(const std::wstring& irkHex);

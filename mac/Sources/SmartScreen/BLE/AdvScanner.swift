@@ -277,6 +277,19 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         return v
     }
 
+    // MARK: - 확인 연결 조절 (판정 쪽에서 부른다, 아무 스레드에서나)
+
+    /// STATE 줄 꼬리. 탐색 중이면 ", probing for 1.3s", 끝난 지 3초 안이면 ", probe ended 0.4s ago",
+    /// 아니면 "". Windows BleRssiScanner::ProbeTagForLog 와 같은 글자. (자리만 잡아 둔다)
+    func probeTagForLog(now: UInt64) -> String { "" }
+
+    /// 같은 기기의 연속 실패로 늘어난 재시도 간격을 처음으로 되돌린다 (깨어남 등). (자리만 잡아 둔다)
+    func resetProbeBackoff() {}
+
+    /// 재보기 중인지. 재보기 동안은 직접 읽기 스캔(R)을 켠다 - 광고 기준을 평소 광고 경로와 같은
+    /// 조건에서 재야 한다. (자리만 잡아 둔다)
+    func setMeasuring(_ on: Bool) {}
+
     /// 수신 끊김 판정 시간(초). 5..600 으로 자른다.
     func setTimeoutSec(_ s: UInt32) {
         let sec = UInt64(min(max(s, 5), 600))
