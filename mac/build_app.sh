@@ -55,9 +55,16 @@ fi
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 # 임시(ad-hoc) 서명. 개발자 인증서가 없으므로 Gatekeeper 는 처음 한 번 막는다
-# (설치 안내.txt 1장). 서명이 아예 없으면 Apple Silicon 에서 실행이 안 된다.
-codesign --force --deep --sign - --identifier com.icesgg.smartscreen "$APP"
+# (설치 안내.txt 2장). 서명이 아예 없으면 Apple Silicon 에서 실행이 안 된다.
+#
+# designated requirement 를 식별자로 준다. 임시 서명의 기본 요건은 코드 해시라서
+# 빌드마다 다른 앱이 되고, macOS 의 개인정보 보호(TCC)가 업데이트할 때마다 블루투스
+# 허용을 다시 물을 수 있다. 기업 PC 는 업데이트를 묻지 않고 적용하므로, 그러면 아무도
+# 모르는 사이에 감시가 멈춘다 (docs/MAC.md).
+codesign --force --deep --sign - --identifier com.icesgg.smartscreen \
+    --requirements '=designated => identifier "com.icesgg.smartscreen"' "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
+codesign -d -r- "$APP" 2>&1 | tail -n 2
 
 # 만든 것을 직접 돌려 버전을 본다 (--version 은 창을 띄우지 않고 끝난다).
 GOT="$("$APP/Contents/MacOS/SmartScreen" --version | tail -n1)"

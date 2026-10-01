@@ -23,7 +23,9 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>자리 비움을 감지하려고 아이폰의 블루투스 신호 세기를 읽습니다.</string>
+	<string>자리 비움을 알아채려고 아이폰의 블루투스 신호 세기를 읽습니다.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>아이폰 앱이 1초마다 신호 세기를 알려 주도록 이 Mac 이 연결을 받습니다.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSPrincipalClass</key>

@@ -34,7 +34,19 @@ jobs:
           xcodebuild -version
           swift --version
 
+      # 단계마다 따로 돌린다 (if: always()). 판단 로직(Core)이 깨져도 앱 쪽 오류까지
+      # 한 번에 보이게 - 이 저장소에서는 컴파일 한 번이 푸시 한 번이다.
+      - name: Build core
+        working-directory: mac
+        run: swift build --target SmartScreenCore 2>&1 | tee ../core-build.log
+
+      - name: Build app
+        if: always()
+        working-directory: mac
+        run: swift build --target SmartScreen 2>&1 | tee ../app-build.log
+
       - name: Test (판단 로직)
+        if: always()
         working-directory: mac
         run: swift test 2>&1 | tee ../swift-test.log
 
@@ -57,6 +69,8 @@ jobs:
         with:
           name: logs
           path: |
+            core-build.log
+            app-build.log
             swift-test.log
             swift-build.log
           if-no-files-found: ignore
