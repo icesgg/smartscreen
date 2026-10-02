@@ -15,7 +15,90 @@ SmartScreen 프로젝트를 이어서 개발한다. 저장소: C:\work\smartscre
 - 같은 구글 계정으로 로그인한 PC 끼리 클립보드를 주고받는다 (docs/CLIPBOARD.md)
 - 새 버전을 서버에 올리면 모든 PC 가 스스로 받아 간다 (docs/UPDATE.md)
 
-## 직전 세션: Mac 실기 준비, iOS 컴파일 CI, Windows 결함 6건 (2026-10-01 오후)
+## 직전 세션: 노트북 로그로 진단 + 1.1.11 준비 (2026-10-02 오전)
+
+사용자가 결과 틀을 **하나도 채우지 않은 채** 왔다. 그래서 이 노트북의 events.log(1.1.10, 10-01 18:32 ~
+10-02 07:35)를 직접 읽어 진단하고, 정할 것을 장단점과 함께 물어 사용자가 고른 것만 넣었다. **전부 main 에 있고
+아직 안 내놓았다 = 다음 release.bat 이 1.1.11** (재보기 문구 c00e63c 도 함께 나간다). 맥북 로그는 없었다.
+
+### 노트북 로그에서 나온 것
+
+- **앉은 채 짧게 가려짐 4번** (19:53:53, 19:58:58, 19:59:23, 20:38:08). 모두 광고 경로, -68 ~ -72 (기준 -67),
+  12~15초 뒤 풀림. 그때 폰은 노트북에 GATT 로 붙어 있지 않았다. 원인 후보가 둘이다:
+  - 기준 -67 은 손으로 정한 값이고 1.1.10 에서 다시 재지 않았다 (`gattRssiOffset=0`). 1.1.9 때 GATT 경로도 같은
+    -67 로 짧은 FAR 를 6번 냈다 → 주머니에 넣은 채 다시 재기는 어쨌든 필요하다
+  - **노트북 자신의 토큰 프로버가 폰에 연결을 시작한 순간과 겹친다.** 4번 모두 프로브 시작 ±1.5초 안이었고, 로그 전체에서
+    30초 이하 광고 FAR 의 43% 가 그 창에 있었다 (우연이면 16%). 이 노트북은 IRK 로 폰을 이미 알아보는데도 프로버가 20초마다
+    연결을 시도해 거의 다 실패했다 (`probe failed` 3,106줄 = 로그의 53%). 같은 안테나라 광고를 놓치는 것으로 본다 - **원시값이
+    없어(bleDebugLog=0) 메커니즘은 미증명**. 1.1.11 의 STATE 꼬리(`, probing for 1.3s`)로 다음 로그에서 바로 갈린다
+- **노트북 → 폰 새 연결은 상태와 상관없이 거의 늘 실패한다** (약 99.5%). 성공은 폰이 막 이 PC 에 GATT 로 붙은 직후(그 링크를
+  탐, ~1.1초)나 노트북이 깨어나거나 앱이 막 시작한 직후(3.4~4.1초)뿐이다. 맥북은 브리프상 주소가 바뀐 뒤 1~3초에 다시 묶었다.
+  노트북은 IRK 덕에 판정에는 지장이 없었다
+- **깨자마자 14초 가려짐** (06:40:19, 9시간 잠 뒤). GetTickCount64 는 잠든 시간을 센다 → 깨어난 첫 판정이 "90초 넘게 못 들음 =
+  부재" 로 읽었다 (`GATT rssi=-100` 은 부재 갈래가 붙인 이름). Windows 잠금 화면 뒤에서 끝나 눈에는 안 보였을 것이다
+- **클립보드 3건 사라짐** (06:46:53 ~ 06:49:24, id 252~254). 다른 기기에서 온 것을 받았는데 Windows 가 잠겨 있어
+  (Winlogon 21:20:38 잠금 ~ 06:55:19 해제) 클립보드를 열지 못하고 버렸다. 다시 받을 길이 없다 (`s_seenId` 가 먼저 올라감)
+- **재보기 함정**: 재보기 1단계 동안 키보드·마우스를 쓰면 PC 가 TICK 을 안 보내 연결 신호를 못 잰다 (두 판 같음)
+
+### 사용자가 고른 것 (AskUserQuestion) 과 들어간 것
+
+- 확인 연결(프로버): **네 가지 다** - IRK 로 알아보는 동안 쉬기(Windows), 시도 시작·끝 로그 + 실패 줄 요약(둘 다), 연속 실패 시
+  간격 늘리기 15→30→60→120초(둘 다), GATT 로 붙은 지 60초 뒤 쉬기(Windows)
+- 결함: **네 가지 다** - 재보기 중 TICK 1초(둘 다), 잠긴 동안 온 클립보드 보관 뒤 붙이기(Windows), 깨어난 직후 12초 유예 +
+  Windows SLEEP/WAKE 줄(둘 다)
+- 맥북 직접 읽기 스캔(R): **"GATT 가 붙어 있을 때만 끄기"** (+ 필터가 멎으면 다시 걸기)
+- 남은 작업: **정지 결함만** (StopMon 15초 조인 + 같은 꼴의 GATT TickThread 3초 조인). keepalive TICK, ProbeScan 문구,
+  대시보드 supabase-js 고정은 고르지 않았다
+
+새 로그 줄 (두 판 글자 같음, 표시 없는 것은 둘 다):
+- STATE 꼬리 `, probing for 1.3s` / `, probe ended 0.4s ago` (프로브가 돌고 있거나 끝난 지 3초 안)
+- `ident: <id> probe failed x<N> since <HH:MM:SS> (last: <why>, <ms>ms)` - 첫 실패는 예전 줄 그대로, 그 뒤는 10번째마다와
+  연속이 끝날 때만 (첫 실패 순으로)
+- Windows: `ident: probes paused - IRK recognises the phone` / `ident: probes resumed - IRK has not matched for 30s` /
+  `ident: probes held - GATT linked for 60s` / `ident: probes resumed - GATT link ended` / `ident: probes resumed - measuring` /
+  `ident: <addr> back, bound again`
+- `judge: slept <S>s - absence waits up to 12s for a fresh sample` / `judge: no sample within 12s of waking - absence applies`
+- Windows: `SLEEP` / `WAKE` (WM_POWERBROADCAST, Mac 과 같은 글자), `scan thread did not stop in 15s - left to finish`,
+  `GATT tick thread did not stop in 3s - left to finish`, `scan thread could not start (err=<n>)` (그때 상태 `시작 실패`)
+- Mac: `scan: raw=off (GATT linked)` / `scan: raw=on (GATT not linked)` / `scan: raw=on (measuring)` /
+  `scan: raw=on (filter quiet)` / `scan: filter restarted (no phone via filter for 30s)`
+- Windows 클립보드: `clip: apply deferred - 클립보드를 열지 못했다 (err=, holder=, locked=)`, `clip: applied text (N bytes) after Ns`,
+  `clip: deferred item replaced by a newer one`, `clip: deferred item dropped - newer local copy`,
+  `clip: deferred item discarded - sync stopped`, `clip: read failed - ...`. 상태 글 `잠금이 풀리면 붙여요` / `클립보드가 비면 붙여요`.
+  둘 다: `clip: text body gone before download (id=<n>)`
+
+규칙 요점:
+- 깨어남은 판정 스레드가 직접 잰다 (Windows `GetTickCount64 - QueryUnbiasedInterruptTime/10000`, Mac `CLOCK_MONOTONIC -
+  CLOCK_UPTIME_RAW`, 반복 사이 5초 넘게 늘면). 새 광고·GATT 보고가 올 때까지 최대 12초 어느 갈래로도 FAR 로 안 간다. 새 샘플이
+  유예를 끝내면 미만 카운터도 처음부터 센다 (잠들기 전 샘플과 짝짓지 않게)
+- Mac R: GATT 가 10초 넘게 건강하고 **필터(F)가 묶인 폰을 30초 안에 줬을 때만** 끈다. 재보기 중엔 늘 켠다. F 다시 걸기는 120초에
+  한 번까지 - R 이 10초 안에 묶인 폰을 줬으면 F 가 그 폰을, 근거가 GATT 뿐이면 F 가 신원 후보를 하나도 30초 못 줄 때 (주소가
+  바뀐 폰은 새 식별자로 오므로)
+- Windows GATT 쉼 중에도 조용해진 결합은 푼다 (`went quiet`). 찾지는 않지만 같은 주소가 다시 들리면 탐색 없이 다시 묶는다.
+  재보기 중에는 쉬지 않는다
+- 정지 결함: 판정·틱 스레드가 `DuplicateHandle` 로 자기 정지 이벤트를 쥐고 세대 번호(`g_scanGen`)를 본다. 브리프의 "이벤트를
+  닫지 않기만" 으로는 모자랐다 - 스레드가 전역을 다시 읽어 다음 [시작] 의 이벤트를 이어받기 때문. [시작] 은 실패하면 닫힌 쪽으로
+  (`시작 실패`, 감시 안 켬)
+
+### 검토에서 바뀐 것, 남긴 것
+
+워크플로 넷: (1) 진단 8갈래 + 반박 검증(갈래마다 1~2) (2) 구현 5갈래(각자 worktree·브랜치, Mac 은 갈래마다 CI) + 통합
+(3) 검토 7관점 → 지적 30건, 건마다 반박 검증 둘 (4) 고치기 2갈래 + 통합 + 고친 것만 다시 검토. 마지막 세 건은 메인이 직접 고쳤다.
+Mac CI 시험 248 → 323+. Windows 는 별도 폴더(`build-s11`, `build_in.bat`) 빌드만. **실기 확인은 하나도 없다.**
+
+- **GATT 쉼이 묶은 주소를 얼려 두던 것** (검토, fail-open): 쉼 중에 폰이 주소를 바꾸면 옛 주소에 묶인 채 남아, GATT 가 끊기는
+  순간 그 주소의 마지막 착석 RSSI 로 최대 bleTimeoutSec 까지 NEAR 가 날 수 있었다 (토큰만 쓰는 PC). 쉼 중에도 조용해지면 풀게
+  고쳤다. 실측상 링크 중 재결합은 예전에도 1/22 만 성공했으므로 남은 차이는 작다
+- **남긴 것 (판정 쪽, 이번 변경 전부터 있던 것 - 고치면 잠그는 시점이 바뀌므로 사용자가 정할 일)**:
+  - 토큰만 쓰는 Windows PC(IRK 없음)에서 긴 GATT 링크 중 폰이 주소를 바꾸면 광고 경로가 눈이 먼다. 그 뒤 GATT 가 1초만 끊겨도
+    `GATT rssi=-100` 으로 바로 가려진다 (main.cpp 의 `gattExpected && !IsReceiving` 갈래). 후보: GATT 를 막 잃었고 직전이 NEAR 면
+    몇 초 다시 붙기를 기다리기 (두 판 같은 줄로)
+  - GATT 가 끊긴 뒤 광고 경로가 마지막 광고 샘플을 bleTimeoutSec(90초)까지 쓴다 - 그 사이 주소가 바뀌었으면 묵은 착석 값이다
+  - Mac 깨어남: 첫 프로버 틱이 묵은 결합을 풀어, 다시 묶기 전에는 광고로 유예를 끝낼 수 없다 (맥북은 다시 묶기가 1~3초라 낮음)
+  - 틱 스레드가 3초 조인을 넘기면 Stop 이 비우는 provider 를 건드릴 수 있다 (드묾), 클립보드 바로 붙이기 경로의 `expectSeq=0`
+    (예전부터), 엉뚱한 IRK(본딩된 마우스 등)면 IRK 쉼이 토큰 결합을 영영 막는다
+
+## 그 앞 세션: Mac 실기 준비, iOS 컴파일 CI, Windows 결함 6건 (2026-10-01 오후)
 
 사용자가 맥북 결과 칸을 **하나도 채우지 않은 채** 왔다 (`mac_releases` 를 anon 으로 읽어 보니 404 = SQL 도
 아직). 결과를 기다리지 않고, **맥북 시험 한 번으로 최대한 많이 갈리게** 준비했다. 전부 main 에 있다.
@@ -407,6 +490,60 @@ A 에서 스크린캡처하면 B 에서 Ctrl+V 로 붙는다. 연결고리는 �
 
 ## 남은 작업
 
+### 1.1.11 실기 확인 (가장 먼저 - 2026-10-02 에 사용자에게 준 절차)
+
+재보기는 **1.1.11 을 깐 뒤에** 한다 (프로버 쉼이 광고 표본의 짧은 꺼짐을 없애므로, 1.1.10 으로 재면 착석 최저가 낮게 나와
+기준이 헐거워진다. 1.1.11 은 재보기 중 키보드를 써도 연결 신호를 잰다). 폰은 PC 하나에만 GATT 로 붙으므로 재는 쪽이 아닌
+PC 의 앱은 끄고 잰다.
+
+1. 받기: 노트북은 release.bat 이 1.1.11 로 다시 띄운다. 대시보드(https://icesgg.github.io/smartscreen/dashboard.html)에서
+   1.1.11 [승인] (Windows, Mac). 맥북은 간단 창 띠 [업데이트] - **업데이트 직후 블루투스 허용 창이 다시 뜨는지, "앱 관리" 에
+   막히는지** 본다. 데스크톱: `Select-String -Path "$env:APPDATA\SmartScreen\events.log" -Pattern 'start: SmartScreen|update:' |
+   Select-Object -Last 5`, IRK 유무 `[bool](Select-String -Path "$env:APPDATA\SmartScreen\config.ini" -Pattern '^bleIrk=.+')`
+2. 노트북 재보기: 맥북 오른쪽 위 작은 상자 [종료] → 아이폰 설정 > Bluetooth 끄고 3초 뒤 켜기 → 노트북
+   `Select-String -Path "$env:APPDATA\SmartScreen\events.log" -Pattern 'GATT client' | Select-Object -Last 1` 이 subscribed →
+   폰을 주머니에 넣고 간단 창 [내 자리에 맞게 다시 재기] → [시작하기] → 1분 평소처럼 → 폰을 꺼지길 원하는 곳에 두고 →
+   [폰을 두고 왔어요] → 45초 → 숫자 적고 [이대로 쓰기]. 두 번 한다
+3. 맥북 재보기: 노트북 오버레이 [종료] → 아이폰 Bluetooth 껐다 켜기 → 맥북 고급 창 아래 `GATT: linked` → 2와 같이 두 번 →
+   `grep "재보기" ~/Library/Application\ Support/SmartScreen/events.log | tail -2`. 끝나면 노트북
+   `Start-Process C:\work\smartscreen\build\SmartScreen.exe`
+4. 두 대 다 켜고 1~2시간 평소대로, 한 번은 폰을 주머니에 넣은 채 1분 넘게 자리 비우기. 그 뒤 로그 (아래 틀)
+5. 잠금 중 클립보드: 노트북 Win+L → 2분 → 아이폰이나 맥북에서 글 복사 → 1분 → 잠금 풀고 메모장 Ctrl+V →
+   `Select-String -Path "$env:APPDATA\SmartScreen\events.log" -Pattern 'clip:' | Select-Object -Last 6`
+   (기대: `clip: apply deferred - ... locked=1` → `clip: applied text (... bytes) after Ns`)
+6. 덮개: 보호 중에 폰을 지닌 채 덮개 닫고 3분 → 열고 로그인 →
+   `Select-String -Path "$env:APPDATA\SmartScreen\events.log" -Pattern 'SLEEP|WAKE|judge:|STATE|BLACK' | Select-Object -Last 8`
+   (기대: `SLEEP`, `WAKE`, `judge: slept ...s`, 그 뒤 `NEAR -> FAR (GATT rssi=-100` 없음)
+7. (선택) 아이폰 앱 새 소스: 맥북 터미널 `curl -L -o ~/Downloads/SSBeaconApp.swift
+   https://raw.githubusercontent.com/icesgg/smartscreen/main/ios/SSBeacon/SSBeaconApp.swift` → Xcode 프로젝트의 SSBeaconApp.swift
+   내용을 바꿔 넣고 ⌘R. 시험: 폰이 노트북에 붙은 채 잠그고 주머니 → 노트북 오버레이 [종료] →
+   `Start-Process C:\work\smartscreen\build\SmartScreen.exe` → 2분 →
+   `Select-String -Path "$env:APPDATA\SmartScreen\events.log" -Pattern 'START thr=|GATT client' | Select-Object -Last 3`
+   (START 뒤 몇 초 만에 subscribed 인가 - 예전 앱은 19~27분 안 붙었다)
+8. (선택) 맥북 구글 로그인 결과 창: 간단 창 '내 폰' [바꾸기] → [예] (구글 계정) → 같은 계정으로 로그인 → 결과 창이 브라우저
+   앞에 뜨는가
+
+결과를 받는 틀 (다음 세션 첫 메시지):
+
+```
+- 업데이트: 노트북 [1.1.11 / 아님], 맥북 [받았다 / 안 받았다], 블루투스 허용 창 [다시 떴다 / 안 떴다], 앱 관리 [막혔다 / 아니다],
+  데스크톱 [받았다 / 안 받았다 / 모름], 데스크톱 IRK [True / False]
+- 노트북 재보기 (주머니): 광고 [앉음 ~ / 비움 ~], 연결 [앉음 ~ / 비움 ~ / 못 쟀다]  x2
+- 맥북 재보기 (주머니): 광고 [앉음 ~ / 비움 ~], 연결 [앉음 ~ / 비움 ~ / 못 쟀다]  x2
+- 앉아 있는데 가려짐: 맥북 [없다 / 가끔 / 자주], 노트북 [없다 / 가끔 / 자주]
+- 자리를 뜨면 가려짐: 맥북 [됐다 / 안 됐다], 노트북 [됐다 / 안 됐다], 광고 경로로 도는 쪽도 [됐다 / 안 됐다]
+- 잠금 중 클립보드: [붙었다 / 안 붙었다 - 로그]
+- 덮개 닫았다 열기: [깬 직후 가려짐 없음 / 있음 - 로그]
+- 아이폰 새 소스: [안 했다 / 했다 - 재시작 뒤 subscribed 까지 N초]
+- 구글 로그인 결과 창 (맥북): [앞 / 뒤에 숨음 / 안 해 봄]
+- 노트북 로그: Select-String -Path "$env:APPDATA\SmartScreen\events.log" -Pattern '재보기|START thr=|STATE|BLACK|GATT client|ident: probes|probe failed|back, bound|judge:|SLEEP|WAKE|clip: apply|clip: deferred' | Select-Object -Last 120
+- 맥북 로그: grep -E "재보기|START thr=|STATE|BLACK|GATT client|ident: .*locked|ident: probes|probe failed|judge:|scan: |SLEEP|WAKE|update:" ~/Library/Application\ Support/SmartScreen/events.log | tail -150
+```
+
+읽는 법: 짧은 광고 가림의 STATE 줄에 `, probing for` / `, probe ended` 꼬리가 붙어 있으면 그 맥북·PC 의 프로버가 방아쇠다
+(노트북은 IRK 쉼이라 거의 안 나와야 한다 - `ident: probes paused` 줄). 맥북은 `scan: raw=` 줄로 R 이 언제 꺼지고 켜졌는지,
+`scan: filter restarted` 가 자주 나오는지(필터가 멎는 Mac) 본다.
+
 ### Mac. 실기 시험 (2026-10-01 저녁에 대부분 됐다 - 결과는 "현재 기기 상태")
 
 **남은 것은 셋이다.**
@@ -425,8 +562,8 @@ A 에서 스크린캡처하면 B 에서 Ctrl+V 로 붙는다. 연결고리는 �
      Mac CI 248 통과, Windows 는 별도 폴더 MSVC 빌드. 실기 미확인
 2. 아직 결과를 못 받은 것: 재보기 마법사 문구, 로그인 결과 창 위치, 잠자기 줄, 업데이트(1.1.10 을 낸 뒤 -
    블루투스 허용을 다시 묻는가)
-3. 직접 읽기 스캔(R)을 끌지: 잠긴 폰은 대부분 `locked adverts via filter` 로 왔고 `raw bit 31` 은 가끔이었다.
-   R 은 주변 광고를 다 받으므로 CPU 를 쓴다. 필터가 계속 되면 끄는 쪽 (끄기 전에 사용자에게 물을 것)
+3. ~~직접 읽기 스캔(R)을 끌지~~ → **사용자가 "GATT 가 붙어 있을 때만 끄기" 로 정해 1.1.11 에 넣었다** (2026-10-02,
+   위 "직전 세션"). 완전히 끄는 안은 필터 단독이 실기에서 돈 적이 없고 멎으면 되살릴 길이 없어 권하지 않았다
 
 2026-10-01 오후 세션에 사용자에게 준 절차 (명령어 그대로). 결과 줄의 뜻은 docs/MAC.md "확인하지 못한
 것" 1. 앞의 것이 안 되면 뒤는 의미가 없다.
@@ -506,8 +643,8 @@ OK center=1, 업데이트 확인, BLE NEAR, 오버레이 [종료] 로 0.5초 만
   원래 안 뜬다** - 이 시험은 그 값을 비우거나(고급 창) 다른 PC 에서
 - 기업 등록 창: 틀린 UUID → "그런 조직이 없어요", 칸을 비우고 누르기 → 등록 해제.
   **해제는 노트북에서 하면 다시 등록해야 한다**
-- 클립보드: 노트북은 `clipSync=0` 이라 꺼져 있다 (브리프에 "켜짐" 이라 적혀 있던 것은
-  틀렸다). 켜서 두 대 사이 글·그림, 암호 관리자에서 복사한 것은 안 넘어가야 한다
+- 클립보드: 노트북은 10-01 13:57 부터 `clipSync=1` (켜짐, 10-02 config.ini 로 확인). 두 대 사이 글·그림은 됐다.
+  암호 관리자에서 복사한 것은 안 넘어가야 한다 (아직 안 봄)
 - 구글 로그인 한 번 (리스너를 다시 썼다). `release.bat` 의 Publish 로그인은 통과했다 -
   같은 리스너다
 - 대시보드: `사진.PNG` 올리기(소문자로 들어가야 한다), 같은 파일 두 번, 송출 토글, 삭제
@@ -549,15 +686,21 @@ provider 를 지원한다. 사내 배포(TestFlight 내부)면 해당 없다.
 ### 3. 검토해 볼 것
 
 - Mac 에서 고친 Windows 결함은 2026-10-01 오후에 client/ 에도 고쳤다 (main, 1.1.8 대기). 검토에서 보류한 것:
-  - Windows ScanThread 가 StopMon 의 15초 조인을 넘기면 (레거시 RFCOMM 경로만) `g_hStopEvent` 를 닫고
-    null 로 만들어, 스레드의 대기가 즉시 실패하며 영영 안 끝나고 다음 [시작] 에 두 벌이 돈다. 시간 초과면
-    이벤트를 닫지 말고 남겨 두는 것이 싸다
-  - PC 가 입력 중에도 30~45초마다 TICK 을 하나 보내면 (client/ble_gatt.cpp, mac GattServer.swift) 폰이
-    "입력 중" 과 "묵은 링크" 를 가를 수 있어 감시의 끊기 간격을 늘릴 필요가 없다 (폰 배터리와 맞바꿈)
-  - 잠긴 채 정지된 폰 앱은 묵은 구독을 알아챌 사건이 없다. 캐시되지 않는 특성을 하나 두고 PC 가 읽게
-    하면 깨울 수 있을지 모른다 - 프로토콜 변경이고, 실제로 깨우는지 먼저 실기로 볼 것
-  - Windows 1.1.7 의 첫 결과 블록(ProbeScan 의 요약 앞 줄)은 "신원 서비스는 있는데 토큰 읽기 실패" 와
-    "신원 서비스 없음" 을 같은 문구로 말한다 (Mac 요약은 가른다)
+  - ~~Windows ScanThread 15초 조인~~ → **1.1.11 에서 고쳤다** (위 "직전 세션" - 같은 꼴의 GATT TickThread 3초 조인도)
+  - 입력 중 keepalive TICK (30~45초마다 하나): 2026-10-02 에 **사용자가 고르지 않았다.** 이유: 폰에 깔린 앱은 감시가 없는 옛
+    소스라 다시 깔기 전에는 이득이 0, 감시는 앱이 깨어 있을 때만 돌아 잠긴 폰의 묵은 링크는 이것으로도 못 고침. 새 폰 소스를
+    깐 뒤 "앉은 채 GATT client lost → subscribed 쌍" 이 자주 보이면 그때 PC 는 2바이트 TICK(`[seq, 0x01]`, 옛 폰은 첫 바이트만
+    읽어 호환) + 폰은 표식이 있으면 끊기 간격을 두 배로 늘리지 않는 안(A-2)
+  - 잠긴 채 정지된 폰 앱은 묵은 구독을 알아챌 사건이 없다. 캐시되지 않는 특성을 PC 가 읽게 하면 깨울 수 있을지 모른다
+    (Apple 문서상 bluetooth-peripheral 앱은 central 의 읽기에 깨어난다). 미뤘다: 먼저 위 절차 7(새 폰 소스 + 재시작 시험)로
+    `didModifyServices` 가 잠긴 폰도 다시 구독시키는지 볼 것. 하게 되면 프로버(광고 주소)가 아니라 이미 맺어진 링크 위로 읽어야
+    한다 - 노트북의 프로버 연결은 거의 늘 실패한다
+  - Windows ProbeScan 의 첫 결과 블록은 "신원 서비스는 있는데 토큰 읽기 실패" 와 "신원 서비스 없음" 을 같은 문구로 말한다
+    (Mac 요약은 가른다). 2026-10-02 에 고르지 않았다 - 아이폰 재설치 시험 전에 하면 득이 있다
+  - 판정 쪽, 이번 변경 전부터 있던 것 둘 (위 "직전 세션 - 남긴 것"): 토큰만 쓰는 Windows PC 의 "GATT 1초 끊김 = 즉시 가림",
+    GATT 가 끊긴 뒤 묵은 광고 샘플을 90초까지 씀. 고치면 잠그는 시점이 바뀐다 - 사용자에게 물을 것
+  - 대시보드 supabase-js 가 `@2` 로만 불린다 (`docs/dashboard.html`). 정확한 버전 고정은 S 이고 공개 페이지 수정이라 사용자 확인.
+    2026-10-02 에 고르지 않았다
 - **`contents` 와 `content` 버킷은 여전히 로그인 없이 읽힌다** (전 org 의 행, 파일
   바이트, 목록). 쓰기는 닫혔다 (위 "직전 세션"). 조이려면 기업 PC 에 로그인이나 그에
   준하는 것이 필요해진다 (`org_release_approvals` 도 같은 이유로 anon 읽기다) - 그
@@ -579,7 +722,8 @@ provider 를 지원한다. 사내 배포(TestFlight 내부)면 해당 없다.
 ## 작업 환경
 
 - **Mac 판 빌드는 CI 에서만 된다.** `mac` 이나 `main` 에 `mac/**` 를 바꿔 푸시하면
-  `mac.yml` 이 돈다. 오류 보기: `gh run view <id> --log` 에서 `.swift:<줄>:<칸>: error:` 줄.
+  `mac.yml` 이 돈다. 다른 브랜치는 `gh workflow run mac.yml --ref <브랜치>` (workflow_dispatch) - 2026-10-02 에 갈래마다
+  브랜치를 따로 두고 이렇게 돌렸다. 오류 보기: `gh run view <id> --log` 에서 `.swift:<줄>:<칸>: error:` 줄.
   zip 받기: `gh run download <id> -n SmartScreen-mac`. 판단 로직을 고치면 `mac/Tests` 에 시험을
   더할 것 - Mac 이 없는 곳에서 행동을 확인하는 유일한 길이다 (2026-10-01 오후 현재 237개)
 - **iOS 컴파일은 `ios.yml` 이 본다** (`ios/**` 를 main / mac / ios 에 푸시). typecheck + SIL 까지이고
@@ -623,8 +767,10 @@ provider 를 지원한다. 사내 배포(TestFlight 내부)면 해당 없다.
 - **라이브가 실제로 어떤지는 `supabase/inspect_live.sql` 로 본다** (읽기 전용, select
   하나, 결과 한 칸). 정책·RLS·버킷·함수·트리거가 다 나온다. anon key 로 밖에서 찔러
   보는 것보다 이게 먼저다 - 아래 함정
-- `build-review\` 는 직전 세션이 앱을 건드리지 않고 컴파일을 확인하려고 만든 폴더다
-  (.gitignore). `do_build.bat` 와 같은 명령을 빌드 폴더만 바꿔 돌린 것이고, 지워도 된다
+- `build-review\`, `build-s11\` 은 앱을 건드리지 않고 컴파일을 확인하려고 만든 폴더다
+  (.gitignore). `do_build.bat` 와 같은 명령을 빌드 폴더만 바꿔 돌린 것이고, 지워도 된다. 2026-10-02 에는 원본과 빌드 폴더를
+  인자로 받는 배치(vcvarsall → cmake `<원본>` -G "NMake Makefiles" → `nmake SmartScreen`)를 스크래치에 두고 썼다. **이
+  하네스에서는 Bash 의 `cmd.exe` 호출이 막혀 있어 PowerShell 도구로 `& "<bat>" <원본> <빌드폴더>` 를 돌렸다**
 - `.env` 에 Supabase URL/anon key 가 있다 (커밋 안 됨, `.env.example` 이 형식)
 - config.ini 편집은 앱을 완전히 종료한 뒤에. 안 그러면 앱이 덮어쓴다
 - Git Bash 에서 `cmd.exe /c x.bat` 은 `/c` 가 `C:/` 로 바뀌어 **배너만 찍고 끝난다.**
@@ -632,6 +778,19 @@ provider 를 지원한다. 사내 배포(TestFlight 내부)면 해당 없다.
   따옴표가 깨진다 - cmd 에서 돌리거나 `build\Publish.exe` 를 직접 부를 것
 
 ## 함정
+
+### 짧은 가림을 기준값 탓으로만 읽지 말 것 - 같은 안테나의 다른 일과 시각을 맞춰 볼 것
+
+2026-10-02 의 첫 진단은 "원인은 -67 기준, 코드는 설계대로" 였고 반박 검증자 둘이 모두 뒤집었다. 짧은 광고 FAR 의 시각을
+프로버의 연결 시작(로그 시각 - 걸린 ms)과 맞대 보니 4/4 가 ±1.5초 안이었다. 기준값과 판정 규칙만 보면 이것이 안 보인다.
+연결 시도, Classic 탐침, 광고 재시작처럼 같은 라디오를 쓰는 일의 시각을 먼저 겹쳐 볼 것. 1.1.11 부터 STATE 줄의 꼬리가
+그것을 바로 말해 준다.
+
+### GetTickCount64 는 잠든 시간을 센다
+
+수신 시각과 "지금" 의 차이로 부재를 판단하는 코드는 깨어난 첫 판정에서 잠든 시간 전체를 "못 들은 시간" 으로 읽는다
+(2026-10-02 06:40:19, 9시간 → 즉시 FAR). Mac 의 `CLOCK_MONOTONIC` 도 같다. 잠든 시간은 Windows
+`GetTickCount64 - QueryUnbiasedInterruptTime/10000`, Mac `CLOCK_MONOTONIC - CLOCK_UPTIME_RAW` 로 잰다 (1.1.11 의 깨어남 유예).
 
 ### macOS 에서 경고창을 메인 큐 블록 안에서 띄우지 말 것
 
@@ -838,6 +997,14 @@ Disconnected / Closed 로 보고됐다. `GattDeviceService` 는 반드시 `Close
 
 ## 현재 기기 상태
 
+- **2026-10-02 오전 (이 세션 끝)**: main 에 1.1.11 거리(위 "직전 세션")가 있고 **아직 안 내놓음** - `client/version.h` = 1.1.10 =
+  서버의 마지막. 저장소 맨 위 zip 둘은 1.1.10 그대로 (`SmartScreen-desktop.zip` `cda52a67…c9cd`, `SmartScreen-mac.zip`
+  `47438c23…3755`). 사용자가 release.bat 을 돌리면 1.1.11 로 바뀐다
+- 노트북(1.1.10)은 **아직 다시 재지 않았다** (`gattRssiOffset=0`, 기준 -67, `clipSync=1` - 10-01 13:57 에 켰다). 07:32 부터 폰이
+  노트북에 GATT 로 붙어 있었다. 밤새 앱을 켠 채 잠들었다가(21:20:39 덮개, S3) 06:40 에 깼다 - 앱이 켜진 채 잠자기를 건넌 것은
+  로그 전체에서 이 한 번이다. Windows 는 21:20:38 잠금 ~ 06:55:19 해제
+- 노트북 events.log 는 6,000줄 남짓이고 절반 넘게 `probe failed` 다 (1.1.11 의 IRK 쉼과 실패 줄 요약으로 줄어야 한다)
+- 맥북·데스크톱의 1.1.10 결과(재보기, 업데이트 때 블루투스 허용 창, 로그인 결과 창)는 이번에도 못 받았다
 - **1.1.10 이 나갔다** (사용자 release.bat, 2026-10-01 18:50 - 경로마다 따로, 아이폰 클립보드) 와 승인 (Windows,
   Mac). 서버 Windows exe `0007a7af...`, Mac zip `47438c233f90ea7da0c8caf55a5d1cafbc934cfd48d3284f40d154e043103755`
   (= 저장소 맨 위 `SmartScreen-mac.zip`), `SmartScreen-desktop.zip` `cda52a67dc6e4a0d0ba08d2bc707a2802a86e4365a85e99f07cb98de2c5ac9cd`.
@@ -903,11 +1070,11 @@ Disconnected / Closed 로 보고됐다. `GattDeviceService` 는 반드시 `Close
   쌍(thr = set)은 1.1.7 시절의 예전 결함이다 (13번째)
 - 아이폰 앱: 폰에 깔린 것은 2026-10-01 오후 전의 소스다 (`didModifyServices`·TICK 감시·`import Combine` 없음).
   사용자가 Xcode 로 다시 설치해야 들어간다
-- 노트북(LG gram 14Z990, Intel 내장): **1.1.9**, 기업 등록(`enterpriseRegistered=1`,
+- 노트북(LG gram 14Z990, Intel 내장): **1.1.10** (10-02), 기업 등록(`enterpriseRegistered=1`,
   orgId `0dca070f-…`), **`measuredBaseRssi=-67`, `nearRssiThreshold=-67` =
   `gattRssiThreshold=-67` (거리 3단계의 [보통])**, `idleCountdownSec=15`, `bleDebugLog=0`.
   IRK 와 폰 토큰 둘 다 설정돼 있다. **`centerImagePath` 는 개인 그림
-  (`Pictures\대시보드.jpg`), `clipSync=0`** (2026-10-01 에 config.ini 를 직접 봤다). 앱은
+  (`Pictures\대시보드.jpg`)**, `clipSync=1`, `gattRssiOffset=0` (2026-10-02 에 config.ini 를 직접 봤다). 앱은
   `C:\work\smartscreen\build\SmartScreen.exe` 로 돌고 있다 (release.bat 이 그걸 닫았다
   다시 띄운다; `dist\` 의 exe 와 같은 파일이다)
 - 데스크톱: 마지막으로 확인한 것은 **1.1.4** (1.1.5/1.1.6 을 받았는지 확인 안 됨 - 위
@@ -921,4 +1088,4 @@ Disconnected / Closed 로 보고됐다. `GattDeviceService` 는 반드시 `Close
   1.1.9 는 1.1.8 과 같은 코드를 제대로 빌드한 것). `mac_releases.sql` 적용됨 (`mac_releases` 에 1.1.8,
   1.1.9). `release_admins` 에 icesgg@gmail.com. `org_release_approvals` 에는 1.1.1 한 줄뿐이었다
   (2026-10-01 14시 전, anon 으로 읽음)
-- `client/version.h` = 1.1.9 = 서버의 마지막(Windows, Mac) = `build\` = `dist\` = 두 zip
+- `client/version.h` = 1.1.10 = 서버의 마지막(Windows, Mac) = `build\` = `dist\` = 두 zip (2026-10-02, release.bat 전)

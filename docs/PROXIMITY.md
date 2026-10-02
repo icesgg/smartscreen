@@ -134,6 +134,9 @@ right token. Anything weaker than ten dB below the threshold is skipped
 
 Probing runs on its own thread. A connection attempt takes seconds and
 can take twenty, which is far too long to spend in a scan callback.
+How often it probes, and when it holds back, is under
+[Radio contention](#radio-contention): probing too eagerly turned out to
+cost the advertisement path more than it gained.
 
 ### IRK, the earlier route
 
@@ -513,6 +516,39 @@ time when the phone is switched off rather than carried away.
 keyboard event. Someone typing is present regardless of what the radio says,
 and without this a stale reading could lock the screen out from under them.
 
+**Waking is not absence.** `GetTickCount64` counts time spent asleep, so
+on the first judgement after a resume every age looks expired: the receive
+timeout has passed, the GATT link is gone, keepAlive has lapsed. The
+laptop woke at 06:40:19 (2026-10-02, 1.1.10) after nine hours with the
+phone beside it and locked on that first judgement —
+`STATE NEAR -> FAR  (GATT rssi=-100 dBm thr=-67 set=-67, latency=0ms reachable=1)`
+— 14 s of black screen behind the Windows lock screen, judged on samples
+from the night before.
+
+The judge thread now (1.1.11) measures sleep itself. `GetTickCount64()` minus
+`QueryUnbiasedInterruptTime()/10000` is the time spent asleep since boot;
+when it grows by 5 s or more between two iterations, the PC slept:
+`judge: slept <S>s - absence waits up to 12s for a fresh sample`. Until a
+fresh advertisement or GATT report arrives after the resume, and for at
+most 12 s — about twice the p90 packet gap — no branch moves to FAR: not
+−100, not the dropped-GATT absence rule, not the two-sample rule or its
+cap, not keepAlive. NEAR is still allowed. The fresh sample that ends the
+wait also restarts the below-threshold counter; otherwise one below sample
+from before the sleep pairs with the first one after it, and its
+hours-old first tick makes the 6 s cap look long expired, so a single
+packet would blank the screen. With nothing in 12 s, the judge logs
+`judge: no sample within 12s of waking - absence applies` and the normal
+rules apply. The only cost is that a real absence across a sleep is
+detected up to 12 s later. The probe backoff below is reset on waking too.
+
+The judge measures sleep rather than listening for the power notification
+because the notification arrives on the UI thread in no fixed order with
+the judge, which could already have judged on stale state. Windows now
+logs `SLEEP` and `WAKE` from `WM_POWERBROADCAST` all the same, in the
+same words as the Mac, so the log shows when it happened; those lines
+change nothing. The Mac does the same measurement with `CLOCK_MONOTONIC`
+minus `CLOCK_UPTIME_RAW`, with the same lines.
+
 **A lost signal means absence** (`bleLostMeansFar`, default on). The
 companion app advertises continuously, so silence means the phone left.
 Falling back to the latency probe here would reinstate the 30-50 m blind spot
@@ -532,6 +568,15 @@ therefore sends `TICK` only when it needs an answer:
 | idle 5 s … 2 min | 1 s |
 | idle over 2 min | 3 s |
 | screen locked | 2 s — watching for return |
+| re-measure wizard measuring | 1 s, regardless of input |
+
+A locked screen takes precedence, then measuring, then the input rules.
+The measuring row came later (1.1.11). The wizard records a GATT series,
+and that series is made of reports, so with the input rule in force
+someone who typed during the seated minute stopped the `TICK`, got no
+connection samples, and was told the connection signal had not been
+measured. Locking is off while measuring, so judging on those reports
+cannot blank the screen.
 
 The advertisement path costs the phone nothing beyond advertising, which it
 does regardless.
@@ -554,6 +599,101 @@ An earlier change stopped the advertisement scanner while a companion app was
 expected, on the theory that scanning and advertising were competing. It was
 reverted: the evidence never supported it, and afterwards a dongle stopped
 being discoverable at all.
+
+### The token prober
+
+The prober that reads the phone's token shares that antenna too, and in
+1.1.10 it probed far more than it bound.
+
+The laptop's own `events.log` on the evening of 2026-10-01 has four short
+locks while seated, all on the advertisement path: 19:53:53, 19:58:58,
+19:59:23 and 20:38:08, each on a reading of −68 to −72 against a
+threshold of −67, each over in 12-15 s. Every one of them started within
+±1.5 s of the prober starting a connection to the phone. Over the whole
+log, 43% of advertisement-path FAR stretches shorter than 30 s fell within
+±1.5 s of a probe start, where chance alone would put about 16%.
+
+The probing bought nothing. This laptop has an IRK that already
+recognises the phone, yet the prober kept trying roughly every 20 s and
+almost always failed: 3,106 `probe failed` lines, 53% of the log at the
+time. A new LE connection from the laptop to the phone succeeded,
+essentially, only right after the phone had opened its own GATT link to
+this PC — the link is reused and the probe takes about 1.1 s — or right
+after the laptop woke or started monitoring. Otherwise about 99.5% came
+back `Unreachable`.
+
+The mechanism is not proven. Contention for the one antenna fits, but raw
+RSSI was not being logged (`bleDebugLog=0`), so the log cannot say whether
+packets were missed or merely read weaker during a connection attempt.
+The coincidence and the waste are established, and probing less addresses
+both. 1.1.11 holds the prober back in four ways (`client/ble_rssi.cpp`):
+
+- **IRK pause.** While an IRK has resolved one of the phone's
+  advertisements in the last 30 s, nothing is probed — the phone is
+  already recognised: `ident: probes paused - IRK recognises the phone`,
+  then `ident: probes resumed - IRK has not matched for 30s`. The
+  advertisement callback now resolves the address even when it is the
+  bound one, so the pause does not lapse merely because a binding exists,
+  and the binding is left alone while paused. The status bar shows `IRK`
+  rather than `IRK/토큰 대기`.
+- **GATT hold.** Once this PC's GATT link has been healthy for 60 s, the
+  prober stops looking: `ident: probes held - GATT linked for 60s`, and
+  when the link ends `ident: probes resumed - GATT link ended`. Bindings
+  happen mostly in the first minute of a link (32 of 38 in the logs), so
+  that minute still probes. There is no hold while the re-measure wizard
+  measures, because token-identified advertisement samples only come from
+  the bound address and a hold could leave the wizard without any:
+  `ident: probes resumed - measuring`. The hold stops the looking, not the
+  bookkeeping. A bound address silent for 30 s is still released
+  (`ident: <addr> went quiet, looking again`), so the status bar and the
+  log stop claiming a binding the phone left long ago; and if that same
+  address advertises again it is bound again on sight, without a probe
+  (`ident: <addr> back, bound again`) — it was verified by token, and
+  random addresses do not repeat. When both apply the IRK pause wins, and
+  only the reason in force is logged.
+- **Unreachable backoff.** An address that fails to connect is retried
+  after 15, 30, 60, 120, 120… s. The first retries stay quick because the
+  right address has been seen to fail five times in a row; the cap is
+  there because the same candidate otherwise failed every 18 s for 27
+  minutes. The counts are forgotten, and waiting addresses cut
+  back to the first step, when the odds change: monitoring start, a token
+  change, waking, and the GATT link starting or ending. A link ending
+  clears the `Unreachable` holds outright, so the next 2 s tick probes at
+  once — while the link lasted the phone may have moved address, and
+  adverts are now the only way to see it. The ten-minute "not our phone"
+  hold is unchanged.
+- **Failure streaks.** The first failure of an address is logged as
+  before, `ident: <addr> probe failed (<why>, <ms>ms)`. After that one
+  line sums up the streak every tenth failure and when it ends — on a
+  bind, a "not our phone" verdict, a pause or hold, stop, a backoff reset,
+  or five minutes without a probe:
+  `ident: <addr> probe failed x<N> since <HH:MM:SS> (last: <why>, <ms>ms)`.
+  Streaks that end together are written in order of first failure, so the
+  `since` times read forwards.
+
+The `STATE` line also says whether a probe was running when the state
+changed: `, probing for 1.3s` while one runs, `, probe ended 0.4s ago` for
+up to 3 s after. The four locks above had to be matched to probes by
+subtracting each probe's duration from the time its failure was logged;
+with the tail, the next coincidence is on the line itself.
+
+The Mac has the same backoff, streak lines and `STATE` tail
+(`mac/Sources/SmartScreenCore/ProbePolicy.swift`), but no IRK and no GATT
+hold. It re-binds within 1-3 s after the phone rotates its address, which
+the Windows laptop does not; its own measure is to stop the unfiltered
+scan while the GATT link is healthy, described in [MAC.md](MAC.md).
+
+**What this leaves open.** On a Windows PC with a token and no IRK, a
+phone that rotates its address during a long GATT link is not looked for
+again until the link ends — though looking during a link rarely worked
+before either: re-binding during a link succeeded once in 22 in the
+logs. Meanwhile the advertisement path hears nothing it can attribute,
+so a GATT drop of a second, once the last matched advertisement is older
+than `bleTimeoutSec`, is judged as absence. And within `bleTimeoutSec` of
+the last matched advertisement, a GATT drop hands the judgement to the
+advertisement path, which judges on the last advertisement RSSI it heard
+— a value up to `bleTimeoutSec` old. Both are in the judge, not the
+prober, and are left for the user to decide.
 
 ---
 
@@ -605,6 +745,25 @@ Recorded because most were invisible without instrumentation.
   Changing the registration left those verdicts, and the current binding,
   standing — so a freshly registered phone could be ignored for ten minutes,
   and a phone that had just been replaced kept holding the screen open.
+- [Stop] waited 15 s for the judge thread and then closed and cleared the
+  global stop event whether or not the thread had ended. A thread still
+  inside an RFCOMM connect (up to 14.1 s measured) came back, re-read the
+  global, spun on `WAIT_FAILED`, and adopted the event the next [Start]
+  created: two judge threads. Each thread now owns a duplicated handle and
+  a generation number (`g_scanGen`, bumped by [Start]); it exits when its
+  generation is stale, its results carry the generation, and stale results
+  are dropped. A timeout is logged,
+  `scan thread did not stop in 15s - left to finish`, and the GATT tick
+  thread got the same treatment
+  (`GATT tick thread did not stop in 3s - left to finish`). If the judge
+  thread cannot be started at all, [Start] now fails closed — scanner and
+  GATT server stopped, [Start] enabled again, the state label reading
+  `시작 실패` — instead of showing protection with nothing judging.
+- Tick differences against a value another thread had just written could
+  wrap: a bound phone advertising between reading "now" and the
+  comparison gave a huge unsigned age, which could log a spurious
+  `went quiet` or make `GetSmoothedRssi` return a one-off −100. Those
+  differences now floor at zero.
 
 Three of these were dormant until link encryption was turned off. Without
 it the companion app never connected, so the code that runs once it has —
