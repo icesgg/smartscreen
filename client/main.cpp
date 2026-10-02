@@ -554,9 +554,17 @@ static DWORD WINAPI ScanThread(LPVOID param) {
             }
             asleepPrev = asleep;
         }
+        // 새 샘플 시각은 반복마다 여기서 한 번만 읽는다. 아래의 깨어남 유예는 "깬 뒤 새 샘플이
+        // 왔는가" 를 이 값으로 본다. 판정이 RSSI 를 읽은 뒤에 다시 읽으면, 그 사이에 막 도착한
+        // 샘플이 유예를 끝내면서도 이번 판정의 RSSI 는 잠들기 전 것일 수 있다. 먼저 읽어 두면
+        // 유예를 끝낸 샘플은 언제나 이번 판정이 읽은 RSSI 에 이미 들어 있다.
+        const ULONGLONG advTick0  = g_bleScanner.LastReceivedTick();
+        const ULONGLONG gattTick0 = g_bleGatt.LastReportTick();
         // 이 PC 에 폰 앱이 붙어 있는지 스캐너에 알린다. 오래 붙어 있으면 확인 연결을 쉬고,
         // 떨어지면 곧바로 다시 찾는다 (BleRssiScanner::SetGattLinked).
         g_bleScanner.SetGattLinked(g_bleGatt.IsHealthy());
+        // 재보기가 재는 동안은 그 쉼을 걸지 않는다 (BleRssiScanner::SetMeasuring).
+        g_bleScanner.SetMeasuring(g_measuring);
 
         bool reachable = false; DWORD latency = 0; int wsaErr = 0;
         bool isNear = false, bleAvail = false, useGatt = false;
@@ -673,8 +681,13 @@ static DWORD WINAPI ScanThread(LPVOID param) {
         // 평소 규칙으로 돌아가고, kWakeGraceMs 안에 하나도 안 오면 그때는 정말 없는 것이다.
         bool wakeHold = false;
         if (resumeTick != 0) {
-            if (g_bleScanner.LastReceivedTick() > resumeTick || g_bleGatt.LastReportTick() > resumeTick) {
+            if (advTick0 > resumeTick || gattTick0 > resumeTick) {
+                // 새 샘플이 유예를 끝냈다. 미만 카운터는 잠들기 전 것이니 비운다 - 남겨 두면
+                // 잠들기 전의 미만 샘플 하나와 이 새 샘플 하나가 2샘플 규칙을 채우거나, 6초
+                // 상한이 이미 지나 있어 새 샘플 하나로 FAR 가 된다. 이 샘플부터 처음부터 센다
+                // (Mac ProximityJudge 와 같다). 유예가 샘플 없이 끝난 갈래는 그대로 둔다.
                 resumeTick = 0;
+                belowCount = 0; belowFirstTick = 0; belowSampleTick = 0;
             } else if (now - resumeTick < kWakeGraceMs) {
                 wakeHold = true;
             } else {
@@ -1040,6 +1053,13 @@ static void StartMon() {
     cfg.bannerImagePath = g_bannerImagePath;
     SaveAppConfig(cfg);
 
+    // 판정 상태는 스레드가 뜨기 전에 여기서 먼저 비운다 (스레드가 처음에 쓰는 것과 같은 값).
+    // 스레드가 실제로 돌기 전에는 지난 [시작] 의 NEAR 와 lastNearTick 이 그대로 남아 있어,
+    // 그 사이 1초 타이머가 지난 세션의 lastNearTick 으로 유휴 잠금을 재고 상태 칸이 지난
+    // 세션의 "근처" 색으로 그려진다. 스레드를 못 띄우면(아래) 이 값 그대로 남는다 - 멀리.
+    g_proxState = ProxState::Far;
+    g_lastNearTick = 0;
+
     // 판정 스레드는 새 세대 번호와, 정지 이벤트를 복제한 자기 사본을 받는다 (StopScanThread 주석).
     // 지난 [중지] 에서 끝나지 않고 남은 스레드가 있으면 세대가 바뀐 것을 보고 스스로 끝난다.
     int gen = ++g_scanGen;
@@ -1051,10 +1071,19 @@ static void StartMon() {
                         &sp->stopEvent, 0, FALSE, DUPLICATE_SAME_ACCESS))
         th = CreateThread(nullptr, 0, ScanThread, sp, 0, nullptr);
     if (!th) {
-        // 예전에는 확인하지 않았다. 판정 스레드가 없으면 화면은 "보호 중" 인데 아무것도 판정하지 않는다.
+        // 판정 스레드가 없으면 감시를 시작하지 않는다. 예전에는 적기만 하고 그대로 "보호 중" 으로
+        // 넘어가서, 화면은 감시 중인데 아무것도 판정하지 않았다 - 자리를 떠도 잠기지 않는다.
+        // 띄운 것을 도로 내리고 [시작] 을 다시 누를 수 있게 둔다.
         DbgEvent(L"scan thread could not start (err=%lu)", GetLastError());
         if (sp->stopEvent) CloseHandle(sp->stopEvent);
         delete sp;
+        if (g_hStopEvent) { CloseHandle(g_hStopEvent); g_hStopEvent = nullptr; }
+        g_bleScanner.Stop();
+        g_bleGatt.Stop();
+        EnableWindow(g_hBtnStart, TRUE); EnableWindow(g_hBtnStop, FALSE);
+        SetWindowTextW(g_hStateLabel, L"  \xC2DC\xC791 \xC2E4\xD328");  // 시작 실패
+        UpdateOverlayState();
+        return;
     }
     g_hThread = th;
     g_monitoring = true;

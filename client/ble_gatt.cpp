@@ -124,6 +124,27 @@ struct BleGattServer::Impl {
         }
     }
 
+    // 올린 서비스를 내린다: 콜백 해제, 광고 중지, 특성/공급자 해제, 로그 닫기.
+    // Stop 과, 광고까지 올린 뒤 틱 스레드를 못 띄운 Start 가 같이 쓴다. 틱 스레드는 이미
+    // 없거나 멈추라고 한 뒤다 - 스레드가 tickChar 를 만지는 중에 비우지 않도록.
+    void ReleaseService() {
+        try {
+            if (tickChar) tickChar.SubscribedClientsChanged(subToken);
+            if (rssiChar) rssiChar.WriteRequested(writeToken);
+            if (provider) provider.StopAdvertising();
+        } catch (...) {}
+        Sleep(300);   // Windows가 광고를 정리할 시간 (바로 재시작하면 Aborted가 됨)
+        tickChar = nullptr;
+        rssiChar = nullptr;
+        provider = nullptr;
+        subscribers = 0;
+        intervalMs = 0;
+        {
+            std::lock_guard<std::mutex> lock(logMutex);
+            if (logFile) { fclose(logFile); logFile = nullptr; }
+        }
+    }
+
     // 틱 스레드가 받는 것. 스레드가 시작하면서 지운다.
     struct TickParam {
         Impl*  self;
@@ -346,10 +367,15 @@ bool BleGattServer::Start(bool plain, const std::wstring& logPath) {
                             &tp->stopEvent, 0, FALSE, DUPLICATE_SAME_ACCESS))
             m_impl->thread = CreateThread(nullptr, 0, Impl::TickThread, tp, 0, nullptr);
         if (!m_impl->thread) {
-            // 예전에는 확인하지 않았다. 틱이 없으면 폰 앱이 깨지 않아 보고가 안 온다.
+            // 틱이 없으면 폰 앱이 깨지 않아 보고가 안 온다. 예전에는 적기만 하고 running 으로
+            // 두어서, 판정은 "서버가 돈다" 를 믿고 폰 앱의 연결을 기다렸다 - 붙어도 보고는 없다.
+            // 실패한 시작처럼 다 내리고 false 를 돌려준다 (부르는 쪽은 광고 경로로 간다).
             DbgEvent(L"GATT tick thread could not start (err=%lu)", GetLastError());
             if (tp->stopEvent) CloseHandle(tp->stopEvent);
             delete tp;
+            if (m_impl->stopEvent) { CloseHandle(m_impl->stopEvent); m_impl->stopEvent = nullptr; }
+            m_impl->ReleaseService();
+            return false;
         }
         m_impl->running = true;
         DbgEvent(L"GATT server started (%s)", plain ? L"plain" : L"encryption required");
@@ -377,21 +403,7 @@ void BleGattServer::Stop() {
         CloseHandle(m_impl->thread); m_impl->thread = nullptr;
     }
     if (m_impl->stopEvent) { CloseHandle(m_impl->stopEvent); m_impl->stopEvent = nullptr; }
-    try {
-        if (m_impl->tickChar) m_impl->tickChar.SubscribedClientsChanged(m_impl->subToken);
-        if (m_impl->rssiChar) m_impl->rssiChar.WriteRequested(m_impl->writeToken);
-        if (m_impl->provider) m_impl->provider.StopAdvertising();
-    } catch (...) {}
-    Sleep(300);   // Windows가 광고를 정리할 시간 (바로 재시작하면 Aborted가 됨)
-    m_impl->tickChar = nullptr;
-    m_impl->rssiChar = nullptr;
-    m_impl->provider = nullptr;
-    m_impl->subscribers = 0;
-    m_impl->intervalMs = 0;
-    {
-        std::lock_guard<std::mutex> lock(m_impl->logMutex);
-        if (m_impl->logFile) { fclose(m_impl->logFile); m_impl->logFile = nullptr; }
-    }
+    m_impl->ReleaseService();
 }
 
 bool BleGattServer::IsRunning() const { return m_impl->running; }
