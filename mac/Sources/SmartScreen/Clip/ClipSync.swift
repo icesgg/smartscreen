@@ -1033,8 +1033,14 @@ private final class ClipEngine {
             }
             return
         }
-        // 그 사이에 행이 정리됐다 (보낸 쪽이 더 새 것을 올렸다). 말없이 버린다.
-        if got.data.isEmpty { return }
+        // 그 사이에 행이 정리됐다 (보낸 쪽이 더 새 것을 올렸다). 오류는 아니다 - 그것이 남의 것이면 다음
+        // 조회가 받는다. 하지만 글인데 아무 줄도 남기지 않으면 받은 줄도 실패한 줄도 없이 그 id 만 사라져서,
+        // 로그로는 잃은 것인지 건너뛴 것인지 가릴 수 없다 (Windows 와 같은 줄). 그림은 빈 본문이면 위에서
+        // 이미 실패로 왔다.
+        if got.data.isEmpty {
+            if !it.isImage { EventLog.write("clip: text body gone before download (id=\(it.id))") }
+            return
+        }
         if ClipLogic.isOverCap(Int64(got.data.count), cap: cap) {
             setStatus(false, ClipLogic.overCapReceiveText(size: Int64(got.data.count), cap: cap))
             EventLog.write("clip: incoming id=\(it.id) dropped - \(got.data.count) bytes is over the cap")
