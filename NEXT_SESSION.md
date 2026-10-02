@@ -19,7 +19,7 @@ SmartScreen 프로젝트를 이어서 개발한다. 저장소: C:\work\smartscre
 
 사용자가 결과 틀을 **하나도 채우지 않은 채** 왔다. 그래서 이 노트북의 events.log(1.1.10, 10-01 18:32 ~
 10-02 07:35)를 직접 읽어 진단하고, 정할 것을 장단점과 함께 물어 사용자가 고른 것만 넣었다. **전부 main 에 있고
-아직 안 내놓았다 = 다음 release.bat 이 1.1.11** (재보기 문구 c00e63c 도 함께 나간다). 맥북 로그는 없었다.
+1.1.11 로 나갔다** (2026-10-02 11:21, 사용자 release.bat - 재보기 문구 c00e63c 도 함께). 아래 "현재 기기 상태". 맥북 로그는 없었다.
 
 ### 노트북 로그에서 나온 것
 
@@ -997,9 +997,19 @@ Disconnected / Closed 로 보고됐다. `GattDeviceService` 는 반드시 `Close
 
 ## 현재 기기 상태
 
-- **2026-10-02 오전 (이 세션 끝)**: main 에 1.1.11 거리(위 "직전 세션")가 있고 **아직 안 내놓음** - `client/version.h` = 1.1.10 =
-  서버의 마지막. 저장소 맨 위 zip 둘은 1.1.10 그대로 (`SmartScreen-desktop.zip` `cda52a67…c9cd`, `SmartScreen-mac.zip`
-  `47438c23…3755`). 사용자가 release.bat 을 돌리면 1.1.11 로 바뀐다
+- **1.1.11 이 나갔다** (사용자 release.bat, 2026-10-02 11:21 Windows / 11:24 Mac, 커밋 `3be9748`). 사용자: "모두 정상 업데이트
+  됨". 확인한 것: 서버 `releases` 1.1.11 sha `4e9a164f…5537` = `build\SmartScreen.exe` = `dist\` = zip 안의 exe, exe 안에 1.1.11 만
+  있고 1.1.10 없음. `mac_releases` 1.1.11 sha = 저장소 맨 위 `SmartScreen-mac.zip`
+  `7824e52c3779a588077129347ca2b10af7e18668b938aa0b4777f2cb7ba076e7`. `SmartScreen-desktop.zip`
+  `9162ed97cc2daf83c37de4be91a7eacc1503836b5f42b9b4b37b0debddc599e4`. 노트북 `start: SmartScreen 1.1.11` →
+  `update: up to date (1.1.11, 12 row(s))`
+- **1.1.11 노트북 첫 10분 (11:21~11:30)**: `ident: probes paused - IRK recognises the phone` 바로 뒤로 `probe failed` 가 한 줄도
+  없다 (IRK 쉼이 돈다). 그런데도 광고 경로 짧은 FAR 3번 (11:26:24, 11:26:46, 11:29:34, 모두 adv -71, STATE 꼬리 없음 = 프로브
+  없음, 11:29:34 는 idleCountdown=9). GATT 는 그동안 노트북에 안 붙었다 (폰이 맥북에 붙은 것으로 보임). **이 셋은 프로버가 아니라
+  기준 -67 쪽이다** - 노트북 재보기(주머니)가 가장 급하다
+- 승인 기록: `org_release_approvals` / `org_mac_release_approvals` 의 1.1.9·1.1.10 승인은 조직 `c40caa88-…` 이고, 노트북의
+  orgId 와 콘텐츠의 조직은 `0dca070f-…` 다 (그 조직의 승인은 1.1.1 뿐). 노트북은 release.bat 이 직접 바꾸므로 상관없었다.
+  1.1.11 승인은 아직 어느 조직에도 없다 (기업 등록 PC 가 승인을 기다리는지 볼 것)
 - 노트북(1.1.10)은 **아직 다시 재지 않았다** (`gattRssiOffset=0`, 기준 -67, `clipSync=1` - 10-01 13:57 에 켰다). 07:32 부터 폰이
   노트북에 GATT 로 붙어 있었다. 밤새 앱을 켠 채 잠들었다가(21:20:39 덮개, S3) 06:40 에 깼다 - 앱이 켜진 채 잠자기를 건넌 것은
   로그 전체에서 이 한 번이다. Windows 는 21:20:38 잠금 ~ 06:55:19 해제
@@ -1088,4 +1098,4 @@ Disconnected / Closed 로 보고됐다. `GattDeviceService` 는 반드시 `Close
   1.1.9 는 1.1.8 과 같은 코드를 제대로 빌드한 것). `mac_releases.sql` 적용됨 (`mac_releases` 에 1.1.8,
   1.1.9). `release_admins` 에 icesgg@gmail.com. `org_release_approvals` 에는 1.1.1 한 줄뿐이었다
   (2026-10-01 14시 전, anon 으로 읽음)
-- `client/version.h` = 1.1.10 = 서버의 마지막(Windows, Mac) = `build\` = `dist\` = 두 zip (2026-10-02, release.bat 전)
+- `client/version.h` = 1.1.11 = 서버의 마지막(Windows, Mac) = `build\` = `dist\` = 두 zip (2026-10-02 11:24)
