@@ -250,6 +250,11 @@ public final class ProximityJudge {
             let fresh = scanner.lastReceivedTick > resumeTick || gatt.lastReportTick > resumeTick
             if fresh {
                 resumeTick = 0
+                // 미만 카운터도 여기서 처음부터 센다 (Windows 도 같다). 잠들기 전에 센 미만 샘플 하나가
+                // 남아 있으면 깬 뒤 첫 미만 샘플 하나로 2 샘플 규칙이 차고, 그 첫 샘플 시각이 몇 시간 전이라
+                // 6 s 상한도 이미 지나 있다 - 책상 앞에서 Mac 을 연 사람 앞에서 샘플 하나로 화면이 가려진다.
+                // 유예가 샘플 없이 끝날 때는 지우지 않는다 - 그때는 평소 규칙 그대로다.
+                belowCount = 0; belowFirstTick = 0; belowSampleTick = 0
             } else if t &- resumeTick < ProximityJudge.wakeGraceMs {
                 holdForWake = true
             } else {

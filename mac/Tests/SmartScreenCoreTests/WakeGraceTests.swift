@@ -233,6 +233,67 @@ final class WakeGraceTests: XCTestCase {
         XCTAssertEqual(j.resumeTick, 0)
     }
 
+    /// 잠들기 전에 미만 샘플 하나가 세어져 있었다: 깬 뒤 첫 새 미만 샘플은 새 구간의 첫 샘플이다 (NEAR 그대로).
+    /// 두 번째 새 미만 샘플에 FAR. 잠들기 전의 하나와 합쳐 2 샘플이 차거나, 그때의 첫 시각으로 6 s 상한이
+    /// 이미 지난 것으로 보면 안 된다.
+    func testPreSleepBelowSampleIsForgottenWhenAFreshSampleEndsTheGrace() {
+        let j = nearJudge()
+        _ = step(j, WakeFix.t0 + 1_000, WakeFix.adv(-70, tick: WakeFix.t0 + 1_000))   // 미만 1 (자기 전)
+        XCTAssertEqual(j.state, .near)
+        j.noteResume(now: WakeFix.wake)
+        // 유예 중, 아직 새 샘플이 없다
+        XCTAssertEqual(step(j, WakeFix.wake, WakeFix.stale()).result.state, .near)
+
+        var out = step(j, WakeFix.wake + 1_000, WakeFix.adv(-70, tick: WakeFix.wake + 1_000))   // 새 미만 1
+        XCTAssertEqual(out.result.state, .near)
+        XCTAssertEqual(j.resumeTick, 0)
+        XCTAssertFalse(out.wakeGraceExpired)
+
+        out = step(j, WakeFix.wake + 2_500, WakeFix.adv(-72, tick: WakeFix.wake + 2_500))       // 새 미만 2
+        XCTAssertEqual(out.result.state, .far)
+        XCTAssertEqual(out.result.prevState, .near)
+    }
+
+    /// 짧게 잤다 (스캐너가 아직 잠들기 전의 미만 값을 들고 있다): 깬 뒤 첫 새 미만 샘플만으로는 FAR 가 아니다.
+    /// 그 뒤 6 s 상한은 새 샘플의 시각부터 잰다.
+    func testFreshSampleRestartsTheBelowCap() {
+        let j = nearJudge()
+        _ = step(j, WakeFix.t0 + 1_000, WakeFix.adv(-70, tick: WakeFix.t0 + 1_000))   // 미만 1 (자기 전)
+        let resume = WakeFix.t0 + 30_000
+        j.noteResume(now: resume)
+        var out = step(j, resume + 1_000, WakeFix.adv(-70, tick: resume + 1_000))          // 새 미만 1
+        XCTAssertEqual(out.result.state, .near)
+        // 같은 샘플을 다시 봐도 세지 않는다. 6 s 가 되기 전에는 그대로
+        out = step(j, resume + 6_999, WakeFix.adv(-70, tick: resume + 1_000))
+        XCTAssertEqual(out.result.state, .near)
+        out = step(j, resume + 7_000, WakeFix.adv(-70, tick: resume + 1_000))
+        XCTAssertEqual(out.result.state, .far)
+    }
+
+    /// 잠들기 전 미만 1 이 있고 유예가 새 샘플 없이 끝났다: 예전처럼 평소 규칙이다 (카운터를 지우지 않는다) -
+    /// 낡은 값을 들고 있는 스캐너로는 6 s 상한이 이미 지나 FAR, 수신 타임아웃이 지났으면 -100 으로 FAR.
+    func testGraceExpiringWithoutASampleStillGoesFar() {
+        // 짧게 잤다: 스캐너는 아직 잠들기 전의 미만 값(-70)을 들고 있다
+        let j = nearJudge()
+        _ = step(j, WakeFix.t0 + 1_000, WakeFix.adv(-70, tick: WakeFix.t0 + 1_000))
+        let resume = WakeFix.t0 + 30_000
+        j.noteResume(now: resume)
+        var out = step(j, resume + 11_999, WakeFix.adv(-70, tick: WakeFix.t0 + 1_000))
+        XCTAssertEqual(out.result.state, .near)
+        out = step(j, resume + 12_000, WakeFix.adv(-70, tick: WakeFix.t0 + 1_000))
+        XCTAssertTrue(out.wakeGraceExpired)
+        XCTAssertEqual(out.result.state, .far)
+
+        // 오래 잤다: 수신 타임아웃이 지나 -100
+        let k = nearJudge()
+        _ = step(k, WakeFix.t0 + 1_000, WakeFix.adv(-70, tick: WakeFix.t0 + 1_000))
+        k.noteResume(now: WakeFix.wake)
+        XCTAssertEqual(step(k, WakeFix.wake + 6_000, WakeFix.stale()).result.state, .near)
+        out = step(k, WakeFix.wake + 12_000, WakeFix.stale())
+        XCTAssertTrue(out.wakeGraceExpired)
+        XCTAssertEqual(out.result.state, .far)
+    }
+
     /// 유예는 FAR 로 가는 것만 막는다: 입력 중(GATT 폴링 쉼)이면 FAR 에서 NEAR 로 간다.
     func testGraceDoesNotBlockNear() {
         let j = ProximityJudge()
