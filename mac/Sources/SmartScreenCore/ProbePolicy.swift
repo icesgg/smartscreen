@@ -123,14 +123,16 @@ public struct ProbeFailStreaks<ID: Hashable> {
         return s.needsSummary ? s : nil
     }
 
-    /// 모든 연속을 끝낸다 (감시 멈춤, 재시도 간격 되돌리기). 요약할 것들을 첫 실패 순으로.
+    /// 모든 연속을 끝낸다 (감시 멈춤, 재시도 간격 되돌리기). 요약할 것들을 첫 실패 순으로
+    /// (같으면 주소 글자 순).
     public mutating func endAll() -> [Ended] {
         let out = ProbeFailStreaks.summaries(streaks)
         streaks.removeAll()
         return out
     }
 
-    /// streakIdleMs 동안 다시 탐색하지 않은 주소의 연속을 끝낸다. 요약할 것들을 첫 실패 순으로.
+    /// streakIdleMs 동안 다시 탐색하지 않은 주소의 연속을 끝낸다. 요약할 것들을 첫 실패 순으로
+    /// (같으면 주소 글자 순).
     public mutating func expire(now: UInt64) -> [Ended] {
         let idle = streaks.filter { now > $0.value.lastTick && now - $0.value.lastTick >= ProbePolicy.streakIdleMs }
         if idle.isEmpty { return [] }
@@ -138,10 +140,78 @@ public struct ProbeFailStreaks<ID: Hashable> {
         return ProbeFailStreaks.summaries(idle)
     }
 
+    /// 첫 실패 순, 같으면 주소의 글자 순 (Windows 도 같은 순서 - 같으면 주소 순). 사전의 순서는 실행마다
+    /// 달라서, 같은 시각에 시작한 연속들의 요약 줄이 로그마다 다른 순서로 나오면 두 로그를 맞대 볼 수 없다.
     private static func summaries(_ d: [ID: ProbeFailStreak]) -> [Ended] {
         return d.filter { $0.value.needsSummary }
             .map { Ended(id: $0.key, streak: $0.value) }
-            .sorted { $0.streak.firstTick < $1.streak.firstTick }
+            .sorted {
+                if $0.streak.firstTick != $1.streak.firstTick { return $0.streak.firstTick < $1.streak.firstTick }
+                return String(describing: $0.id) < String(describing: $1.id)
+            }
+    }
+}
+
+/// 주소마다의 재시도 금지 (AdvScanner). Windows client/ble_rssi.cpp 의 Hold { until, set, notOurs } 와 같다.
+/// set 은 금지를 건 시각: 간격을 처음으로 되돌릴 때 "첫 실패였다면" 의 길이(15초)로 줄이는 데 쓴다.
+/// notOurs 는 10분짜리 "남의 폰" 판정 - 되돌리기도 GATT 링크 끊김도 건드리지 않는다 (다시 붙어도 같은 답이다).
+public struct ProbeHolds<ID: Hashable> {
+    public struct Hold: Equatable {
+        public var until: UInt64
+        public var set: UInt64
+        public var notOurs: Bool
+
+        public init(until: UInt64, set: UInt64, notOurs: Bool) {
+            self.until = until
+            self.set = set
+            self.notOurs = notOurs
+        }
+    }
+
+    public private(set) var holds: [ID: Hold] = [:]
+
+    public init() {}
+
+    public var count: Int {
+        return holds.count
+    }
+
+    /// 후보 고르기(IdentCandidatePick)가 보는 모양: 주소 -> 금지가 풀리는 시각.
+    public var untilById: [ID: UInt64] {
+        return holds.mapValues { $0.until }
+    }
+
+    /// 못 붙었다 (또는 탐색을 막 시작했다 - 잠정 잠금). now 부터 ms 동안 다시 찌르지 않는다.
+    public mutating func holdUnreachable(_ id: ID, now: UInt64, ms: UInt64) {
+        holds[id] = Hold(until: now + ms, set: now, notOurs: false)
+    }
+
+    /// 붙었는데 남의 기기로 확인됐다 (서비스가 없다, 토큰이 다르다): 10분.
+    public mutating func holdNotOurs(_ id: ID, now: UInt64) {
+        holds[id] = Hold(until: now + ProbePolicy.notOursMs, set: now, notOurs: true)
+    }
+
+    /// 감시 멈춤, 토큰 바뀜: 남의 폰 판정까지 모두 버린다.
+    public mutating func removeAll() {
+        holds.removeAll()
+    }
+
+    /// 풀린 지 keepMs 넘은 것을 버린다. 식별자는 주기적으로 바뀌므로 그냥 두면 계속 쌓인다.
+    public mutating func prune(now: UInt64, keepMs: UInt64) {
+        holds = holds.filter { !(now > $0.value.until && now - $0.value.until > keepMs) }
+    }
+
+    /// 재시도 간격을 처음으로 되돌린다. 못 붙어 걸린 금지는 "첫 실패였다면" 의 길이(set + 15초)로 줄인다
+    /// (깨어남, GATT 링크가 생김). clearUnreachable 이면 아예 지워서 다음 2초 틱에 바로 찾는다 (감시 시작,
+    /// GATT 링크가 끊김 - 링크가 있는 동안 폰이 주소를 바꿨을 수 있다). 남의 폰 판정은 어느 쪽이든 그대로.
+    public mutating func resetBackoff(clearUnreachable: Bool) {
+        for (id, h) in holds where !h.notOurs {
+            if clearUnreachable {
+                holds.removeValue(forKey: id)
+            } else {
+                holds[id]?.until = min(h.until, h.set + ProbePolicy.unreachableFirstMs)
+            }
+        }
     }
 }
 
