@@ -26,8 +26,11 @@ constexpr wchar_t kWndClass[] = L"SmartScreenClipSync";
 constexpr UINT    WM_CLIP_APPLY = WM_APP + 71;   // LPARAM = new Payload*
 
 // 받았는데 붙이지 못하고 미뤄 둔 것을 다시 붙여 보는 타이머 (s_pending 의 주석).
+// 1초: 다른 앱이 잠깐 쥐고 있었던 것이면 사람은 곧바로 Ctrl+V 를 누른다. 3초마다 보면
+// 그 사이의 Ctrl+V 에는 옛것이 붙는다. 바퀴마다 OpenClipboard 를 한 번만 부르므로
+// (RetryPending) 잠긴 밤 내내 돌아도 이 스레드를 재우지 않는다.
 constexpr UINT_PTR kDeferTimerId = 1;
-constexpr UINT     kDeferRetryMs = 3000;
+constexpr UINT     kDeferRetryMs = 1000;
 
 // 입력이 최근에 있었으면 자주, 자리를 비웠으면 드물게 확인한다. 이 앱은 자리
 // 비움을 이미 재고 있으므로 그 값을 쓰면 공짜다. 5초 고정으로 두면 하루에
@@ -789,18 +792,21 @@ void ClearPending(HWND hw) {
 
 // p 를 미뤄 둔다 (소유권을 넘겨받는다). 쥔 것이 있으면 그것은 더 오래된 것이다 -
 // WM_CLIP_APPLY 가 새 항목을 보자마자 비우므로 여기서는 지우기만 한다.
-void DeferPending(HWND hw, Payload* p) {
+// locked: 열지 못한 까닭이 잠금 화면인지 (OpenFail::locked). 상태 글은 그 까닭대로 쓴다 -
+// 다른 앱이 클립보드를 쥐고 있을 뿐인데 "잠금이 풀리면" 이라고 하면, 잠겨 있지도 않은
+// 화면 앞의 사람은 무엇을 기다리는지 알 수 없다.
+void DeferPending(HWND hw, Payload* p, bool locked) {
     delete s_pending;
     s_pending = p;
     s_pendingSince = GetTickCount64();
     SetTimer(hw, kDeferTimerId, kDeferRetryMs, nullptr);
-    SetStatus(true, L"잠금이 풀리면 붙여요");
+    SetStatus(true, locked ? L"잠금이 풀리면 붙여요" : L"클립보드가 비면 붙여요");
 }
 
-// 미뤄 둔 것을 다시 붙여 본다 (kDeferTimerId, 3초마다).
+// 미뤄 둔 것을 다시 붙여 본다 (kDeferTimerId, 1초마다).
 //
 // 한 번만 열어 본다. 여기 온 것은 30ms x 8 이 이미 실패한 뒤이고 잠금은 몇 분에서
-// 밤새 간다 - 3초마다 240ms 씩 이 스레드를 재우면 그동안 클립보드 알림도 밀린다.
+// 밤새 간다 - 1초마다 240ms 씩 이 스레드를 재우면 그동안 클립보드 알림도 밀린다.
 void RetryPending(HWND hw) {
     if (!s_pending) { KillTimer(hw, kDeferTimerId); return; }
 
@@ -832,7 +838,7 @@ void RetryPending(HWND hw) {
     }
 
     // 열리는지만 먼저 본다. 그림이면 WriteClipboard 가 열기 전에 PNG 를 푸는데, 잠긴
-    // 밤 내내 3초마다 수 MB 를 풀 이유가 없다. 열었다 닫기만 해서는 순번이 오르지 않는다.
+    // 밤 내내 1초마다 수 MB 를 풀 이유가 없다. 열었다 닫기만 해서는 순번이 오르지 않는다.
     if (!OpenClipboard(hw)) return;
     CloseClipboard();
 
@@ -998,7 +1004,7 @@ LRESULT CALLBACK ClipWndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         if (r == WriteResult::Busy) {
             // 열지 못한 것은 버리지 않고 쥐고 있다가 다시 붙여 본다 (s_pending 의 주석).
             // s_seenId 는 이미 올랐으므로 여기서 놓으면 다시 받을 길이 없다.
-            DeferPending(hw, p);
+            DeferPending(hw, p, of.failed && of.locked);
             DbgEvent(L"clip: apply deferred - %s (%s)", why.c_str(), of.diag.c_str());
             return 0;
         }

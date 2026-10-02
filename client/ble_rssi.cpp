@@ -140,6 +140,7 @@ struct BleRssiScanner::Impl {
         int fails = 0;          // 이번 연속의 실패 수 (= 재시도 간격의 몇 번째)
         int logged = 0;         // 그중 로그에 이미 담긴 수
         SYSTEMTIME firstWall{}; // 첫 실패의 벽시계 시각 (since 표시용)
+        ULONGLONG firstTick = 0; // 첫 실패 시각. 한꺼번에 끝난 묶음 줄을 이 순서로 적는다
         ULONGLONG lastTick = 0; // 마지막 실패 시각 = 마지막으로 탐색한 시각
         std::wstring lastWhy;
         DWORD lastMs = 0;
@@ -151,6 +152,7 @@ struct BleRssiScanner::Impl {
     // 탐색 조절 상태. 판정 스레드(SetGattLinked), 광고 콜백(irkMatchTick),
     // UI 스레드(ProbeTagForLog, IrkRecognisesPhone)가 함께 보므로 원자값으로 둔다.
     std::atomic<ULONGLONG> gattLinkSince{ 0 };  // GATT 링크가 생긴 시각, 끊겨 있으면 0
+    std::atomic<bool> measuring{ false };       // 재보기가 재는 중 (SetMeasuring). 그동안 GATT 쉼 없음
     std::atomic<ULONGLONG> irkMatchTick{ 0 };   // IRK 가 폰의 광고를 마지막으로 푼 시각
     std::atomic<ULONGLONG> probeStartTick{ 0 }; // 진행 중인 탐색의 시작 시각, 없으면 0
     std::atomic<ULONGLONG> probeEndTick{ 0 };   // 마지막 탐색이 끝난 시각
@@ -194,10 +196,22 @@ struct BleRssiScanner::Impl {
         StreakLine(it->first, it->second, lines);
         streaks.erase(it);
     }
+    // 한꺼번에 끝난 연속 실패들의 묶음 줄을 첫 실패 순으로 적는다 (같으면 주소 순).
+    // map 순서(주소 순)로 적으면 "since 07:12:30" 뒤에 "since 07:05:10" 이 오는 식으로
+    // 로그의 시간이 거꾸로 읽힌다. Mac ProbeFailStreaks.summaries 도 첫 실패 순이다.
+    static void StreakLinesByFirstFail(std::vector<std::pair<uint64_t, Streak>>& ended,
+                                       std::vector<std::wstring>& lines) {
+        std::sort(ended.begin(), ended.end(), [](auto const& x, auto const& y) {
+            if (x.second.firstTick != y.second.firstTick) return x.second.firstTick < y.second.firstTick;
+            return x.first < y.first;
+        });
+        for (auto const& [a, s] : ended) StreakLine(a, s, lines);
+    }
     // candMutex 를 쥔 채 부른다. 모든 연속 실패를 끝낸다 (쉼, 감시 중지, 되돌리기).
     void EndAllStreaks(std::vector<std::wstring>& lines) {
-        for (auto const& [a, s] : streaks) StreakLine(a, s, lines);
+        std::vector<std::pair<uint64_t, Streak>> ended(streaks.begin(), streaks.end());
         streaks.clear();
+        StreakLinesByFirstFail(ended, lines);
     }
 
     // 재시도 간격을 처음으로 되돌리고 연속 실패 수를 잊는다. 잊기 전에 묶음 줄은 남긴다 -
@@ -226,7 +240,9 @@ struct BleRssiScanner::Impl {
         return t != 0 && Elapsed(now, t) < kIrkPauseMs && HasIrk();
     }
     // GATT 링크가 60초 넘게 이어졌는지. 결합은 대부분(위 32/38) 그 60초 안에 됐다.
+    // 재보기가 재는 동안은 아니다 (BleRssiScanner::SetMeasuring 주석).
     bool GattHeld(ULONGLONG now) const {
+        if (measuring) return false;
         ULONGLONG s = gattLinkSince.load();
         return s != 0 && Elapsed(now, s) >= kGattHoldAfterMs;
     }
@@ -424,6 +440,9 @@ struct BleRssiScanner::Impl {
                     DbgEvent(L"ident: probes held - GATT linked for 60s");
                 else if (pause == Pause::Irk)
                     DbgEvent(L"ident: probes resumed - IRK has not matched for 30s");
+                else if (measuring && gattLinkSince.load() != 0)
+                    // 링크는 그대로인데 재보기가 재기 시작했다 (SetMeasuring 주석)
+                    DbgEvent(L"ident: probes resumed - measuring");
                 else
                     DbgEvent(L"ident: probes resumed - GATT link ended");
                 pause = next;
@@ -435,29 +454,39 @@ struct BleRssiScanner::Impl {
                 std::vector<std::wstring> lines;
                 {
                     std::lock_guard<std::mutex> lock(candMutex);
+                    std::vector<std::pair<uint64_t, Streak>> ended;
                     for (auto it = streaks.begin(); it != streaks.end(); ) {
                         if (Elapsed(now, it->second.lastTick) < kStreakIdleMs) { ++it; continue; }
-                        StreakLine(it->first, it->second, lines);
+                        ended.emplace_back(it->first, std::move(it->second));
                         it = streaks.erase(it);
                     }
+                    StreakLinesByFirstFail(ended, lines);
                 }
                 LogLines(lines);
             }
 
-            // 쉬는 동안에는 결합도 그대로 둔다. 여기서 went quiet 로 풀면 "looking again"
-            // 이라고 적고는 찾지 않는다. 쉼이 끝나는 틱에 아래에서 바로 풀고 찾는다.
-            if (pause != Pause::None) continue;
+            // IRK 가 폰을 알아보는 동안에는 결합도 그대로 둔다 (예전대로). 그동안 폰의 광고는
+            // IRK 로 잡히므로 옛 주소가 남아 있어도 판정은 같다. 쉼이 끝나는 틱에 아래에서
+            // 바로 풀고 찾는다.
+            if (pause == Pause::Irk) continue;
 
             // 묶인 주소가 아직 광고 중이면 할 일이 없다.
             // 30초로 잡은 이유: 실측 광고 간격의 최대가 19.9초였다. 20초로 두면
             // 정상적인 공백에도 결합이 풀려 헛된 탐색이 돈다. 늦게 풀어도 손해가
             // 적은 쪽인데, 결합이 풀려도 RSSI 는 bleTimeoutSec(90초)까지 살아 있다.
             if (boundAddr && Elapsed(now, boundSeenTick) < 30000) continue;
+            // GATT 로 쉬는 동안에도 조용해진 결합은 푼다. 예전에는 쉼 내내 그대로 두어서
+            // 폰이 주소를 바꾼 뒤에도 BoundAddress() 가 옛 주소를 가리켰다 - 링크가 이어지는
+            // 내내 상태바는 "토큰" 으로 묶여 있다고 말하고, 로그에는 언제 놓쳤는지가 남지 않았다.
             if (boundAddr) {
                 DbgEvent(L"ident: %012llX went quiet, looking again",
                          (unsigned long long)boundAddr.load());
                 boundAddr = 0;
             }
+            // 찾는 것만은 쉰다. GATT 쉼은 링크가 오래된 뒤의 탐색이 거의 결합되지 않아
+            // 일부러 둔 것이다 (kGattHoldAfterMs). 쉼이 끝나는 틱에 아래로 내려가 찾는다 -
+            // 위 줄의 "looking again" 은 그때부터다.
+            if (pause == Pause::Gatt) continue;
 
             uint64_t pick = 0; bool pickRnd = true; int pickBit = -1, pickRssi = -127;
             {
@@ -525,7 +554,7 @@ struct BleRssiScanner::Impl {
                                             (unsigned long long)pick, reason, took));
                     } else {
                         Streak& s = streaks[pick];
-                        if (s.fails == 0) GetLocalTime(&s.firstWall);
+                        if (s.fails == 0) { GetLocalTime(&s.firstWall); s.firstTick = done; }
                         s.fails++;
                         s.lastTick = done;
                         s.lastWhy = reason;
@@ -892,6 +921,12 @@ void BleRssiScanner::SetGattLinked(bool linked) {
     if (linked == was) return;
     m_impl->gattLinkSince = linked ? (std::max)(GetTickCount64(), 1ULL) : 0;
     m_impl->ResetBackoff(!linked);
+}
+
+// 판정 스레드가 반복마다 부른다. 값만 둔다 - "탐색 재개 - measuring" 줄과 재기가 끝난 뒤의
+// "쉼" 은 프로버 스레드가 다음 2초 틱에 GattHeld 를 보고 적는다.
+void BleRssiScanner::SetMeasuring(bool measuring) {
+    m_impl->measuring = measuring;
 }
 
 // 깨어남 등. 잠든 동안 폰도 주소도 달라졌을 수 있어 처음 간격부터 다시 찾는다.

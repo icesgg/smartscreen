@@ -99,6 +99,11 @@ public:
     // 이 PC 에 폰 앱이 GATT 로 붙어 있는지(IsHealthy) 판정 스레드가 반복마다 알린다.
     // 붙은 지 60초가 지나면 탐색을 쉬고, 떨어지면 재시도 간격을 처음으로 되돌려 바로 찾는다.
     void SetGattLinked(bool linked);
+    // 재보기(g_measuring)가 재는 중인지. 판정 스레드가 SetGattLinked 옆에서 반복마다 알린다.
+    // 재는 동안에는 GATT 링크가 오래됐어도 쉬지 않는다 - 토큰으로 알아보는 폰의 광고 표본은
+    // 묶인 주소에서만 오는데, 쉬는 중에 주소가 바뀌면 재는 1분 내내 광고 표본이 안 쌓인다.
+    // 끝났을 때 링크가 아직 60초를 넘겼으면 쉼이 다시 걸린다.
+    void SetMeasuring(bool measuring);
     // 같은 주소의 연속 실패로 늘어난 재시도 간격(15 -> 120초)을 처음으로 되돌린다 (깨어남 등).
     void ResetProbeBackoff();
     // STATE 줄 꼬리. 탐색 중이면 ", probing for 1.3s", 끝난 지 3초 안이면
