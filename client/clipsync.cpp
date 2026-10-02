@@ -98,6 +98,7 @@ Payload*       s_outgoing = nullptr;   // 올릴 것이 있으면 여기 (최신
 // 것에 덮인다.
 Payload*       s_pending = nullptr;
 ULONGLONG      s_pendingSince = 0;     // 미루기 시작한 GetTickCount64 ("after Ns")
+bool           s_pendingLocked = false; // 상태 글이 지금 말하는 까닭 (잠금 화면인지)
 // 이 PC 의 클립보드 읽기가 열기에서 연달아 실패하는 중인지. 첫 번만 적는다 -
 // 다른 앱이 몇 분씩 쥐고 있으면 복사할 때마다 같은 줄이 쌓인다.
 bool           s_readOpenFailing = false;
@@ -800,6 +801,7 @@ void DeferPending(HWND hw, Payload* p, bool locked) {
     s_pending = p;
     s_pendingSince = GetTickCount64();
     SetTimer(hw, kDeferTimerId, kDeferRetryMs, nullptr);
+    s_pendingLocked = locked;
     SetStatus(true, locked ? L"잠금이 풀리면 붙여요" : L"클립보드가 비면 붙여요");
 }
 
@@ -839,7 +841,16 @@ void RetryPending(HWND hw) {
 
     // 열리는지만 먼저 본다. 그림이면 WriteClipboard 가 열기 전에 PNG 를 푸는데, 잠긴
     // 밤 내내 1초마다 수 MB 를 풀 이유가 없다. 열었다 닫기만 해서는 순번이 오르지 않는다.
-    if (!OpenClipboard(hw)) return;
+    if (!OpenClipboard(hw)) {
+        // 까닭은 바뀔 수 있다 - 잠금 때문에 미뤘는데 풀린 뒤에는 다른 앱이 쥐고 있거나,
+        // 그 반대. 상태 글이 미룬 첫 순간의 까닭에 머물지 않게 바뀔 때만 고쳐 쓴다.
+        bool locked = InputDesktopLocked();
+        if (locked != s_pendingLocked) {
+            s_pendingLocked = locked;
+            SetStatus(true, locked ? L"잠금이 풀리면 붙여요" : L"클립보드가 비면 붙여요");
+        }
+        return;
+    }
     CloseClipboard();
 
     std::wstring why;

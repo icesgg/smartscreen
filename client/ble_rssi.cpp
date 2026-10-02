@@ -101,6 +101,10 @@ struct BleRssiScanner::Impl {
     std::atomic<int> identBitLearned{ -1 };     // 새로 배워서 저장해야 할 값
     std::atomic<int> probeFloor{ -75 };         // 이보다 약하면 탐색하지 않는다
     std::atomic<uint64_t> boundAddr{ 0 };       // 토큰으로 확인된 현재 주소
+    // 조용해져서 놓아준 주소. 같은 주소가 다시 광고하면 탐색 없이 다시 묶는다 - 토큰으로
+    // 확인했던 주소이고, 랜덤 주소가 우연히 같을 일은 없다. GATT 쉼 동안에는 탐색을 안 하므로
+    // 이것이 없으면 잠깐 조용했을 뿐인 폰도 링크가 끝날 때까지 광고 경로에서 빠진다.
+    std::atomic<uint64_t> quietAddr{ 0 };
     std::atomic<ULONGLONG> boundSeenTick{ 0 };  // 그 주소를 마지막으로 본 시각
 
     // 못 붙은 것은 금방 다시 해 본다. 실측에서 맞는 주소인데도 Unreachable 이
@@ -481,6 +485,7 @@ struct BleRssiScanner::Impl {
             if (boundAddr) {
                 DbgEvent(L"ident: %012llX went quiet, looking again",
                          (unsigned long long)boundAddr.load());
+                quietAddr = boundAddr.load();
                 boundAddr = 0;
             }
             // 찾는 것만은 쉰다. GATT 쉼은 링크가 오래된 뒤의 탐색이 거의 결합되지 않아
@@ -691,6 +696,17 @@ bool BleRssiScanner::Start(const std::wstring& targetDeviceName, uint64_t target
 
             // 이 광고가 "내 폰"인지. IRK 해석이 유일하게 폰을 특정하는 방법이라 먼저 본다.
             uint64_t bound = m_impl->boundAddr.load();
+            if (bound == 0 && m_impl->identOn && addr != 0) {
+                uint64_t q = addr;
+                if (m_impl->quietAddr.compare_exchange_strong(q, 0)) {
+                    // 놓아준 주소가 돌아왔다 (위 quietAddr 주석). 한 번만 일어나도록 비교-교환으로.
+                    uint64_t none = 0;
+                    if (m_impl->boundAddr.compare_exchange_strong(none, addr)) {
+                        bound = addr;
+                        DbgEvent(L"ident: %012llX back, bound again", (unsigned long long)addr);
+                    }
+                }
+            }
             bool identMatch = (bound != 0 && addr == bound);
             if (identMatch) {
                 m_impl->boundSeenTick = GetTickCount64();
@@ -819,6 +835,7 @@ void BleRssiScanner::Stop() {
     // 다시 시작하면 처음부터 후보를 모아 다시 확인한다.
     // 감시를 멈추면 연속 실패도 끝난다 - 아직 안 적힌 실패는 묶음 줄로 남긴다.
     m_impl->boundAddr = 0;
+    m_impl->quietAddr = 0;
     m_impl->irkMatchTick = 0;
     std::vector<std::wstring> lines;
     {
@@ -885,6 +902,7 @@ void BleRssiScanner::SetIdentity(const std::wstring& tokenHex, int ovfBit, int p
             m_impl->probedUntil.clear();
             m_impl->EndAllStreaks(lines);
             m_impl->boundAddr = 0;
+            m_impl->quietAddr = 0;   // 예전 토큰으로 확인한 주소다
         }
         Impl::LogLines(lines);
         // 등록을 바꾼 직후 폰을 못 알아보는 일이 로그에서 갈리도록 남긴다.

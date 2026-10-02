@@ -26,8 +26,9 @@ enum RegisterOutcome {
 ///                 토큰이 등록돼 있고 감시 중일 때만 돈다. 이 Mac 에 폰 앱이 GATT 로 10초 넘게 건강하게
 ///                 붙어 있고 F 가 묶인 폰을 30초 안에 줬으면 끄고, 재보기 중에는 늘 켠다 (RawScanPolicy,
 ///                 `scan: raw=...` 줄).
-///    F 가 멎은 것 같으면 (폰이 가까운 게 분명한데 30초 넘게 F 가 아무 후보도 안 준다) F 를 다시 건다
-///    (FilterScanWatch).
+///    F 가 멎은 것 같으면 F 를 다시 건다 (FilterScanWatch, 120초에 한 번까지). R 이 10초 안에 묶인 폰을 그
+///    식별자 그대로 줬으면 F 가 그 폰을 30초 못 줄 때, 폰이 가깝다는 근거가 GATT 뿐이면 F 가 신원 후보를
+///    하나도 30초 못 줄 때다 (주소가 바뀐 폰은 묶이지 않은 새 식별자로 오기 때문).
 ///    후보는 기기 식별자로 합친다. 두 쪽이 같은 패킷을 각각 알릴 수 있으므로 등록된 폰의 샘플은
 ///    DualSourceDedupe 를 지나야 칼만/공개 상태/판정 깨우기에 닿는다 (연속 2샘플 규칙이 샘플을 센다).
 ///    어느 쪽이 잠긴 폰을 실제로 주는지는 `ident: XXXX locked adverts via ...` 줄과 --probe-scan 의 요약이
@@ -123,7 +124,8 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     // rawScanning = R 에 스캔을 걸어 뒀다
     private var rawPolicy = RawScanPolicy()
     private var rawScanning = false
-    // F 가 폰을 안 주는지 (폰이 가까운 게 분명한데 30초 넘게 없으면 F 를 다시 건다)
+    // F 가 멎었는지 (폰이 가까운 게 분명한데 F 가 30초 넘게 안 주면 다시 건다 - 무엇을 "준다" 로 치는지는
+    // FilterScanWatch 머리 주석)
     private var filterWatch = FilterScanWatch()
     // 프로버 틱이 마지막으로 본 이 Mac 의 GATT 연결 상태 (nil = 이번 감시에 아직 안 봤다)
     private var gattLinkedSeen: Bool?
