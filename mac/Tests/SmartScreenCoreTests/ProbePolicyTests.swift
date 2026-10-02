@@ -159,6 +159,124 @@ final class ProbeFailStreakTests: XCTestCase {
         XCTAssertTrue(s.expire(now: 1_000).isEmpty)
         XCTAssertEqual(s.failures("A"), 2)
     }
+
+    /// 첫 실패가 같은 시각이면 주소의 글자 순 (사전 순서는 실행마다 다르다 - 로그 순서가 흔들리면 안 된다).
+    func testSummariesWithTheSameFirstFailureAreOrderedById() {
+        for _ in 0..<20 {
+            var s = ProbeFailStreaks<String>()
+            _ = failN(&s, "D4", 2, startTick: 10_000)
+            _ = failN(&s, "late", 2, startTick: 20_000)
+            _ = failN(&s, "A1", 3, startTick: 10_000)
+            _ = failN(&s, "C3", 2, startTick: 10_000)
+            _ = failN(&s, "B2", 4, startTick: 10_000)
+            _ = failN(&s, "early", 2, startTick: 5_000)
+            XCTAssertEqual(s.endAll().map { $0.id }, ["early", "A1", "B2", "C3", "D4", "late"])
+        }
+        // expire 도 같은 순서
+        var s = ProbeFailStreaks<String>()
+        _ = failN(&s, "Z", 2, startTick: 1_000)
+        _ = failN(&s, "M", 2, startTick: 1_000)
+        _ = failN(&s, "A", 2, startTick: 1_000)
+        XCTAssertEqual(s.expire(now: 1_000 + 15_000 + 300_000).map { $0.id }, ["A", "M", "Z"])
+    }
+
+    /// UUID 주소도 글자(uuidString) 순이다 (AdvScanner 가 쓰는 모양).
+    func testUUIDTieBreakUsesTheIdString() {
+        let a = UUID(uuidString: "0A000000-0000-0000-0000-000000000000")!
+        let b = UUID(uuidString: "0B000000-0000-0000-0000-000000000000")!
+        let c = UUID(uuidString: "FF000000-0000-0000-0000-000000000000")!
+        var s = ProbeFailStreaks<UUID>()
+        for id in [c, a, b] {
+            _ = s.fail(id, why: "Unreachable", ms: 1, now: 1_000, wallClock: "09:00:00")
+            _ = s.fail(id, why: "Unreachable", ms: 1, now: 16_000, wallClock: "09:00:15")
+        }
+        XCTAssertEqual(s.endAll().map { $0.id }, [a, b, c])
+    }
+}
+
+// 재시도 금지 (Windows Hold { until, set, notOurs }). 되돌리기는 못 붙음 금지를 15초로 줄이고, GATT 링크가
+// 끊기면 아예 지운다. 남의 폰 판정은 어느 쪽도 건드리지 않는다.
+final class ProbeHoldsTests: XCTestCase {
+
+    func testHoldsAndPick() {
+        var h = ProbeHolds<String>()
+        h.holdUnreachable("A", now: 1_000, ms: 120_000)
+        h.holdNotOurs("B", now: 1_000)
+        XCTAssertEqual(h.count, 2)
+        XCTAssertEqual(h.untilById, ["A": 121_000, "B": 601_000])
+        XCTAssertEqual(h.holds["A"], ProbeHolds<String>.Hold(until: 121_000, set: 1_000, notOurs: false))
+        XCTAssertEqual(h.holds["B"]?.notOurs, true)
+        // 후보 고르기가 그대로 쓴다
+        let cands = [IdentCandidate(id: "A", rssi: -50, sure: true, bit: -1),
+                     IdentCandidate(id: "B", rssi: -40, sure: true, bit: -1)]
+        XCTAssertNil(IdentCandidatePick.pick(cands, learnedBit: -1, probeFloor: -75,
+                                             probedUntil: h.untilById, now: 60_000))
+        XCTAssertEqual(IdentCandidatePick.pick(cands, learnedBit: -1, probeFloor: -75,
+                                               probedUntil: h.untilById, now: 121_000)?.id, "A")
+    }
+
+    /// 깨어남, GATT 링크가 생김: 못 붙음 금지를 "첫 실패였다면" 의 15초(건 때 + 15초)로 줄인다.
+    func testResetShortensUnreachableToFirstDelayAndKeepsNotOurs() {
+        var h = ProbeHolds<String>()
+        h.holdUnreachable("A", now: 10_000, ms: 120_000)    // 2분을 기다리던 주소
+        h.holdUnreachable("B", now: 20_000, ms: 15_000)     // 이미 짧다 - 늘리지 않는다
+        h.holdNotOurs("C", now: 10_000)
+        h.resetBackoff(clearUnreachable: false)
+        XCTAssertEqual(h.untilById, ["A": 25_000, "B": 35_000, "C": 610_000])
+        XCTAssertEqual(h.holds["C"]?.notOurs, true)
+    }
+
+    /// GATT 링크가 끊김 (건강 -> 아님): 못 붙음 금지를 아예 지워 다음 틱에 바로 찾는다. 남의 폰은 그대로.
+    func testLinkEndClearsUnreachableHoldsOutright() {
+        var h = ProbeHolds<String>()
+        h.holdUnreachable("A", now: 10_000, ms: 120_000)
+        h.holdUnreachable("B", now: 11_000, ms: 15_000)     // 잠정 잠금도 못 붙음 쪽이다
+        h.holdNotOurs("C", now: 10_000)
+        h.resetBackoff(clearUnreachable: true)
+        XCTAssertEqual(h.untilById, ["C": 610_000])
+        // 지운 주소는 곧바로 고를 수 있다 (15초를 기다리지 않는다)
+        let cands = [IdentCandidate(id: "A", rssi: -60, sure: true, bit: -1),
+                     IdentCandidate(id: "C", rssi: -40, sure: true, bit: -1)]
+        XCTAssertEqual(IdentCandidatePick.pick(cands, learnedBit: -1, probeFloor: -75,
+                                               probedUntil: h.untilById, now: 12_000)?.id, "A")
+    }
+
+    /// 앞서 줄여 둔 금지도 끊기면 지운다 (연속 실패 기록이 이미 없어도 - 그것으로 고르지 않는다).
+    func testLinkEndAfterAnEarlierShorteningStillClears() {
+        var h = ProbeHolds<String>()
+        h.holdUnreachable("A", now: 10_000, ms: 120_000)
+        h.resetBackoff(clearUnreachable: false)             // 링크가 생김: 25_000 으로
+        XCTAssertEqual(h.untilById, ["A": 25_000])
+        h.resetBackoff(clearUnreachable: true)              // 곧 끊김
+        XCTAssertEqual(h.count, 0)
+    }
+
+    func testNotOursReplacesUnreachableAndViceVersa() {
+        var h = ProbeHolds<String>()
+        h.holdUnreachable("A", now: 1_000, ms: 15_000)
+        h.holdNotOurs("A", now: 5_000)
+        h.resetBackoff(clearUnreachable: true)
+        XCTAssertEqual(h.untilById, ["A": 605_000])
+        // 토큰이 바뀌면 다시 못 붙음으로 걸릴 수 있다
+        h.removeAll()
+        h.holdUnreachable("A", now: 700_000, ms: 30_000)
+        XCTAssertEqual(h.holds["A"]?.notOurs, false)
+    }
+
+    func testPruneDropsLongExpiredHolds() {
+        var h = ProbeHolds<String>()
+        h.holdUnreachable("A", now: 1_000, ms: 15_000)      // 16_000 에 풀림
+        h.holdNotOurs("B", now: 1_000)                      // 601_000 에 풀림
+        h.prune(now: 316_000, keepMs: 300_000)
+        XCTAssertEqual(h.count, 2)
+        h.prune(now: 316_001, keepMs: 300_000)
+        XCTAssertEqual(h.untilById, ["B": 601_000])
+        // 시계가 거꾸로 가도 지우지 않는다
+        h.prune(now: 0, keepMs: 300_000)
+        XCTAssertEqual(h.count, 1)
+        h.removeAll()
+        XCTAssertEqual(h.count, 0)
+    }
 }
 
 final class ProbeTagTests: XCTestCase {

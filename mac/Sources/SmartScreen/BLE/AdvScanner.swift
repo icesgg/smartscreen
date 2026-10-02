@@ -24,8 +24,10 @@ enum RegisterOutcome {
 ///      R (직접 읽기) - 거르지 않고 훑어 제조사 데이터 `4C 00 01 + 16바이트` 를 Windows 처럼 직접
 ///                 읽는다. 비트가 딱 하나인 광고가 후보이고 그 비트 번호를 배운다 (phoneOvfBit).
 ///                 토큰이 등록돼 있고 감시 중일 때만 돈다. 이 Mac 에 폰 앱이 GATT 로 10초 넘게 건강하게
-///                 붙어 있으면 끄고, 재보기 중에는 늘 켠다 (RawScanPolicy, `scan: raw=...` 줄).
-///    F 가 멎은 것 같으면 (폰이 가까운 게 분명한데 30초 넘게 F 가 폰을 안 준다) F 를 다시 건다 (FilterScanWatch).
+///                 붙어 있고 F 가 묶인 폰을 30초 안에 줬으면 끄고, 재보기 중에는 늘 켠다 (RawScanPolicy,
+///                 `scan: raw=...` 줄).
+///    F 가 멎은 것 같으면 (폰이 가까운 게 분명한데 30초 넘게 F 가 아무 후보도 안 준다) F 를 다시 건다
+///    (FilterScanWatch).
 ///    후보는 기기 식별자로 합친다. 두 쪽이 같은 패킷을 각각 알릴 수 있으므로 등록된 폰의 샘플은
 ///    DualSourceDedupe 를 지나야 칼만/공개 상태/판정 깨우기에 닿는다 (연속 2샘플 규칙이 샘플을 센다).
 ///    어느 쪽이 잠긴 폰을 실제로 주는지는 `ident: XXXX locked adverts via ...` 줄과 --probe-scan 의 요약이
@@ -110,13 +112,15 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private var cands: [UUID: Cand] = [:]
     // 기기별 재시도 금지 시각. 실패 종류에 따라 길이가 다르다 -
     // 남의 기기로 확인된 기기를 계속 다시 찌르면 맞는 기기에 쓸 시도를 낭비한다.
-    private var probedUntil: [UUID: UInt64] = [:]
+    // 남의 폰 판정은 따로 표시해 둔다 - 되돌리기와 GATT 링크 끊김이 그것만은 건드리지 않는다 (ProbeHolds).
+    private var probedUntil = ProbeHolds<UUID>()
     private var proberTimer: DispatchSourceTimer?
     private var probe: Probe?
     private var registration: Registration?
     // 기기별 연속 실패 (Unreachable). 재시도 간격(15 -> 120초)과 "probe failed" 줄 줄이기가 이 횟수를 쓴다.
     private var failStreaks = ProbeFailStreaks<UUID>()
-    // R 을 돌릴지 (GATT 가 10초 넘게 건강하면 끈다, 재보기 중에는 켠다). rawScanning = R 에 스캔을 걸어 뒀다
+    // R 을 돌릴지 (GATT 가 10초 넘게 건강하고 F 가 묶인 폰을 30초 안에 줬으면 끈다, 재보기 중에는 켠다).
+    // rawScanning = R 에 스캔을 걸어 뒀다
     private var rawPolicy = RawScanPolicy()
     private var rawScanning = false
     // F 가 폰을 안 주는지 (폰이 가까운 게 분명한데 30초 넘게 없으면 F 를 다시 건다)
@@ -125,9 +129,9 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private var gattLinkedSeen: Bool?
 
     // 재시도 간격 (ProbePolicy): 못 붙은 것은 15초에서 시작해 연달아 실패하면 120초까지 늘린다.
-    // 붙었는데 우리 서비스가 없던 기기는 다시 볼 이유가 없다 (10분). 주소가 바뀌면 어차피 새 후보로 들어온다.
+    // 붙었는데 우리 서비스가 없던 기기는 다시 볼 이유가 없다 (10분, ProbeHolds.holdNotOurs). 주소가 바뀌면
+    // 어차피 새 후보로 들어온다.
     private static let retryUnreachableMs = ProbePolicy.unreachableFirstMs
-    private static let retryNotOursMs = ProbePolicy.notOursMs
 
     /// 후보 하나. 같은 기기를 두 관리자가 다 보면 한 줄로 합친다.
     private struct Cand {
@@ -227,8 +231,8 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             }
 
             // 재시도 간격은 처음부터 (지난 감시의 연속은 stopOnQueue 가 이미 끝냈다). R 정책과 F 감시도
-            // 처음부터 센다 - 멈춰 있는 동안 GATT 를 보지 않았다.
-            resetBackoffOnQueue()
+            // 처음부터 센다 - 멈춰 있는 동안 GATT 를 보지 않았다. 못 붙음 금지는 지운다 (Windows Start 와 같다).
+            resetBackoffOnQueue(clearUnreachable: true)
             rawPolicy.restart()
             filterWatch.reset()
             gattLinkedSeen = nil
@@ -330,7 +334,7 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     /// 잠든 동안의 실패는 깬 뒤의 폰에 대해 아무것도 말하지 않는다 - 120초를 기다리게 두면 깬 직후
     /// 폰을 다시 묶는 것이 그만큼 늦는다. 판정 스레드를 기다리게 하지 않으려고 큐에 넘기기만 한다.
     func resetProbeBackoff() {
-        BLEIds.queue.async { [weak self] in self?.resetBackoffOnQueue() }
+        BLEIds.queue.async { [weak self] in self?.resetBackoffOnQueue(clearUnreachable: false) }
     }
 
     /// 재보기 중인지 (메인, 재보기 창이 열리고 닫힐 때). 재보기 동안은 직접 읽기 스캔(R)을 켠다 -
@@ -456,8 +460,10 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         // 잠긴 광고의 길은 결합마다 새로 센다 (다시 묶으면 "locked adverts" 줄을 다시 남긴다)
         boundLocked = ScanSourceTimes()
         lockedLog.reset()
-        // F 가 새 폰을 주는지는 지금부터 센다 (FilterScanWatch)
+        // F 가 새 폰을 주는지는 지금부터 센다 (FilterScanWatch). R 을 끄는 데 쓰는 "F 가 묶인 폰을 줬다" 도
+        // 앞 폰의 것이라 버린다 (RawScanPolicy) - 새 폰을 F 가 주기 전까지 R 은 켜 둔다.
         filterWatch.bindingChanged(now: Mono.now())
+        rawPolicy.bindingChanged()
         lock.lock()
         pubBound = id != nil
         lock.unlock()
@@ -511,7 +517,7 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     /// R 을 돌려야 하는지: 감시 중이고 토큰이 있고, 정책(RawScanPolicy)이 원할 때 - 이 Mac 에 폰 앱이
-    /// GATT 로 10초 넘게 건강하게 붙어 있으면 끈다, 재보기 중에는 켠다.
+    /// GATT 로 10초 넘게 건강하게 붙어 있고 F 가 묶인 폰을 30초 안에 줬으면 끈다, 재보기 중에는 켠다.
     private func rawWanted(now: UInt64) -> Bool {
         return running && identOn && rawPolicy.wantsRaw(now: now)
     }
@@ -520,8 +526,16 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     /// 단위라 두 번째 관리자가 허용 창을 다시 띄우지 않는다. 켜지기 전이면 state 콜백이 건다.
     /// reissue: 이미 걸어 둔 스캔도 다시 건다 (시작, 블루투스가 켜짐, 토큰 변경 - 예전과 같다).
     /// 프로버 틱(applyRawPolicy)은 false 로 부른다 - 2초마다 다시 걸면 그때마다 스캔이 새로 시작된다.
-    private func updateRawScan(reissue: Bool = true) {
-        let want = rawWanted(now: Mono.now())
+    ///
+    /// "scan: raw=..." 줄은 여기서 남긴다 (감시 중이고 토큰이 있을 때, 까닭이 바뀌었으면). R 을 켜고 끄는
+    /// 길이 여럿이라 (프로버 틱, 재보기, 토큰, R 의 상태 콜백, 스캔 맞추기) 한 곳에서 남겨야 R 이 줄 없이
+    /// 켜지거나 꺼지는 일이 없다. 줄과 결정은 같은 now 로 본다 - 각자 시각을 재면 경계(10초, 30초)에서
+    /// 줄은 "off" 라는데 R 은 켜 둔 채가 될 수 있다. 감시 밖이나 토큰이 없을 때는 START / 토큰 줄이 말한다.
+    private func updateRawScan(reissue: Bool = true, now: UInt64 = Mono.now()) {
+        if running && identOn, let line = rawPolicy.changedLine(now: now) {
+            EventLog.write(line)
+        }
+        let want = rawWanted(now: now)
         if want && rawCentral == nil {
             rawCentral = CBCentralManager(delegate: self, queue: BLEIds.queue, options: nil)
             return
@@ -542,14 +556,11 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         }
     }
 
-    /// R 정책을 지금 상태에 맞춘다 (프로버 틱, 재보기 시작/끝). 까닭이 바뀌었으면 한 줄 남긴다.
-    /// 감시 중이고 토큰이 있을 때만 - 그 밖에는 R 이 어차피 꺼져 있고, START / 토큰 줄이 그렇게 말한다.
+    /// R 정책을 지금 상태에 맞춘다 (프로버 틱, 재보기 시작/끝). 까닭이 바뀌었으면 updateRawScan 이 한 줄
+    /// 남긴다. 감시 중이고 토큰이 있을 때만 - 그 밖에는 R 이 어차피 꺼져 있고, START / 토큰 줄이 그렇게 말한다.
     private func applyRawPolicy(now: UInt64) {
         guard running, identOn else { return }
-        if let line = rawPolicy.changedLine(now: now) {
-            EventLog.write(line)
-        }
-        updateRawScan(reissue: false)
+        updateRawScan(reissue: false, now: now)
     }
 
     /// R 이 준 기기 객체를 놓는다: R 에서만 본 후보는 버리고, 함께 본 후보는 F 의 것만 남긴다 (F 의
@@ -675,10 +686,12 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         // 이 광고가 "내 폰" 인지
         let identMatch = boundId != nil && boundId == id
         // F 가 멎었는지 보려고 쪽마다 적는다 (FilterScanWatch). F 가 준 것은 모두 신원 후보다 (필터가 맞췄다).
+        // F 가 묶인 폰을 줬다는 것은 R 을 꺼도 되는 증거이기도 하다 (RawScanPolicy).
         if fromRaw {
             if identMatch { filterWatch.rawDeliveredBound(now: now) }
         } else {
             filterWatch.filterDelivered(now: now, boundPhone: identMatch)
+            if identMatch { rawPolicy.filterDeliveredBound(now: now) }
         }
         if identMatch {
             boundSeenTick = now
@@ -983,7 +996,7 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
         cands = cands.filter { BLEIds.elapsed(now, since: $0.value.seen) <= 30_000 }
         // 식별자는 주기적으로 바뀌므로 그냥 두면 계속 쌓인다
-        probedUntil = probedUntil.filter { !(now > $0.value + 300_000) }
+        probedUntil.prune(now: now, keepMs: 300_000)
 
         // Windows 처럼 두 번 훑는다 (IdentCandidatePick): 1차는 신원 UUID 를 직접 본 후보와 배운
         // 비트가 맞는 후보, 못 찾으면 2차로 전체를 신호 순으로.
@@ -993,7 +1006,7 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             list.append(IdentCandidate(id: id, rssi: c.rssi, sure: c.sure, bit: c.bit))
         }
         guard let pick = IdentCandidatePick.pick(list, learnedBit: identBit, probeFloor: probeFloor,
-                                                 probedUntil: probedUntil, now: now),
+                                                 probedUntil: probedUntil.untilById, now: now),
               let c = cands[pick.id] else { return }
         // F 의 객체가 있으면 F 로 붙는다 (원래 경로). R 에서만 본 기기는 R 로.
         let p: CBPeripheral
@@ -1007,7 +1020,7 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         } else {
             return
         }
-        probedUntil[pick.id] = now + AdvScanner.retryUnreachableMs   // 잠정 잠금
+        probedUntil.holdUnreachable(pick.id, now: now, ms: AdvScanner.retryUnreachableMs)   // 잠정 잠금
         // bound 줄의 "via ...": 탐색 직전 10초 안에 이 기기를 준 쪽만 (filter / raw bit N / raw list,
         // 여럿이면 " + "), 그동안 앱이 화면에 떠 있던 광고도 왔으면 ", app on screen" (ScanSourceTimes).
         // 첫 판은 후보가 생긴 뒤 한 번이라도 준 쪽을 다 적어서, 앱이 떠 있을 때 필터가 준 폰을 잠근 뒤
@@ -1022,9 +1035,11 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         // 부르는 일도 없다) - 이 큐에서 불러도 된다. 우리 잠금은 쥐지 않은 채로 부른다.
         let linked = GattServer.shared.snapshot(now: now).healthy
         // 폰 앱이 이 Mac 에 붙었다/떨어졌다: 폰의 상태가 바뀌었으니 그 전의 실패가 말해 주는 것이 없다.
-        // 재시도 간격을 처음으로 (Windows 는 SetGattLinked 의 전환에서 같은 일을 한다).
+        // 재시도 간격을 처음으로 (Windows SetGattLinked 의 전환과 같다). 붙으면 못 붙음 금지를 "첫 실패였다면"
+        // 의 15초로 줄이고, 끊기면 아예 지워 다음 틱에 바로 찾는다 - 연결이 있는 동안 폰이 주소를 바꿨을 수
+        // 있고, 이제 광고 말고는 폰을 볼 길이 없다. 남의 폰 판정(10분)은 어느 쪽이든 그대로.
         if let prev = gattLinkedSeen, prev != linked {
-            resetBackoffOnQueue()
+            resetBackoffOnQueue(clearUnreachable: prev && !linked)
         }
         gattLinkedSeen = linked
         rawPolicy.observeGatt(healthy: linked, now: now)
@@ -1042,15 +1057,12 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     /// 재시도 간격을 처음으로 되돌리고 연속 실패를 잊는다 (감시 시작, 깨어남, GATT 연결 변화).
-    /// 줄로 안 남긴 실패는 요약해 남긴다. 못 붙어 기다리던 주소는 마지막 실패에서 첫 간격(15초)만
-    /// 기다리게 줄인다 - 2분을 기다리던 주소가 처음 실패한 주소처럼 된다. 남의 폰의 10분은 그대로다
-    /// (토큰이 바뀔 때만 지운다 - setIdentity).
-    private func resetBackoffOnQueue() {
-        for (id, s) in failStreaks.streaks {
-            if let until = probedUntil[id] {
-                probedUntil[id] = min(until, s.lastTick + ProbePolicy.unreachableFirstMs)
-            }
-        }
+    /// 줄로 안 남긴 실패는 요약해 남긴다. 못 붙어 기다리던 주소는 금지를 건 때에서 첫 간격(15초)만
+    /// 기다리게 줄인다 - 2분을 기다리던 주소가 처음 실패한 주소처럼 된다 (깨어남, GATT 연결이 생김).
+    /// clearUnreachable 이면 그 금지를 아예 지운다 (감시 시작, GATT 연결이 끊김 - Windows ResetBackoff(true)).
+    /// 남의 폰의 10분은 그대로다 (토큰이 바뀔 때만 지운다 - setIdentity).
+    private func resetBackoffOnQueue(clearUnreachable: Bool) {
+        probedUntil.resetBackoff(clearUnreachable: clearUnreachable)
         logStreakSummaries(failStreaks.endAll())
     }
 
@@ -1076,14 +1088,14 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                 if let s = failStreaks.end(id) {
                     EventLog.write("ident: \(sid) \(s.summaryText)")
                 }
-                probedUntil[id] = now + AdvScanner.retryNotOursMs
+                probedUntil.holdNotOurs(id, now: now)
                 EventLog.write("ident: \(sid) is not our phone (\(reason), \(took)ms)")
                 return
             }
             // 못 붙은 것은 일시적일 수 있으니 금방 다시 해 보되, 같은 주소가 연달아 못 붙으면 간격을
             // 15, 30, 60, 120초로 늘린다. 줄은 연속의 첫 실패만 그대로, 그 뒤는 10번째마다 요약한다.
             let r = failStreaks.fail(id, why: reason, ms: took, now: now, wallClock: LocalClock.hhmmss())
-            probedUntil[id] = now + ProbePolicy.unreachableDelayMs(failures: r.n)
+            probedUntil.holdUnreachable(id, now: now, ms: ProbePolicy.unreachableDelayMs(failures: r.n))
             switch r.line {
             case .first:
                 EventLog.write("ident: \(sid) probe failed (\(reason), \(took)ms)")
