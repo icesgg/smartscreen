@@ -15,6 +15,30 @@ SmartScreen 프로젝트를 이어서 개발한다. 저장소: C:\work\smartscre
 - 같은 구글 계정으로 로그인한 PC 끼리 클립보드를 주고받는다 (docs/CLIPBOARD.md)
 - 새 버전을 서버에 올리면 모든 PC 가 스스로 받아 간다 (docs/UPDATE.md)
 
+## 직전 세션 (뒤쪽): 폰 등록 창에 [등록 내역 삭제] (2026-10-06, main, 아직 안 내놓음 = 다음 release.bat 이 1.1.12)
+
+사용자 요청 ("폰 등록 팝업창에 등록내역삭제 버튼도"). 사용자가 정한 것: **이 PC 의 폰 토큰 + 기기 키(IRK) 를 지우고 구글
+로그인(클립보드 공유)은 그대로**, 서버 `device_tokens` 와 다른 PC 는 건드리지 않음, **보호가 켜져 있으면 함께 끈다**. Mac 은
+기기 키 기능이 없어 토큰만 (설정 키 `bleIrk` 는 같은 이름이라 같이 비운다).
+
+- 단추는 등록된 것(토큰 또는 기기 키, 아직 저장 못 한 로그인 토큰 포함)이 있을 때만 보인다. 창 본문에 한 단락이 붙는다:
+  `[등록 내역 삭제]  이 PC 에서 폰 등록을 지웁니다` / `구글 로그인과 클립보드 공유는 그대로입니다.` (두 판 같은 글자)
+- 흐름: 로그인 중이면 거절 → 확인 창(기본 아니요, "지울 것: 폰 토큰, 기기 키", 보호 중이면 "함께 끕니다") → config 를 새로
+  읽어 `phoneToken`="" / `phoneOvfBit`=-1 / `bleIrk`="" 저장 (실패하면 아무것도 안 바꾸고 알림) → 저장 대기 중인 로그인
+  토큰(`g_authSave.phoneToken`)도 비움 → 보호 끄기 → 스캐너의 신원·IRK 지우기, 배운 overflow 비트 버리기 → 목록과 간단 창
+  ("아직 등록하지 않았어요" / [등록하기]) → 완료 창
+- 로그 (두 판 같음): `register phone: registration deleted (token=1 irk=1, protection stopped)`,
+  `register phone: delete NOT saved - registration kept`, `register phone: delete - nothing registered on this PC`
+- **Windows 는 표준 MessageBox 로 단추 넷을 못 만든다** - 앱에 comctl32 v6 매니페스트가 없어 TaskDialog 도 못 쓴다 (부르면
+  로드가 깨진다). 그래서 `client/choicebox.cpp/.h` (메모리 DLGTEMPLATE + DialogBoxIndirectParamW, 배치는 WM_INITDIALOG
+  에서 픽셀로)를 새로 만들었다. 치수는 이 PC 에서 실제 MessageBoxW 를 찍어 잰 값이다 (아이콘 21,23 / 글 62,23 / 42px 회색 띠 /
+  단추 75x23). [등록 내역 삭제(D)] 는 왼쪽 끝, [예(Y)] [아니요(N)] [취소] 는 예전 자리. 저장소 밖 하네스로 PrintWindow 캡처와
+  키보드 11가지(Esc/Enter/Alt+D/Tab/X 등)를 확인했다. 띄우지 못하면 예전 3단추 MessageBoxW 로 물러난다
+- Mac: `SmartScreenCore/PhoneRegistration.swift` (문구·지울 것·로그 줄, 시험 14개), `Alerts.yesNoCancel(_:title:destructive:)`
+  4단추 (넷째는 빨간 글씨, 키 없음). Mac CI 337개 통과. 실기(지우기를 끝까지 누르기)는 두 판 모두 아직 안 했다 - 사용자의
+  등록이 지워지므로 사용자가 직접 한다 (아래 "남은 작업")
+- 설명서 두 개(`dist/README.txt` 2-(3), `mac/README.txt` (6))에 한 단락씩
+
 ## 직전 세션: 노트북 로그로 진단 + 1.1.11 준비 (2026-10-02 오전)
 
 사용자가 결과 틀을 **하나도 채우지 않은 채** 왔다. 그래서 이 노트북의 events.log(1.1.10, 10-01 18:32 ~
@@ -489,6 +513,14 @@ A 에서 스크린캡처하면 B 에서 Ctrl+V 로 붙는다. 연결고리는 �
 비움 45초)가 어댑터도 판정한다.
 
 ## 남은 작업
+
+### 1.1.12 [등록 내역 삭제] 실기 확인
+
+노트북: 간단 창 '내 폰' [바꾸기] → 창 왼쪽 아래 [등록 내역 삭제] → 확인 창 [예] → "아직 등록하지 않았어요" / [등록하기],
+보호 꺼짐, `Select-String -Path "$env:APPDATA\SmartScreen\events.log" -Pattern 'register phone' | Select-Object -Last 2`
+에 `registration deleted (token=1 irk=1, protection stopped)`. 그다음 [등록하기] → [예] (구글 계정)로 다시 등록, [보호 꺼짐]
+을 눌러 켜기. **기기 키(IRK)도 지워지므로** 노트북의 IRK 쉼(1.1.11)은 고급 창 [기기 키] 로 다시 넣을 때까지 돌지 않는다 -
+토큰 탐색만으로 돈다. 맥북도 같은 순서 (`grep "register phone" ~/Library/Application\ Support/SmartScreen/events.log | tail -2`)
 
 ### 1.1.11 실기 확인 (가장 먼저 - 2026-10-02 에 사용자에게 준 절차)
 
