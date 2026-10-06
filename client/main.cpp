@@ -22,6 +22,7 @@
 #include "enterprise/auth.h"
 #include "enterprise/session.h"
 #include "clipsync.h"
+#include "choicebox.h"
 #include "update.h"
 #include "version.h"
 #include <mutex>
@@ -1119,6 +1120,100 @@ static void StopMon() {
 }
 
 // ---------------------------------------------------------------------------
+// 폰 등록 지우기 (이 PC 에서만)
+// ---------------------------------------------------------------------------
+// [폰 등록] 창의 [등록 내역 삭제]. 지우는 것은 이 PC 가 폰을 알아보는 데 쓰는 둘이다:
+// 폰 토큰(phoneToken, 배운 overflow 비트도 같이)과 기기 키(bleIrk).
+// 구글 로그인과 클립보드 공유는 남긴다 - 폰을 바꾸거나 다시 등록하려는 것이지 계정을
+// 떠나려는 것이 아니다. 서버의 device_tokens 줄과 다른 PC 의 등록도 건드리지 않는다:
+// 같은 계정의 다른 PC 는 그 폰을 계속 알아봐야 한다. Mac 도 같은 두 키를 지운다.
+
+// 이 PC 에 남아 있는 등록. 로그인 결과를 아직 config.ini 에 못 쓴 채라면(g_authSave) 그
+// 토큰도 등록이다 - 스캐너는 이미 그 토큰으로 폰을 찾고 있고, 타이머가 곧 config 에 쓴다.
+struct PhoneRegHere { bool token = false; bool irk = false; };
+static PhoneRegHere PhoneRegisteredHere(const AppConfig& c) {
+    PhoneRegHere r;
+    r.token = !c.phoneToken.empty() || (g_authSave.pending && !g_authSave.phoneToken.empty());
+    r.irk = !c.bleIrk.empty();
+    return r;
+}
+
+static void UnregisterPhone(HWND hWnd) {
+    // 로그인이 끝나면 새 토큰이 들어온다 - 지웠다고 말한 직후에 등록이 되살아난다.
+    // 등록 단추는 로그인 중에 꺼지지만 간단 창의 [바꾸기] 는 여기로 바로 온다.
+    if (g_loginBusy) {
+        MessageBoxW(hWnd, L"로그인 중에는 지울 수 없습니다.\n브라우저 창을 확인하세요.",
+                    L"폰 등록", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    AppConfig c; LoadAppConfig(c);
+    PhoneRegHere reg = PhoneRegisteredHere(c);
+    if (!reg.token && !reg.irk) {
+        // 고르는 창이 떠 있는 사이에 다른 길로 이미 지워졌다
+        DbgEvent(L"register phone: delete - nothing registered on this PC");
+        return;
+    }
+
+    // 되돌릴 수 없으므로 무엇이 지워지고 무엇이 남는지 말하고 묻는다. 기본은 [아니요].
+    // 보호가 켜져 있으면 같이 끈다: 등록이 없으면 이 PC 는 폰을 못 알아보고, 켜 둔 채로는
+    // 곧바로 "자리 비움" 으로 화면을 가린다.
+    std::wstring q = L"이 PC 에서 폰 등록 내역을 지울까요?\n\n지울 것: ";
+    q += (reg.token && reg.irk) ? L"폰 토큰, 기기 키" : reg.token ? L"폰 토큰" : L"기기 키";
+    q += L"\n";
+    if (g_monitoring) q += L"보호가 켜져 있어 함께 끕니다.\n";
+    q += L"\n구글 로그인과 클립보드 공유는 그대로입니다.\n"
+         L"다른 PC 와 서버의 등록은 건드리지 않습니다.";
+    if (reg.irk) q += L"\n기기 키는 고급 설정의 [기기 키] 로 다시 넣을 수 있습니다.";
+    if (MessageBoxW(hWnd, q.c_str(), L"폰 등록", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+        return;
+
+    // 묻는 동안에도 메시지는 돈다 (간단 창의 단추, 로그인 결과). 처음부터 다시 본다.
+    if (g_loginBusy) {
+        MessageBoxW(hWnd, L"로그인 중에는 지울 수 없습니다.\n브라우저 창을 확인하세요.",
+                    L"폰 등록", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    AppConfig cfg; LoadAppConfig(cfg);
+    reg = PhoneRegisteredHere(cfg);
+    cfg.phoneToken.clear();
+    cfg.phoneOvfBit = -1;   // 이 폰에서 배운 비트다
+    cfg.bleIrk.clear();
+    // 못 썼으면 아무것도 바꾸지 않는다. 보호를 끄거나 스캐너를 비운 뒤에 못 쓴 것을 알면,
+    // 화면은 "지웠다" 인데 다음 실행에서 예전 등록으로 다시 돈다.
+    // (읽지 못한 config 는 SaveAppConfig 가 거절한다 - 기본값으로 덮지 않는다.)
+    if (!SaveAppConfig(cfg)) {
+        DbgEvent(L"register phone: delete NOT saved - registration kept");
+        MessageBoxW(hWnd, L"설정을 저장하지 못했습니다. 다시 시도하세요.",
+                    L"폰 등록", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    // 아직 못 쓴 로그인 결과에 토큰이 실려 있으면, 다시 쓰는 타이머(FlushAuthSave)가
+    // 방금 지운 토큰을 config 에 도로 넣는다. 토큰만 뺀다 - 계정 값은 그대로 써야 한다.
+    g_authSave.phoneToken.clear();
+
+    const bool stopped = g_monitoring;
+    if (stopped) StopMon();
+    // 스캐너와 상태 줄이 들고 있는 예전 등록도 바로 비운다. 다음 [시작] 이 config 에서 다시
+    // 읽기는 하지만, 그때까지 지운 토큰과 키가 메모리에 남아 쓰일 길을 두지 않는다.
+    g_hasToken = false;
+    g_hasIrk = false;
+    g_bleScanner.SetIdentity(L"", -1, g_nearRssiThreshold - 10);
+    g_bleScanner.SetIrk(L"");
+    // 보호를 끄기 직전에 지운 폰에서 배운 overflow 비트가 아직 안 가져간 채 남아 있을 수 있다.
+    // 두면 다음 [시작] 의 1초 타이머가 그것을 새로 등록한 폰의 값으로 config 에 쓴다.
+    g_bleScanner.TakeLearnedOverflowBit();
+    // 목록에서 "등록된 폰" 을 빼고, 간단 창은 "아직 등록하지 않았어요" / [등록하기] 로
+    PopulateCombo();
+    SimpleRefresh();
+
+    DbgEvent(L"register phone: registration deleted (token=%d irk=%d%s)",
+             reg.token ? 1 : 0, reg.irk ? 1 : 0, stopped ? L", protection stopped" : L"");
+    MessageBoxW(hWnd, stopped ? L"이 PC 의 폰 등록 내역을 지웠습니다.\n보호를 껐습니다."
+                              : L"이 PC 의 폰 등록 내역을 지웠습니다.",
+                L"폰 등록", MB_OK | MB_ICONINFORMATION);
+}
+
+// ---------------------------------------------------------------------------
 // Chart
 // ---------------------------------------------------------------------------
 static void PaintChart(HWND hWnd) {
@@ -1853,16 +1948,42 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             //  - 계정: 폰과 PC 가 같은 구글 계정으로 로그인하면 서버가 같은 토큰을 준다.
             //          블루투스도, 앱을 화면에 띄울 필요도 없다.
             //  - 블루투스: 예전 방식. 인터넷이 없어도 되고 서버가 죽어도 된다.
-            int how = MessageBoxW(hWnd,
+            // 이 PC 에 등록된 것이 있으면 지우는 길도 여기 둔다 (UnregisterPhone). 넷째 단추라
+            // MessageBoxW 로는 안 되어 ChoiceBox 를 쓴다 (choicebox.h). 지우기는 되돌릴 수 없어서
+            // 단추 줄 왼쪽 끝에 떼어 둔다 - 기본 단추와 Enter 는 여전히 [예].
+            static const wchar_t* kHowText =
                 L"어떻게 등록할까요?\n\n"
                 L"[예]  구글 계정으로 등록  (권장)\n"
                 L"       아이폰 앱에서도 같은 계정으로 로그인하면 끝납니다.\n"
                 L"       폰을 가까이 둘 필요도, 앱을 띄울 필요도 없습니다.\n\n"
                 L"[아니오]  블루투스로 직접 등록\n"
                 L"       앱을 화면에 띄우고 폰을 PC 가까이 두세요.\n"
-                L"       인터넷 없이 됩니다.",
-                L"폰 등록", MB_YESNOCANCEL | MB_ICONQUESTION);
+                L"       인터넷 없이 됩니다.";
+            constexpr int kHowDelete = 100;   // IDYES/IDNO/IDCANCEL 과 겹치지 않는 값
+            static const ChoiceButton kHowButtons[] = {
+                { kHowDelete, L"등록 내역 삭제(&D)", true  },
+                { IDYES,      L"예(&Y)",            false },
+                { IDNO,       L"아니요(&N)",        false },
+                { IDCANCEL,   L"취소",              false },
+            };
+            AppConfig hcfg; LoadAppConfig(hcfg);
+            PhoneRegHere here = PhoneRegisteredHere(hcfg);
+            const bool canDelete = here.token || here.irk;
+            std::wstring howText = kHowText;
+            if (canDelete)
+                howText += L"\n\n[등록 내역 삭제]  이 PC 에서 폰 등록을 지웁니다\n"
+                           L"       구글 로그인과 클립보드 공유는 그대로입니다.";
+            int how = ChoiceBox(hWnd, howText.c_str(), L"폰 등록", ChoiceIcon::Question,
+                                canDelete ? kHowButtons : kHowButtons + 1, canDelete ? 4 : 3,
+                                IDYES, IDCANCEL);
+            if (how == 0) {
+                // 창을 띄우지 못했다. 등록은 막지 않는다 - 지우기 없이 예전 질문으로 묻는다.
+                DbgEvent(L"register phone: choice box failed (err=%lu) - asking with MessageBox",
+                         GetLastError());
+                how = MessageBoxW(hWnd, kHowText, L"폰 등록", MB_YESNOCANCEL | MB_ICONQUESTION);
+            }
             if (how == IDCANCEL) break;
+            if (how == kHowDelete) { UnregisterPhone(hWnd); break; }
             if (how == IDYES) {
                 if (g_loginBusy) {
                     MessageBoxW(hWnd, L"이미 로그인 중입니다.\n브라우저 창을 확인하세요.",
