@@ -1149,7 +1149,8 @@ static void UnregisterPhone(HWND hWnd) {
     AppConfig c; LoadAppConfig(c);
     PhoneRegHere reg = PhoneRegisteredHere(c);
     if (!reg.token && !reg.irk) {
-        // 고르는 창이 떠 있는 사이에 다른 길로 이미 지워졌다
+        // 고르는 창이 떠 있는 사이에 다른 길로 이미 지워졌다.
+        // 로그 글자는 Mac (PhoneRegistration.deleteNothingLogLine) 과 같다.
         DbgEvent(L"register phone: delete - nothing registered on this PC");
         return;
     }
@@ -1182,6 +1183,7 @@ static void UnregisterPhone(HWND hWnd) {
     // 화면은 "지웠다" 인데 다음 실행에서 예전 등록으로 다시 돈다.
     // (읽지 못한 config 는 SaveAppConfig 가 거절한다 - 기본값으로 덮지 않는다.)
     if (!SaveAppConfig(cfg)) {
+        // Mac (PhoneRegistration.deleteSaveFailedLogLine) 과 같은 글자 - 두 판을 grep 한 줄로 찾는다
         DbgEvent(L"register phone: delete NOT saved - registration kept");
         MessageBoxW(hWnd, L"설정을 저장하지 못했습니다. 다시 시도하세요.",
                     L"폰 등록", MB_OK | MB_ICONWARNING);

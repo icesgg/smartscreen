@@ -100,6 +100,14 @@ public enum PhoneRegistration {
             + (protectionStopped ? ", protection stopped" : "") + ")"
     }
 
+    /// events.log: config.ini 를 못 써서 아무것도 지우지 않았다 (못 읽은 사본을 저장이 거절한 때도).
+    /// Windows UnregisterPhone 과 같은 글자다 - 두 판의 로그를 grep 한 줄로 함께 찾는다.
+    public static let deleteSaveFailedLogLine = "register phone: delete NOT saved - registration kept"
+
+    /// events.log: [등록 내역 삭제] 를 골랐는데 확인을 묻기 전에 보니 지울 것이 없었다 (고르는 상자가 떠
+    /// 있는 사이에 다른 길로 지워졌다). 알림은 띄우지 않고 이 줄만 남긴다. Windows 와 같은 글자다.
+    public static let deleteNothingLogLine = "register phone: delete - nothing registered on this PC"
+
     /// 로그인이 도는 중에는 지우지 않는다. 그 로그인이 끝나면 계정의 토큰을 config 에 쓰므로, 지금
     /// 지워도 몇 분 뒤 되살아난다 - "지웠습니다" 가 거짓말이 된다.
     public static let deleteLoginBusyText = "로그인 중에는 지울 수 없습니다.\n브라우저 창을 확인하세요."

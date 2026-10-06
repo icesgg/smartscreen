@@ -1169,8 +1169,9 @@ final class AppController: NSObject, GuardEngineHost {
 
     /// 이 Mac 에 남아 있는 폰 등록 (config 의 phoneToken / bleIrk). 아직 config 에 못 쓴 로그인 결과의
     /// 토큰도 친다 - 다시 쓰는 타이머(flushAuthSave)가 곧 적고, 스캐너는 이미 그 토큰으로 폰을 찾는다.
-    private func registrationOnThisMac() -> PhoneRegistration.Present {
-        let c = ConfigStore.load()
+    /// config: 이미 읽어 둔 config (지우기 직전처럼 읽은 그 사본을 그대로 고쳐 저장할 때). 없으면 여기서 읽는다.
+    private func registrationOnThisMac(_ config: AppConfig? = nil) -> PhoneRegistration.Present {
+        let c = config ?? ConfigStore.load()
         let pending = (authSave.pending && authSave.login) ? authSave.phoneToken : ""
         return PhoneRegistration.present(configToken: c.phoneToken, pendingToken: pending, bleIrk: c.bleIrk)
     }
@@ -1192,7 +1193,12 @@ final class AppController: NSObject, GuardEngineHost {
             return
         }
         let asked = registrationOnThisMac()
-        if !asked.any { return }   // 상자가 떠 있는 동안 지울 것이 없어졌다
+        if !asked.any {
+            // 고르는 상자가 떠 있는 사이에 다른 길로 이미 지워졌다. Windows 와 같은 줄을 남긴다 - 단추를
+            // 눌렀는데 아무 일도 없었다는 문의가 오면 여기서 갈린다.
+            EventLog.write(PhoneRegistration.deleteNothingLogLine)
+            return
+        }
         // 되돌릴 수 없는 일이라 Return 이 [아니오] 다 (MB_DEFBUTTON2). Mac 은 [기기 키] 로 IRK 를 다시 넣을
         // 수 없으므로 그 안내 줄은 없다 (irkReimport: false).
         let confirm = PhoneRegistration.deleteConfirm(asked, monitoring: monitoring, irkReimport: false)
@@ -1206,14 +1212,18 @@ final class AppController: NSObject, GuardEngineHost {
             return
         }
         if bleRegisterBusy { return }
-        // 그 사이에 끝난 로그인이 토큰을 썼을 수 있다. 지우는 것도 로그에 남기는 것도 지금 있는 것이다.
-        let found = registrationOnThisMac()
-        if !found.any { return }
+        // 그 사이에 끝난 로그인이 토큰을 썼을 수 있다. 지우는 것도 로그에 남기는 것도 지금 있는 것이다 -
+        // 한 번 읽은 사본으로 보고, 그 사본을 고쳐 저장한다.
+        // 그 사이에 지울 것이 없어졌어도 (다른 길로 지워졌다) 그대로 간다: 지우겠다고 확인한 사람에게 완료를
+        // 말하고, 보호와 스캐너가 쥔 예전 등록도 마저 비운다 (Windows UnregisterPhone 과 같다).
+        // config 를 못 읽었으면 (c.loadFailed) 지울 것이 없어 보이지만 사실은 모르는 것이다. 이 사본은
+        // ConfigStore.save 가 거절하므로 아래의 저장 실패로 간다 - 말없이 돌아가지도, 지웠다고 하지도 않는다.
+        var c = ConfigStore.load()
+        let found = registrationOnThisMac(c)
 
         // 먼저 저장한다. 못 쓰면 아무것도 바꾸지 않은 채 돌아간다 - 보호도, 스캐너가 아는 폰도 그대로다.
         // 보호부터 끄면 저장이 실패했을 때 등록은 남았는데 보호만 꺼진 채가 된다. 저장과 아래 중지 사이에는
         // 다른 메인 일이 끼어들지 않는다 (같은 메인 차례 안이다).
-        var c = ConfigStore.load()
         PhoneRegistration.clear(&c)
         // 아직 못 쓴 로그인 결과가 있으면 그 토큰도 버린다. 남겨 두면 다시 쓰는 타이머가 방금 지운 토큰을
         // config 에 되살린다. 계정 값(refresh, 이메일)은 그대로 기다리게 둔다.
@@ -1221,8 +1231,8 @@ final class AppController: NSObject, GuardEngineHost {
         authSave.phoneToken = ""
         if !ConfigStore.save(c) {
             authSave.phoneToken = pendingToken
-            // 실패 사유는 ConfigStore.save 가 적는다
-            EventLog.write("register phone: registration NOT deleted - config.ini could not be saved")
+            // 실패 사유(못 읽은 사본이라 거절했는지, 쓰다가 실패했는지)는 ConfigStore.save 가 적는다
+            EventLog.write(PhoneRegistration.deleteSaveFailedLogLine)
             Alerts.warning(PhoneRegistration.deleteSaveFailedText, title: AppController.registerTitle)
             return
         }

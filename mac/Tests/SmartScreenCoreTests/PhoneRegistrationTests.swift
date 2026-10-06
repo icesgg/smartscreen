@@ -139,6 +139,17 @@ final class PhoneRegistrationTests: XCTestCase {
                        "register phone: registration deleted (token=0 irk=1)")
         XCTAssertEqual(PhoneRegistration.deleteLogLine(PhoneRegistrationTests.irkOnly, protectionStopped: true),
                        "register phone: registration deleted (token=0 irk=1, protection stopped)")
+        // 확인 뒤 다시 읽어 보니 다른 길로 이미 지워졌던 때 (Windows 도 완료로 처리하고 이 줄을 남긴다)
+        XCTAssertEqual(PhoneRegistration.deleteLogLine(PhoneRegistrationTests.nothing, protectionStopped: false),
+                       "register phone: registration deleted (token=0 irk=0)")
+    }
+
+    func testFailureAndNothingLogLines() {
+        // Windows client/main.cpp UnregisterPhone 의 DbgEvent 와 같은 글자
+        XCTAssertEqual(PhoneRegistration.deleteSaveFailedLogLine,
+                       "register phone: delete NOT saved - registration kept")
+        XCTAssertEqual(PhoneRegistration.deleteNothingLogLine,
+                       "register phone: delete - nothing registered on this PC")
     }
 
     func testRefuseAndSaveFailedTexts() {
