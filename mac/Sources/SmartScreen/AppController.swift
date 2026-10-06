@@ -16,7 +16,8 @@ import SmartScreenCore
 //     본다 - [시작] 은 이 모델을 다시 읽으므로, 간단 창이 바꾼 값도 여기에 들어와 있어야 한다
 //     ("재시작하면 바뀌어 있다").
 //   - StartMon / StopMon, 판정 결과(OnResult), 1 초 틱, 입력, 잠금 창 띄우기/내리기 (GuardEngine 의 host)
-//   - 시작 순서, 계정 세션과 회전한 토큰 저장(FlushAuthSave), 구글 로그인 일꾼, BLE 직접 등록
+//   - 시작 순서, 계정 세션과 회전한 토큰 저장(FlushAuthSave), 구글 로그인 일꾼, BLE 직접 등록,
+//     이 Mac 의 등록 내역 삭제
 //   - 기업 콘텐츠 동기화(시작할 때), 업데이트 틱, 클립보드 타일, 정상 종료
 //
 // 스레드: 전부 메인 스레드. 일꾼(로그인, 세션 시작, 기업 동기화)은 결과만 DispatchQueue.main.async
@@ -92,10 +93,9 @@ final class AppController: NSObject, GuardEngineHost {
     private static let updateEveryMs: UInt64 = 60 * 60 * 1000
     private static let registerScanSec = 6
     private static let loginTimeoutSec = 180
-    private static let registerTitle = "폰 등록"
-    /// [폰 등록] 의 첫 질문. 둘째 줄들의 들여쓰기는 7 칸 (Windows 원문 그대로).
-    private static let registerQuestion =
-        "어떻게 등록할까요?\n\n[예]  구글 계정으로 등록  (권장)\n       아이폰 앱에서도 같은 계정으로 로그인하면 끝납니다.\n       폰을 가까이 둘 필요도, 앱을 띄울 필요도 없습니다.\n\n[아니오]  블루투스로 직접 등록\n       앱을 화면에 띄우고 폰을 PC 가까이 두세요.\n       인터넷 없이 됩니다."
+    /// [폰 등록] 상자들의 제목. 첫 질문과 [등록 내역 삭제] 의 글은 PhoneRegistration (Core) 에 있다 -
+    /// Windows 와 바이트까지 같은지를 시험이 본다.
+    private static let registerTitle = PhoneRegistration.title
     /// 등록이 이미 하나 도는 중일 때의 답. 두 방법이 나란히 돌면 나중에 끝난 쪽이 먼저 저장한 토큰을
     /// 덮는다 (registerPhone).
     private static let registerBleBusyText = "블루투스 등록이 진행 중입니다. 잠시 기다려 주세요."
@@ -1138,6 +1138,7 @@ final class AppController: NSObject, GuardEngineHost {
     /// [폰 등록] / 간단 창 [등록하기]·[바꾸기]. 방법이 둘이다. 목적이 같으므로 단추를 늘리지 않고 여기서 고른다.
     ///  - 계정: 폰과 PC 가 같은 구글 계정으로 로그인하면 서버가 같은 토큰을 준다.
     ///  - 블루투스: 예전 방식. 인터넷이 없어도 되고 서버가 죽어도 된다.
+    /// 이 Mac 에 등록이 남아 있으면 [등록 내역 삭제] 도 같은 상자에서 고른다 (deleteRegistration).
     func registerPhone() {
         // 블루투스 등록(6 초 스캔 + 최대 20 초 토큰 읽기)이 도는 중이면 공통 입구에서 막는다. 고급 창의
         // [폰 등록] 만 꺼 두면 간단 창 [등록하기]/[바꾸기] 와 마법사가 여전히 이리로 온다. 그때 [아니오] 는
@@ -1148,14 +1149,96 @@ final class AppController: NSObject, GuardEngineHost {
             Alerts.info(AppController.registerBleBusyText, title: AppController.registerTitle)
             return
         }
-        // 본문이 [예] / [아니오] 를 이름으로 부르므로 단추도 예 / 아니오 / 취소 여야 한다 (Alerts 가 그렇게 단다)
-        let how = Alerts.yesNoCancel(AppController.registerQuestion, title: AppController.registerTitle)
+        // 본문이 [예] / [아니오] 를 이름으로 부르므로 단추도 예 / 아니오 / 취소 여야 한다 (Alerts 가 그렇게 단다).
+        // 이 Mac 에 지울 등록이 있을 때만 [등록 내역 삭제] 를 넷째 단추로, 본문에 그 문단을 붙인다.
+        let hasRegistration = registrationOnThisMac().any
+        let question = PhoneRegistration.question(withDelete: hasRegistration)
+        let how = hasRegistration
+            ? Alerts.yesNoCancel(question, title: AppController.registerTitle,
+                                 destructive: PhoneRegistration.deleteButton)
+            : Alerts.yesNoCancel(question, title: AppController.registerTitle)
         if how == 0 {
             registerViaAccount()
         } else if how == 1 {
             registerViaBluetooth()
+        } else if how == 3 {
+            deleteRegistration()
         }
         // 2 (취소) → 아무것도 안 한다
+    }
+
+    /// 이 Mac 에 남아 있는 폰 등록 (config 의 phoneToken / bleIrk). 아직 config 에 못 쓴 로그인 결과의
+    /// 토큰도 친다 - 다시 쓰는 타이머(flushAuthSave)가 곧 적고, 스캐너는 이미 그 토큰으로 폰을 찾는다.
+    private func registrationOnThisMac() -> PhoneRegistration.Present {
+        let c = ConfigStore.load()
+        let pending = (authSave.pending && authSave.login) ? authSave.phoneToken : ""
+        return PhoneRegistration.present(configToken: c.phoneToken, pendingToken: pending, bleIrk: c.bleIrk)
+    }
+
+    /// [등록 내역 삭제]: 이 Mac 의 폰 토큰(overflow 비트와 함께)과 기기 키를 지운다. 구글 로그인과
+    /// 클립보드 공유는 그대로, 서버의 등록과 다른 PC 는 건드리지 않는다 (PhoneRegistration 머리말).
+    /// 폰을 바꾸거나 남의 폰을 잘못 등록했을 때, 지금까지는 config.ini 를 손으로 고치는 길밖에 없었다.
+    /// 단추 동작에서 불린다 (main.async 블록 안이 아니다) - 여기서 바로 알림을 띄워도 된다.
+    private func deleteRegistration() {
+        // 도는 로그인은 끝나면 계정의 토큰을 config 에 쓴다. 지금 지우면 몇 분 뒤 되살아난다.
+        if loginBusy {
+            Alerts.info(PhoneRegistration.deleteLoginBusyText, title: AppController.registerTitle)
+            return
+        }
+        // 블루투스 등록 중이면 registerPhone 이 상자를 띄우기 전에 막는다. 끝나면 읽은 토큰을 저장하므로
+        // 같은 이유로 여기서도 막아 둔다.
+        if bleRegisterBusy {
+            Alerts.info(AppController.registerBleBusyText, title: AppController.registerTitle)
+            return
+        }
+        let asked = registrationOnThisMac()
+        if !asked.any { return }   // 상자가 떠 있는 동안 지울 것이 없어졌다
+        // 되돌릴 수 없는 일이라 Return 이 [아니오] 다 (MB_DEFBUTTON2). Mac 은 [기기 키] 로 IRK 를 다시 넣을
+        // 수 없으므로 그 안내 줄은 없다 (irkReimport: false).
+        let confirm = PhoneRegistration.deleteConfirm(asked, monitoring: monitoring, irkReimport: false)
+        if !Alerts.yesNo(confirm, title: AppController.registerTitle, defaultNo: true, warning: true) {
+            return
+        }
+        // 확인 상자가 떠 있는 동안에도 main 큐와 타이머는 돈다 (Alerts 머리말) - 다시 본다.
+        if isExiting { return }
+        if loginBusy {
+            Alerts.info(PhoneRegistration.deleteLoginBusyText, title: AppController.registerTitle)
+            return
+        }
+        if bleRegisterBusy { return }
+        // 그 사이에 끝난 로그인이 토큰을 썼을 수 있다. 지우는 것도 로그에 남기는 것도 지금 있는 것이다.
+        let found = registrationOnThisMac()
+        if !found.any { return }
+
+        // 먼저 저장한다. 못 쓰면 아무것도 바꾸지 않은 채 돌아간다 - 보호도, 스캐너가 아는 폰도 그대로다.
+        // 보호부터 끄면 저장이 실패했을 때 등록은 남았는데 보호만 꺼진 채가 된다. 저장과 아래 중지 사이에는
+        // 다른 메인 일이 끼어들지 않는다 (같은 메인 차례 안이다).
+        var c = ConfigStore.load()
+        PhoneRegistration.clear(&c)
+        // 아직 못 쓴 로그인 결과가 있으면 그 토큰도 버린다. 남겨 두면 다시 쓰는 타이머가 방금 지운 토큰을
+        // config 에 되살린다. 계정 값(refresh, 이메일)은 그대로 기다리게 둔다.
+        let pendingToken = authSave.phoneToken
+        authSave.phoneToken = ""
+        if !ConfigStore.save(c) {
+            authSave.phoneToken = pendingToken
+            // 실패 사유는 ConfigStore.save 가 적는다
+            EventLog.write("register phone: registration NOT deleted - config.ini could not be saved")
+            Alerts.warning(PhoneRegistration.deleteSaveFailedText, title: AppController.registerTitle)
+            return
+        }
+
+        // 등록이 없으면 이 Mac 은 폰을 알아보지 못해 곧바로 화면을 가린다. 평소의 [중지] 길로 끈다.
+        let stopped = monitoring
+        if monitoring { stopMon() }
+        // 스캐너도 바로 잊게 한다. 감시가 꺼져 있어도 스캐너는 지난 [시작] 의 토큰을 쥐고 있다.
+        hasToken = false
+        AdvScanner.shared.setIdentity(tokenHex: "", ovfBit: -1, probeFloor: Shared.shared.nearRssiThreshold - 10)
+        // "등록된 폰" 이 기기 목록에서 빠지고 [시작] 이 꺼진다. 간단 창은 config 를 다시 읽어
+        // "아직 등록하지 않았어요" 와 [등록하기] 를 보인다.
+        populateDevices()
+        EventLog.write(PhoneRegistration.deleteLogLine(found, protectionStopped: stopped))
+        simple?.refresh()
+        Alerts.info(PhoneRegistration.deleteDone(protectionStopped: stopped), title: AppController.registerTitle)
     }
 
     private func registerViaAccount() {
