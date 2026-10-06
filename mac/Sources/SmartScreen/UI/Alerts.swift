@@ -6,8 +6,8 @@ import AppKit
 // 단추도 그 창으로 명령을 넘긴다). Mac 앱은 LSUIElement 라 Dock 아이콘도 메뉴 막대도 없어서,
 // 앱을 먼저 앞으로 불러오지 않으면 알림이 다른 앱 창 뒤에 깔려 아무도 못 본다.
 //
-// 단추 글자는 한국어로 고정한다 (예 / 아니오 / 취소 / 확인). 본문이 "[예] 구글 계정으로 등록",
-// "[아니오] 블루투스로 직접 등록", "준비되면 확인을 누르세요" 처럼 단추 이름을 직접 부르므로
+// 단추 글자는 한국어로 고정한다 (예 / 아니오 / 취소 / 확인 / 등록 내역 삭제). 본문이 "[예] 구글 계정으로 등록",
+// "[아니오] 블루투스로 직접 등록", "[등록 내역 삭제]", "준비되면 확인을 누르세요" 처럼 단추 이름을 직접 부르므로
 // 시스템 언어에 따라 바뀌면 안 된다.
 //
 // Windows 캡션(제목 막대)은 Mac 알림에 없으므로 굵은 제목 줄(messageText)로 보이고,
@@ -48,6 +48,19 @@ enum Alerts {
         return (i == 0 || i == 1) ? i : 2
     }
 
+    /// yesNoCancel 에 되돌릴 수 없는 넷째 단추를 붙인 것 ([폰 등록] 의 [등록 내역 삭제]).
+    /// 0 예 (Return), 1 아니오, 2 취소 (Esc), 3 넷째 단추. 앞의 세 단추와 Return/Esc 는 yesNoCancel 과 같다.
+    /// 넷째 단추는 add 순서대로 넷째로 단다 - NSAlert 는 단추를 오른쪽부터 왼쪽으로 (세로로 쌓으면 위부터
+    /// 아래로) 놓으므로 [예] 에서 가장 먼 끝에 온다 (Windows 도 단추 줄의 왼쪽 끝에 따로 둔다). Return 도
+    /// Esc 도 주지 않는다: 키 하나로 지워지면 안 된다. 빨간 글씨(hasDestructiveAction)로 다른 단추와 갈라
+    /// 보이게 한다. 떠 있는 층으로 올리는 것 등 나머지는 present 가 다른 상자와 똑같이 한다.
+    static func yesNoCancel(_ text: String, title: String, destructive: String) -> Int {
+        let i = present(text, title: title, warning: false, buttons: ["예", "아니오", "취소", destructive],
+                        returnIndex: 0, escIndex: 2, destructiveIndex: 3)
+        // 알 수 없는 응답은 취소로 본다 - 아무것도 하지 않는 쪽이 안전하다.
+        return (i == 0 || i == 1 || i == 3) ? i : 2
+    }
+
     /// MB_YESNO. defaultNo = MB_DEFBUTTON2 (Return 이 [아니오]): 되돌리기 어려운 일을 묻는 곳
     /// (기업 등록 해제, 등록된 조직 바꾸기) 에서 Return 한 번에 일이 벌어지지 않게 한다.
     /// warning = MB_ICONWARNING, 아니면 MB_ICONQUESTION.
@@ -61,15 +74,16 @@ enum Alerts {
     // MARK: - 내부
 
     /// 알림을 띄우고 누른 단추의 번호(0부터)를 돌려준다. 알 수 없으면 -1.
+    /// destructiveIndex: 그 단추를 빨간 글씨로 (되돌릴 수 없는 일). 키는 주지 않는 단추여야 한다.
     private static func present(_ text: String, title: String, warning: Bool, buttons: [String],
-                                returnIndex: Int?, escIndex: Int?) -> Int {
+                                returnIndex: Int?, escIndex: Int?, destructiveIndex: Int? = nil) -> Int {
         // AppKit 은 main 에서만 만진다. 작업 스레드에서 잘못 불려도 죽지 않게 main 으로 넘긴다
         // (계약상 모든 호출자는 main 이다).
         if !Thread.isMainThread {
             var result = -1
             DispatchQueue.main.sync {
                 result = present(text, title: title, warning: warning, buttons: buttons,
-                                 returnIndex: returnIndex, escIndex: escIndex)
+                                 returnIndex: returnIndex, escIndex: escIndex, destructiveIndex: destructiveIndex)
             }
             return result
         }
@@ -96,6 +110,9 @@ enum Alerts {
                 button.keyEquivalent = "\u{1b}"
             } else {
                 button.keyEquivalent = ""
+            }
+            if let d = destructiveIndex, i == d {
+                button.hasDestructiveAction = true
             }
         }
 
