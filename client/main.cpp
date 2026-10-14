@@ -3959,7 +3959,16 @@ int WINAPI wWinMain(HINSTANCE hI, HINSTANCE, LPWSTR, int nS) {
         LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
         if (argv) {
             int rc = -1;
-            if (argc >= 3 && wcscmp(argv[1], L"--dump-irk") == 0) {
+            if (argc >= 2 && wcscmp(argv[1], L"--read-token") == 0) {
+                // 탐색 도우미 (ble_ident.h ReadPhoneTokenIsolated). 무엇보다 먼저 본다 - 뮤텍스,
+                // 설정, 로그, 창, 업데이트 확인 어느 것도 돌면 안 된다. 앱이 떠 있는 동안 2초마다
+                // 뜰 수 있고, 뮤텍스를 쥔 것이 바로 그 앱이다. 인자가 틀려도 여기서 끝난다 (64).
+                // ExitProcess 로 끝낸다: 정적 소멸자와 CRT 정리를 건너뛴다. 시간을 넘겨 버린 WinRT
+                // 작업의 완료 콜백이 스레드 풀에서 아직 돌 수 있는데, 그것과 소멸자가 겹칠 까닭이 없다.
+                rc = ReadTokenHelperMain(argc, argv);
+                LocalFree(argv);
+                ExitProcess((UINT)rc);
+            } else if (argc >= 3 && wcscmp(argv[1], L"--dump-irk") == 0) {
                 // SYSTEM 권한으로 실행됨: 레지스트리를 덤프하고 끝
                 rc = (DumpIrkFromRegistry(argv[2]) > 0) ? 0 : 1;
             } else if (argc >= 3 && wcscmp(argv[1], L"--import-irk") == 0) {
