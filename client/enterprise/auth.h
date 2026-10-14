@@ -95,7 +95,13 @@ public:
     // error 쪽 글(outErr)은 여전히 남이 넣을 수 있는 값이다. 그대로 믿지 말 것.
     // outCode 도 같다 - 남이 그럴듯한 가짜 코드를 먼저 보내면 그것이 돌아가고,
     // 교환이 실패하면서 진짜 요청은 놓친다 (auth.cpp 의 WaitForCode 에 까닭).
-    bool WaitForCode(unsigned timeoutMs, std::string& outCode, std::string& outErr);
+    //
+    // cancelEvent 는 수동 리셋 이벤트(HANDLE)다. 켜지면 기다리던 것을 그 자리에서
+    // 그만두고 false 를 준다 (outErr 는 빈 채로). [등록 내역 삭제] 가 진행 중인 로그인을
+    // 취소할 때 쓴다 (main.cpp 의 CancelLogin). HANDLE 이 아니라 void* 인 것은 이 헤더가
+    // windows.h 를 끌어오지 않으려는 것이다 (아래 AuthSession 주석). nullptr 이면 예전과 같다.
+    bool WaitForCode(unsigned timeoutMs, std::string& outCode, std::string& outErr,
+                     void* cancelEvent = nullptr);
 
     void Stop();
 
@@ -136,9 +142,16 @@ struct AuthSession {
 // 브라우저를 열어 구글 로그인을 받고, 돌아온 코드를 세션으로 바꾼다.
 // 사용자가 브라우저에서 시간을 쓰므로 timeoutSec 은 넉넉해야 한다(기본 3분).
 // 호출하는 쪽이 UI 스레드를 막지 않도록 별도 스레드에서 부를 것.
+//
+// cancelEvent (HANDLE, 수동 리셋 이벤트, nullptr 이면 없음) 가 켜지면 브라우저를 기다리던
+// 것을 곧바로 그만두고 false 를 준다. 코드를 받은 뒤에 켜졌으면 교환도 하지 않는다 -
+// verifier 를 밖으로 내보내지 않는다. 교환이 이미 나간 뒤라면 끝까지 가므로, 부르는
+// 쪽은 그 결과를 따로 버려야 한다 (main.cpp 의 로그인 세대).
+constexpr unsigned kGoogleLoginTimeoutSec = 180;
 bool SignInWithGoogle(const std::wstring& supabaseUrl, const std::wstring& anonKey,
                       AuthSession& outSession, std::wstring& outErr,
-                      unsigned timeoutSec = 180);
+                      unsigned timeoutSec = kGoogleLoginTimeoutSec,
+                      void* cancelEvent = nullptr);
 
 // 저장해 둔 refresh token 으로 세션을 되살린다. 앱을 켤 때마다 부른다.
 bool RefreshSession(const std::wstring& supabaseUrl, const std::wstring& anonKey,
