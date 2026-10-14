@@ -20,7 +20,10 @@ enum Auth {
     /// Blocking: browser + loopback listener + PKCE exchange (spec enterprise-auth §4). Returns tokens or error text.
     /// 사용자가 브라우저에서 시간을 쓰므로 timeoutSec 은 넉넉해야 한다 (기본 3분).
     /// 부르는 쪽이 메인 스레드를 막지 않도록 일꾼 스레드에서 부를 것.
-    static func signInWithGoogle(url: String, key: String, timeoutSec: Int = 180) -> (AuthTokens?, String) {
+    /// cancel: 다른 스레드에서 이 로그인을 멈추는 신호 ([등록 내역 삭제]). 오면 브라우저 기다리기를 바로
+    /// 그만두고, 아직 안 했으면 브라우저를 열지도 코드를 바꾸지도 않는다. 그때의 결과는 부르는 쪽이 버린다.
+    static func signInWithGoogle(url: String, key: String, timeoutSec: Int = 180,
+                                 cancel: LoginCancel? = nil) -> (AuthTokens?, String) {
         if url.isEmpty || key.isEmpty {
             return (nil, "서버 주소나 키가 비어 있다")
         }
@@ -51,13 +54,24 @@ enum Auth {
             + "&code_challenge=" + URLEnc.encode(challenge)
             + "&code_challenge_method=s256"
 
+        // 일꾼이 여기 오기 전에 취소됐으면 브라우저를 띄우지 않는다 - 지우겠다고 확인한 사람 앞에
+        // 로그인 화면이 새로 열리면 무엇이 취소됐는지 알 수 없다.
+        if cancel?.isCancelled == true {
+            return (nil, Auth.cancelledText)
+        }
+
         // 시스템 브라우저로 연다. 임베디드 웹뷰는 구글이 거부한다.
         if !openInBrowser(authorize) {
             return (nil, "브라우저를 열지 못했다")
         }
 
         let waitMs = UInt64(max(0, timeoutSec)) * 1000
-        let got = listener.waitForCode(timeoutMs: waitMs)
+        let got = listener.waitForCode(timeoutMs: waitMs, cancel: cancel)
+        // 취소로 멈췄으면 시간 초과라고 하지 않는다. 코드가 막 왔어도 바꾸지 않는다 - 바꾸면 버릴
+        // 세션 하나가 서버에 생길 뿐이다.
+        if cancel?.isCancelled == true {
+            return (nil, Auth.cancelledText)
+        }
         guard let code = got.code else {
             // err 는 이 포트에 닿은 누구든 넣을 수 있는 글이다. 서버 글과 같은 상한을 걸고,
             // 앱이 한 말로 읽히지 않게 어디서 온 글인지 앞에 붙인다 (알림 창에 그대로 뜬다).
@@ -142,6 +156,10 @@ enum Auth {
 
     // ---- private ----
 
+    /// 취소된 로그인의 err. 부르는 쪽이 이 결과를 세대로 버리므로 상자에 뜨지 않는다 - 그래도 시간
+    /// 초과("시간 안에 끝나지 않았다")와 섞이지 않게 따로 둔다.
+    private static let cancelledText = "로그인을 취소했다"
+
     private static func nowUnix() -> Int64 {
         return Int64(time(nil))
     }
@@ -185,6 +203,64 @@ enum Auth {
 }
 
 extension Auth {
+    /// 도는 로그인을 멈추는 신호 ([등록 내역 삭제] 가 쓴다). cancel() 은 아무 스레드에서나 부를 수 있다.
+    ///
+    /// 리스너는 브라우저를 3 분까지 기다린다. 깃발만 세우면 다음 연결이나 마감까지 아무도 그것을 보지
+    /// 않으므로, 파이프에 한 바이트를 써서 poll 을 바로 깨운다. 그 바이트는 읽어 내지 않는다 - 취소는
+    /// 되돌리지 않으므로 그 뒤의 poll 도 모두 곧바로 깨어나는 것이 맞다.
+    /// 리스너 소켓을 메인에서 닫아 깨우는 방법은 쓰지 않았다: poll 중인 fd 를 다른 스레드가 닫아도
+    /// macOS 는 poll 을 깨운다고 약속하지 않고, 닫힌 번호를 다른 곳이 곧바로 받으면 일꾼이 엉뚱한 fd 를
+    /// 기다리거나 닫는다.
+    final class LoginCancel {
+        private let lock = NSLock()
+        private var cancelled = false
+        /// 파이프의 읽는 쪽 (리스너의 poll 이 함께 본다) 과 쓰는 쪽. 파이프를 못 만들었으면 둘 다 -1 이고,
+        /// 그때 리스너는 poll 을 짧게 끊어 깃발을 본다.
+        fileprivate let wakeRead: Int32
+        private let wakeWrite: Int32
+
+        init() {
+            var fds: [Int32] = [-1, -1]
+            if pipe(&fds) == 0 {
+                for fd in fds {
+                    // 업데이트 적용기 같은 자식 프로세스가 물려받지 않게. 쓰는 쪽이 논블로킹이어야
+                    // cancel 이 (메인에서) 막히지 않는다.
+                    _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
+                    let fl = fcntl(fd, F_GETFL)
+                    if fl >= 0 { _ = fcntl(fd, F_SETFL, fl | O_NONBLOCK) }
+                }
+                wakeRead = fds[0]
+                wakeWrite = fds[1]
+            } else {
+                wakeRead = -1
+                wakeWrite = -1
+            }
+        }
+
+        // 일꾼과 AppController 가 함께 쥐므로, 리스너가 아직 이 fd 를 보는 동안에는 여기 오지 않는다.
+        deinit {
+            if wakeRead >= 0 { _ = close(wakeRead) }
+            if wakeWrite >= 0 { _ = close(wakeWrite) }
+        }
+
+        var isCancelled: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return cancelled
+        }
+
+        func cancel() {
+            lock.lock()
+            let first = !cancelled
+            cancelled = true
+            lock.unlock()
+            if first && wakeWrite >= 0 {
+                var b: UInt8 = 1
+                _ = write(wakeWrite, &b, 1)
+            }
+        }
+    }
+
     /// 루프백 리다이렉트 수신 (Windows LoopbackListener). BSD 소켓을 그대로 옮겼다.
     ///
     /// 이 포트는 같은 PC 의 누구나 닿을 수 있다. 그래서 첫 연결을 결과로 치지 않고, 마감까지
@@ -243,7 +319,8 @@ extension Auth {
         /// ?error= 로 돌아오므로 그것도 받는다. 시간 안에 아무것도 안 오면 (nil, "").
         /// err 쪽 글은 남이 넣을 수 있는 값이다. 그대로 믿지 말 것. code 도 같다 - 남이 그럴듯한
         /// 가짜 코드를 먼저 보내면 그것이 돌아가고, 교환이 실패하면서 진짜 요청은 놓친다.
-        func waitForCode(timeoutMs: UInt64) -> (code: String?, err: String) {
+        /// cancel 이 오면 마감을 기다리지 않고 (nil, "") 로 바로 돌아간다 (부르는 쪽이 취소인지 다시 본다).
+        func waitForCode(timeoutMs: UInt64, cancel: LoginCancel? = nil) -> (code: String?, err: String) {
             if sock < 0 { return (nil, "") }
 
             // 예전 Windows 는 select 한 번, accept 한 번이었다. 그래서 이 포트에 먼저 닿은 연결이
@@ -258,8 +335,10 @@ extension Auth {
 
             let deadline = Mono.now() &+ timeoutMs
             while true {
+                // 취소는 돌 때마다 본다. 남의 연결이 줄지어 와도 그것을 다 정리할 때까지 붙잡히지 않는다.
+                if cancel?.isCancelled == true { return (nil, "") }
                 if Mono.now() >= deadline { return (nil, "") }
-                if !LoopbackListener.waitReadable(sock, until: deadline) { return (nil, "") }
+                if !LoopbackListener.waitReadable(sock, until: deadline, cancel: cancel) { return (nil, "") }
 
                 let c = accept(sock, nil, nil)
                 if c < 0 {
@@ -270,7 +349,13 @@ extension Auth {
                 }
                 LoopbackListener.prepareAccepted(c)
 
-                let req = LoopbackListener.readRequestLine(c, deadline: deadline)
+                // 요청 줄을 기다리는 동안 (길어야 5 초) 에도 취소를 본다. 취소됐으면 이 연결에는 답하지
+                // 않는다 - 로그인 성공 화면을 띄우면 취소한 로그인이 된 것처럼 보인다.
+                let req = LoopbackListener.readRequestLine(c, deadline: deadline, cancel: cancel)
+                if cancel?.isCancelled == true {
+                    LoopbackListener.finishConnection(c, sentSomething: false)
+                    return (nil, "")
+                }
 
                 // 우리가 내준 주소는 http://127.0.0.1:<포트> 이고 브라우저는 거기에 "GET /?code=..."
                 // 로 온다. 그 모양이 아니거나 code 도 error 도 없는 요청은 로그인의 결과가 아니다.
@@ -341,13 +426,13 @@ extension Auth {
         /// 요청 줄만 있으면 된다. 헤더를 다 읽을 필요가 없다 (2048 바이트씩 길어야 8 번,
         /// 첫 "\r\n" 에서 멈춘다). 마감은 recv 마다가 아니라 연결 전체에 둔다 - 한 바이트씩 흘려
         /// 보내며 붙잡는 상대에게 recv 횟수만큼 시간을 내주지 않는다.
-        private static func readRequestLine(_ c: Int32, deadline: UInt64) -> String {
+        private static func readRequestLine(_ c: Int32, deadline: UInt64, cancel: LoginCancel?) -> String {
             var req: [UInt8] = []
             var buf = [UInt8](repeating: 0, count: 2048)
             var connEnd = Mono.now() &+ connMs
             if connEnd > deadline { connEnd = deadline }
             for _ in 0..<8 {
-                if Mono.now() >= connEnd || !waitReadable(c, until: connEnd) { break }
+                if Mono.now() >= connEnd || !waitReadable(c, until: connEnd, cancel: cancel) { break }
                 let n: Int = buf.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) -> Int in
                     return recv(c, raw.baseAddress, raw.count, 0)
                 }
@@ -368,16 +453,26 @@ extension Auth {
 
         /// 읽을 것이 생길 때까지 (Mono 기준) deadline 까지 기다린다. 리스너에서는 "들어온 연결이
         /// 있다", 받은 소켓에서는 "바이트가 왔거나 상대가 끊었다" 는 뜻이다.
-        private static func waitReadable(_ fd: Int32, until deadline: UInt64) -> Bool {
+        /// cancel 이 있으면 그 파이프도 함께 보고, 취소되면 바로 false 다 (마감과 같게 다룬다).
+        private static func waitReadable(_ fd: Int32, until deadline: UInt64, cancel: LoginCancel? = nil) -> Bool {
+            let wake = cancel?.wakeRead ?? -1
             while true {
+                if cancel?.isCancelled == true { return false }
                 let now = Mono.now()
                 if now >= deadline { return false }
                 let left = deadline - now
-                let ms = Int32(min(left, UInt64(Int32.max)))
-                var p = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
-                let r = poll(&p, 1, ms)
-                if r > 0 { return true }
-                if r == 0 { return false }
+                var ms = Int32(min(left, UInt64(Int32.max)))
+                // 파이프를 못 만들었으면 깨워 줄 것이 없다. 짧게 끊어 깃발을 본다.
+                let sliced = cancel != nil && wake < 0 && ms > 250
+                if sliced { ms = 250 }
+                var fds = [pollfd(fd: fd, events: Int16(POLLIN), revents: 0)]
+                if wake >= 0 { fds.append(pollfd(fd: wake, events: Int16(POLLIN), revents: 0)) }
+                let r = poll(&fds, nfds_t(fds.count), ms)
+                if r > 0 {
+                    if fds.count > 1 && fds[1].revents != 0 { return false }   // 취소
+                    return true
+                }
+                if r == 0 { if sliced { continue }; return false }   // 끊은 차례면 위에서 다시 본다
                 if errno == EINTR { continue }
                 return false
             }
