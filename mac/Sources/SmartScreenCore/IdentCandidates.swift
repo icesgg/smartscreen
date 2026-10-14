@@ -24,7 +24,8 @@ public struct IdentCandidate<ID: Hashable> {
 /// 1차(pass 0) 는 맞을 가능성이 높은 것만 본다: 신원 UUID 를 직접 본 후보(sure), 그리고 배운 비트가
 /// 있으면(learnedBit >= 0) 그 비트와 같은 후보. 1차에서 못 찾으면 2차(pass 1)에서 전체를 신호 순으로 -
 /// 비트는 광고 UUID 가 바뀌면 같이 옮겨 가므로 배운 값만 믿으면 영영 못 찾을 수 있다.
-/// (Windows 의 1차는 비트만 본다. Windows 에는 필터 경로가 없어 sure 가 없다.)
+/// (Windows 도 같다. Windows 에는 필터 경로가 없어 일반 서비스 목록에 신원 UUID 를 실은 광고 - 앱이 화면에
+/// 떠 있는 폰 - 만 sure 다.)
 ///
 /// 두 번 모두: probeFloor 보다 약한 것(자리 판정에 쓸 수 없는 거리)과 재시도 금지 시각
 /// (probedUntil > now)이 남은 것은 건너뛰고, 가장 센 것을 고른다. 같은 세기면 배열에서 앞의 것.

@@ -123,20 +123,26 @@ public enum Texts {
         return "  \(countdown)초 후 잠금"
     }
 
+    /// 광고 스캔이 멈춰 있을 때 초당 수신 건수 자리(또는 "BLE: N/A" 자리)에 쓰는 글. Windows 와 같은 글자.
+    public static let scanStoppedField = "광고 스캔 멈춤 - 다시 켜는 중"
+
     /// 고급 창 상태바. targetName 은 상대 기기가 정한 이름이라 길이를 믿을 수 없다 -
     /// Windows 처럼 299 글자(UTF-16)에서 자른다.
+    /// scanStopped: 광고 스캔이 멈춰 있다 (블루투스 꺼짐 등, ScannerSnapshot.scanStopped). 그러면 초당 수신
+    /// 건수 자리에 그렇게 적는다 - 0.0/s 로만 보이면 폰이 조용한 것인지 이 Mac 이 못 듣는 것인지 갈리지 않는다.
     public static func statusBar(_ r: ProbeResult, targetName: String, packetRate: Double,
-                                 nearThr: Int, gattThr: Int, idSt: String, gattSt: String, countdown: Int) -> String {
+                                 nearThr: Int, gattThr: Int, idSt: String, gattSt: String, countdown: Int,
+                                 scanStopped: Bool = false) -> String {
         let s: String
         if r.bleAvailable {
             // 초당 수신 건수: 신호가 얼마나 촘촘한지 보면서 임계값을 잡을 수 있다.
             // Near>= 는 그 경로가 실제로 쓰는 설정값이다 (히스테리시스 없이).
-            let rate = String(format: "%.1f", packetRate)
+            let rate = scanStopped ? scanStoppedField : String(format: "%.1f", packetRate) + "/s"
             let thr = r.gatt ? gattThr : nearThr
             s = "  \"\(targetName)\"  |  \(r.state.name)  |  RSSI: \(r.rssiDbm) dBm\(r.gatt ? " (GATT)" : "")"
-                + "  |  \(rate)/s  |  Near>=\(thr) dBm  |  ID: \(idSt)  |  GATT: \(gattSt)  |  Idle: \(countdown)s"
+                + "  |  \(rate)  |  Near>=\(thr) dBm  |  ID: \(idSt)  |  GATT: \(gattSt)  |  Idle: \(countdown)s"
         } else {
-            s = "  \"\(targetName)\"  |  \(r.state.name)  |  Latency: \(r.latencyMs) ms  |  BLE: N/A"
+            s = "  \"\(targetName)\"  |  \(r.state.name)  |  Latency: \(r.latencyMs) ms  |  BLE: \(scanStopped ? scanStoppedField : "N/A")"
                 + "  |  ID: \(idSt)  |  GATT: \(gattSt)  |  Idle: \(countdown)s"
         }
         return capUTF16(s, 299)

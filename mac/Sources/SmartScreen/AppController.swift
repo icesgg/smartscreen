@@ -653,7 +653,7 @@ final class AppController: NSObject, GuardEngineHost {
                                      nearThr: nearThr, gattThr: gattThr,
                                      idSt: Texts.idStatus(hasToken: hasToken, bound: scan.bound),
                                      gattSt: Texts.gattStatus(running: gatt.running, subscribed: gatt.subscribed),
-                                     countdown: guardEngine.nCountdown)
+                                     countdown: guardEngine.nCountdown, scanStopped: scan.scanStopped)
         advanced?.setStatus(statusText)
         updateOverlay()
     }

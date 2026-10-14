@@ -46,7 +46,9 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     // RSSI 와 틱은 한 잠금 안에서 같이 바꾼다. 판정은 틱 값이 바뀌었는지로 "새 샘플" 을
     // 세므로, 틱만 바뀌고 RSSI 가 예전 값이면 낡은 값을 새 샘플로 셀 수 있다 (spec ble §6).
     private let lock = NSLock()
-    private var pubAvailable = false
+    // available(이번 감시에서 F 를 건 적이 있다)과 멈춤(블루투스 꺼짐 등). 꺼져도 available 은 내리지 않는다 -
+    // ScanAvailability 주석. 바꾸는 것은 BLE 큐, 읽는 것은 snapshot 이라 잠금 안에 둔다.
+    private var pubScan = ScanAvailability()
     private var pubLastReceivedTick: UInt64 = 0   // 샘플의 정체성. 0 = 이번 세션에 아직 없음
     private var pubRaw = -100
     private var pubSmoothed = -100
@@ -251,6 +253,13 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             rawPolicy.markLogged(now: now)
             ensureCentral()
             updateScan()
+            // 블루투스가 이미 꺼져 있다 (관리자가 지난 감시 때 만들어져 있으면 상태가 바뀌지 않아 콜백이 오지
+            // 않는다). 감시 중에 꺼진 것과 같게 멈춤으로 두어 상태바가 말하고, 켜지면 "restarted after" 가
+            // 남는다 (Windows 의 처음 Start 실패와 같다). 막 만든 관리자(.unknown)는 콜백이 알려 준다.
+            if let c = central, c.state != .poweredOn, c.state != .unknown {
+                EventLog.write("BLE central state: \(BLEIds.stateName(c.state))")
+                noteScanLost()
+            }
             if identOn { ensureProber() }
         }
     }
@@ -366,7 +375,8 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         lock.lock()
         defer { lock.unlock() }
         var s = ScannerSnapshot()
-        s.available = pubAvailable
+        s.available = pubScan.available
+        s.scanStopped = pubScan.stopped
         let last = pubLastReceivedTick
         s.lastReceivedTick = last
         // 수신 이력이 있는데 끊긴 경우 = 범위 이탈로 본다 (판정 쪽)
@@ -447,13 +457,14 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         pubRaw = -100
         pubSmoothed = -100
         pubLastReceivedTick = 0
-        pubAvailable = false
+        pubScan.reset()
         lock.unlock()
     }
 
-    private func setAvailable(_ v: Bool) {
+    /// 감시 중에 F 의 스캔이 멈췄다 (블루투스 꺼짐, 재설정, 권한 없음). available 은 그대로 둔다.
+    private func noteScanLost() {
         lock.lock()
-        pubAvailable = v
+        pubScan.scanLost(now: Mono.now())
         lock.unlock()
     }
 
@@ -504,9 +515,13 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             c.scanForPeripherals(withServices: [BLEIds.identService],
                                  options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
             if running {
-                setAvailable(true)
+                let now = Mono.now()
+                lock.lock()
+                let stoppedMs = pubScan.scanIssued(now: now)
+                lock.unlock()
                 // 스캔을 (다시) 건 순간부터 F 의 공백을 센다 (FilterScanWatch)
-                filterWatch.scanStarted(now: Mono.now())
+                filterWatch.scanStarted(now: now)
+                if let ms = stoppedMs { scanCameBack(stoppedMs: ms) }
             }
             // 등록 스캔의 시간은 스캔을 실제로 건 지금부터 잰다. 권한 창이나 꺼진 블루투스를
             // 기다린 시간이 스캔 시간을 먹으면 앱을 띄운 폰이 있어도 "못 찾았다" 가 된다.
@@ -516,6 +531,16 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         } else if c.isScanning {
             c.stopScan()
         }
+    }
+
+    /// 감시 중에 멈췄던 F 를 다시 걸었다 (블루투스가 다시 켜짐). Windows 감시자 복구의 "restarted after" 와
+    /// ResetBackoff(true) 에 해당한다: 꺼져 있던 동안 못 붙은 것은 폰 탓이 아니므로 재시도 간격과 못-붙음 금지를
+    /// 비워 다음 프로버 틱에 바로 찾는다. 예전에는 비우는 길이 GATT 연결이 바뀔 때뿐이었는데, 연결이 안 돼서
+    /// 블루투스를 껐다 켜는 경우에는 그 전환이 생기지 않아 토글 전에 쌓인 금지(최대 120초)가 그대로 남았고,
+    /// 토글 뒤 첫 실패도 이어진 연속으로 세어져 다시 120초가 됐다. 남의 폰 판정(10분)은 그대로다.
+    private func scanCameBack(stoppedMs: UInt64) {
+        EventLog.write(ScanAvailability.restartedLine(stoppedMs: stoppedMs))
+        if identOn { resetBackoffOnQueue(clearUnreachable: true) }
     }
 
     /// R 을 돌려야 하는지: 감시 중이고 토큰이 있고, 정책(RawScanPolicy)이 원할 때 - 이 Mac 에 폰 앱이
@@ -612,14 +637,16 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         loggedCentralState = st
 
         if st == .poweredOn {
-            // 켜지면 (다시) 스캔을 건다. Windows 는 라디오가 꺼졌다 켜지면 다시 Start 를
-            // 눌러야 했지만 여기서는 저절로 이어진다.
+            // 켜지면 (다시) 스캔을 건다. 감시 중에 꺼졌다 켜진 것이면 updateScan 이 "restarted after" 를
+            // 남기고 탐색의 재시도 간격과 못-붙음 금지를 비운다 (scanCameBack).
             updateScan()
             return
         }
         // 꺼짐/권한 없음/재설정: 스캔이 멈췄다. 식별자도 무효가 되므로 후보와 결합을 버린다.
-        // RSSI 와 틱은 그대로 둔다 - 시간이 지나면 판정이 알아서 끊김으로 본다.
-        setAvailable(false)
+        // RSSI 와 틱은 그대로 둔다 - 시간이 지나면 판정이 알아서 끊김으로 본다. available 도 그대로 둔다 -
+        // 내리면 판정이 곧바로(연결 갈래) 또는 5초 뒤(광고 갈래) FAR 로 가서, 연결을 살리려고 블루투스를
+        // 껐다 켜는 사용자 앞에서 화면이 가려질 수 있다 (ScanAvailability). 멈춘 것은 상태바가 말한다.
+        if running { noteScanLost() }
         cands.removeAll()
         if boundId != nil { setBound(nil) }
         // 등록 중에 권한이 거부됐거나(권한 창에서 "허용 안 함") 블루투스가 꺼졌다/없다: 기다려도
@@ -979,6 +1006,10 @@ final class AdvScanner: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         let now = Mono.now()
         scanHousekeeping(now: now)
         guard probe == nil else { return }
+        // 블루투스가 꺼져 있으면(재설정, 권한 없음 포함) 찾지 않는다. 붙어 볼 수도 없고, 그 실패가 연속 실패로
+        // 쌓이면 폰 탓처럼 읽힌다 (Windows 프로버가 감시자가 멈춘 동안 쉬는 것과 같다). 켜지면 scanCameBack 이
+        // 재시도 간격을 비우고 다음 틱부터 찾는다.
+        guard central?.state == .poweredOn else { return }
 
         // 묶인 폰의 잠긴 광고를 어느 길이 주는지: 처음 보일 때와 그 묶음이 바뀔 때만 한 줄 (LockedPathLog).
         // 실기에서 어느 스캔을 살릴지는 bound 줄이 아니라 이 줄로 가른다.

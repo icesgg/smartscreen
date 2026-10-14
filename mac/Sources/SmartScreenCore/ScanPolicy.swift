@@ -109,6 +109,53 @@ public struct RawScanPolicy {
     }
 }
 
+/// 광고 스캔의 "available" 과 "멈춤" (AdvScanner). Windows BleRssiScanner 의 IsAvailable / IsScanStopped.
+///
+/// available 은 "이번 감시에서 필터 스캔(F)을 건 적이 있다" 이다. 블루투스가 꺼져도 내리지 않는다 -
+/// 판정(ProximityJudge)이 이것으로 갈래를 고르는데, 내리면 연결 갈래는 곧바로 "absent"(FAR), 광고 갈래는
+/// keepAliveSec(5초) 뒤 FAR 이 된다. 사용자가 연결을 살리려고 블루투스를 껐다 켜는 바로 그때 Mac 에서만
+/// 화면이 가려질 수 있었다. Windows 처럼 마지막 광고가 bleTimeoutSec(90초) 동안 판정을 잇게 둔다.
+/// 멈춘 것은 stopped 로 따로 말한다 - 상태바만 본다.
+///
+/// 다시 걸었을 때 멈춰 있던 시간을 돌려준다. 부르는 쪽은 그때 restartedLine 을 남기고 탐색의 재시도
+/// 간격과 못-붙음 금지를 비운다 (Windows 감시자 복구의 ResetBackoff(true)) - 꺼져 있던 동안 못 붙은 것은
+/// 폰 탓이 아니고, 그대로 두면 블루투스를 다시 켠 뒤에도 최대 2분 동안 그 폰을 찾지 않는다.
+public struct ScanAvailability {
+    public private(set) var available = false
+    /// 감시 중에 스캔이 멈춘 것(블루투스 꺼짐, 재설정, 권한 없음)을 안 시각. nil = 멈추지 않았다
+    public private(set) var stoppedSince: UInt64?
+
+    public var stopped: Bool { return stoppedSince != nil }
+
+    public init() {}
+
+    /// 감시 시작. 지난 감시의 것은 잊는다.
+    public mutating func reset() {
+        self = ScanAvailability()
+    }
+
+    /// F 에 스캔을 걸었다 (감시 중). 멈췄다가 다시 건 것이면 멈춰 있던 ms, 아니면 nil.
+    public mutating func scanIssued(now: UInt64) -> UInt64? {
+        available = true
+        guard let since = stoppedSince else { return nil }
+        stoppedSince = nil
+        // 다른 스레드가 잰 시각이 거꾸로 올 수 있다 - 그때는 0 ms 로 본다 (UInt64 뺄셈이 죽지 않게)
+        return now > since ? now - since : 0
+    }
+
+    /// 스캔이 멈췄다 (감시 중). available 은 그대로 둔다. 이미 멈춰 있으면 처음 시각을 지킨다 -
+    /// 재설정(resetting) 뒤 꺼짐(poweredOff) 처럼 여러 번 와도 멈춘 시간은 처음부터 잰다.
+    public mutating func scanLost(now: UInt64) {
+        if stoppedSince == nil { stoppedSince = now }
+    }
+
+    /// "scan: restarted after 12s (bluetooth back on)". 초는 버림. Windows 의
+    /// "v1 advertisement scan: restarted after 12s" 와 같은 grep ("restarted after") 에 걸린다.
+    public static func restartedLine(stoppedMs: UInt64) -> String {
+        return "scan: restarted after \(stoppedMs / 1000)s (bluetooth back on)"
+    }
+}
+
 /// 필터 스캔(F)이 멎었는지 보고 다시 걸지 정한다 (AdvScanner).
 ///
 /// 폰이 가까이 있는 것이 분명한데 (GATT 가 건강하다, 또는 R 이 10초 안에 묶인 폰을 줬다) F 가 30초 넘게

@@ -25,8 +25,11 @@ public enum ProxState: Equatable {
 
 /// 광고 스캐너 상태를 `now` 시점에 본 사본 (Windows g_bleScanner 의 접근자들).
 public struct ScannerSnapshot {
-    /// 스캔 시작에 성공했다 (Windows IsAvailable 처럼 한 번 켜지면 다음 Start 실패 전까지 유지)
+    /// 스캔 시작에 성공했다 (Windows IsAvailable 처럼 한 번 켜지면 다음 Start 실패 전까지 유지).
+    /// 블루투스가 꺼져도 내리지 않는다 (ScanAvailability 주석)
     public var available = false
+    /// 감시 중에 스캔이 멈춰 있다 - 블루투스 꺼짐 등 (Windows IsScanStopped). 상태바만 본다, 판정은 보지 않는다
+    public var scanStopped = false
     /// 마지막으로 짝이 맞은 패킷의 시각 (0 = 이번 세션에 아직 없음)
     public var lastReceivedTick: UInt64 = 0
     /// 아무것도 못 받았거나 마지막 패킷이 timeout 보다 오래됐으면(엄격한 >) 이미 -100

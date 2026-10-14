@@ -137,9 +137,14 @@ struct BleRssiScanner::Impl {
     // 이만큼 탐색하지 않은 주소의 연속 실패는 끝난 것으로 본다 (주소가 바뀌었거나 멀어짐).
     static constexpr ULONGLONG kStreakIdleMs = 300000;
 
-    struct Cand { bool rnd; int rssi; int bit; ULONGLONG seen; };
+    // 후보 하나 (Mac IdentCandidate 와 같은 뜻).
+    //  bit  - overflow 광고에서 읽은 비트 (-1 = 모름). 같은 주소가 다른 모양의 광고도 내므로
+    //         새로 읽었을 때만 바꾼다.
+    //  sure - 일반 서비스 목록에 신원 UUID 를 실은 광고를 봤다 (앱이 화면에 떠 있는 폰).
+    //         한 번 서면 후보가 사라질 때까지 남는다.
+    struct Cand { bool rnd = true; int rssi = -127; int bit = -1; bool sure = false; ULONGLONG seen = 0; };
     std::mutex candMutex;
-    std::map<uint64_t, Cand> cands;             // overflow 비트 하나짜리 광고들
+    std::map<uint64_t, Cand> cands;             // overflow 비트 하나짜리 광고와 신원 UUID 를 실은 광고들
     // 주소별 재시도 금지 시각. 실패 종류에 따라 길이가 다르다 -
     // 남의 기기로 확인된 주소를 계속 다시 찌르면 맞는 기기에 쓸 시도를 낭비한다.
     // set 은 금지를 건 시각: 간격을 처음으로 되돌릴 때 "첫 실패였다면" 으로 줄이는 데 쓴다.
@@ -166,7 +171,7 @@ struct BleRssiScanner::Impl {
     // UI 스레드(ProbeTagForLog, IrkRecognisesPhone)가 함께 보므로 원자값으로 둔다.
     std::atomic<ULONGLONG> gattLinkSince{ 0 };  // GATT 링크가 생긴 시각, 끊겨 있으면 0
     std::atomic<bool> measuring{ false };       // 재보기가 재는 중 (SetMeasuring). 그동안 GATT 쉼 없음
-    std::atomic<ULONGLONG> irkMatchTick{ 0 };   // IRK 가 폰의 광고를 마지막으로 푼 시각
+    std::atomic<ULONGLONG> irkMatchTick{ 0 };   // IRK 가 폰의 광고를 마지막으로 푼 시각. 감시자가 멈추면 0
     std::atomic<ULONGLONG> probeStartTick{ 0 }; // 진행 중인 탐색의 시작 시각, 없으면 0
     std::atomic<ULONGLONG> probeEndTick{ 0 };   // 마지막 탐색이 끝난 시각
 
@@ -378,16 +383,27 @@ struct BleRssiScanner::Impl {
     // 포그라운드에서는 UUID가 광고에 실리지만, 잠금/백그라운드에서는 iOS가
     // Apple overflow 영역으로 옮겨 버려서 어차피 이 경로로는 안 보인다.
     static bool HasOurService(BluetoothLEAdvertisement const& adv) {
+        return ListsService(adv, true);
+    }
+
+    // 일반 서비스 목록에 신원 UUID 가 실렸는지 = 앱이 화면에 떠 있는 폰. 탐색 후보를 모을 때 쓴다.
+    // HasOurService 와 달리 예전 PC 쪽 UUID 는 보지 않는다 - 그것은 SmartScreen 을 돌리는 옆 PC 의
+    // GATT 서버도 광고하므로, 받으면 남의 PC 마다 10분에 한 번씩 헛되이 붙는다.
+    static bool ListsIdentService(BluetoothLEAdvertisement const& adv) {
+        return ListsService(adv, false);
+    }
+
+    static bool ListsService(BluetoothLEAdvertisement const& adv, bool legacyToo) {
         static const winrt::guid ident = [] {
             GUID g{}; CLSIDFromString(SS_IDENT_SERVICE_UUID, &g); return winrt::guid(g);
         }();
-        // 예전 앱 빌드는 PC 쪽 서비스 UUID를 광고했다. 둘 다 받아 준다.
+        // 예전 앱 빌드는 PC 쪽 서비스 UUID를 광고했다. legacyToo 면 둘 다 받아 준다.
         static const winrt::guid legacy = [] {
             GUID g{}; CLSIDFromString(SS_GATT_SERVICE_UUID, &g); return winrt::guid(g);
         }();
         try {
             for (auto const& u : adv.ServiceUuids())
-                if (u == ident || u == legacy) return true;
+                if (u == ident || (legacyToo && u == legacy)) return true;
         } catch (...) {}
         return false;
     }
@@ -436,7 +452,8 @@ struct BleRssiScanner::Impl {
             // 감시자가 멈춰 다시 세우는 중일 때도 논다. 라디오가 꺼져 있으면 붙어 볼 수도 없고,
             // 그 실패가 연속 실패로 쌓이면 폰 탓처럼 읽힌다. 다시 서면 재시도 간격을 비우고
             // (WatchTick) 쉬던 이유도 처음부터 적는다 - "probes paused - IRK ..." 가 다시 보이면
-            // 다시 선 감시자가 폰을 듣고 있다는 뜻이다.
+            // 다시 선 감시자가 폰을 듣고 있다는 뜻이다. 멈추기 전의 IRK 일치는 감시자를 내려놓을 때
+            // 지운다 (GoDownLocked, FailLocked) - 남아 있으면 새 감시자가 아무것도 못 들어도 이 줄이 나온다.
             if (!running || !identOn || scanDown) { pause = Pause::None; continue; }
             ULONGLONG now = GetTickCount64();
 
@@ -506,7 +523,7 @@ struct BleRssiScanner::Impl {
             // 위 줄의 "looking again" 은 그때부터다.
             if (pause == Pause::Gatt) continue;
 
-            uint64_t pick = 0; bool pickRnd = true; int pickBit = -1, pickRssi = -127;
+            uint64_t pick = 0; bool pickRnd = true, pickSure = false; int pickBit = -1, pickRssi = -127;
             {
                 std::lock_guard<std::mutex> lock(candMutex);
                 for (auto it = cands.begin(); it != cands.end(); ) {
@@ -519,17 +536,17 @@ struct BleRssiScanner::Impl {
                     else ++it;
                 }
                 int want = identBit.load();
-                // 1차는 학습한 비트와 일치하는 후보만 본다. 못 찾으면 2차에서
-                // 전체를 신호 순으로 - 비트는 광고 UUID가 바뀌면 같이 옮겨간다.
+                // 1차는 맞을 가능성이 높은 것만 본다: 신원 UUID 를 직접 실은 후보(sure, 앱이 화면에 떠
+                // 있는 폰)와, 배운 비트가 있으면 그 비트와 같은 후보. 못 찾으면 2차에서 전체를 신호
+                // 순으로 - 비트는 광고 UUID가 바뀌면 같이 옮겨간다. Mac IdentCandidatePick 과 같다.
                 for (int pass = 0; pass < 2 && !pick; pass++) {
-                    if (pass == 0 && want < 0) continue;
                     for (auto const& [a, c] : cands) {
-                        if (pass == 0 && c.bit != want) continue;
+                        if (pass == 0 && !(c.sure || (want >= 0 && c.bit == want))) continue;
                         if (c.rssi < probeFloor) continue;   // 자리 판정에 쓸 수 없는 거리는 건드리지 않는다
                         auto pit = probedUntil.find(a);
                         if (pit != probedUntil.end() && now < pit->second.until) continue;
                         if (c.rssi > pickRssi) {
-                            pick = a; pickRnd = c.rnd; pickBit = c.bit; pickRssi = c.rssi;
+                            pick = a; pickRnd = c.rnd; pickSure = c.sure; pickBit = c.bit; pickRssi = c.rssi;
                         }
                     }
                 }
@@ -598,8 +615,10 @@ struct BleRssiScanner::Impl {
             LogLines(lines);
             boundAddr = pick;
             boundSeenTick = GetTickCount64();
-            DbgEvent(L"ident: bound to %012llX (%d dBm, %lums)",
-                     (unsigned long long)pick, pickRssi, took);
+            // 앱이 화면에 떠 있던 광고로 찾은 것이면 그렇게 적는다 (Mac 의 ", app on screen" 과 같은 글자) -
+            // 잠긴 폰의 overflow 광고로 찾은 것과 로그에서 갈린다.
+            DbgEvent(L"ident: bound to %012llX (%d dBm, %lums%s)",
+                     (unsigned long long)pick, pickRssi, took, pickSure ? L", app on screen" : L"");
             if (pickBit >= 0 && pickBit != identBit.load()) {
                 identBit = pickBit;
                 identBitLearned = pickBit;   // 설정에 저장하도록 알린다
@@ -652,13 +671,24 @@ struct BleRssiScanner::Impl {
             boundSeenTick = GetTickCount64();
         } else if (identOn) {
             // 아직 못 묶었으면 후보로만 쌓아 둔다. 붙는 일은 프로버 스레드가 한다.
+            // 잠기거나 백그라운드인 폰은 신원 UUID 를 overflow 로 옮겨 비트 하나짜리 광고를 낸다.
+            // 앱이 화면에 떠 있는 폰은 그 모양을 내지 않고 UUID 를 일반 목록에 싣는다 - 예전에는 이것을
+            // 후보로 받지 않아서, 앱을 다시 설치하고 화면에 띄운 채 기다리면 (2026-10-15 데스크톱) 폰이
+            // 잠길 때까지 광고 경로로는 묶이지 않았다. IRK 가 없는 PC 에서는 그 광고가 matched 로도 안
+            // 잡히고, GATT 주변기기가 안 되는 동글 PC 에서는 광고 경로가 전부다. UUID 는 앱을 쓰는 모든
+            // 폰이 같지만 신원은 토큰이 가르므로 남의 폰이 섞여도 오판은 없다. Mac 도 받는다 (sure).
+            // overflow 모양의 광고는 일반 목록이 비어 있으므로 그때는 목록을 읽지 않는다 (뜨거운 경로).
             int bit = SingleOverflowBit(args.Advertisement());
-            if (bit >= 0) {
+            bool sure = bit < 0 && ListsIdentService(args.Advertisement());
+            if (bit >= 0 || sure) {
                 std::lock_guard<std::mutex> lock(candMutex);
                 auto& c = cands[addr];
                 c.rnd = (args.BluetoothAddressType()
                          != Windows::Devices::Bluetooth::BluetoothAddressType::Public);
-                c.rssi = rssi; c.bit = bit; c.seen = GetTickCount64();
+                c.rssi = rssi;
+                if (bit >= 0) c.bit = bit;
+                c.sure = c.sure || sure;
+                c.seen = GetTickCount64();
             }
         }
 
@@ -858,8 +888,12 @@ struct BleRssiScanner::Impl {
     }
 
     // watcherMutex 를 쥔 채 부른다. Up 이던 감시자가 멈췄다 - 내려놓고 복구를 시작한다.
+    // 멈추기 전의 IRK 일치도 지운다. 남겨 두면 다시 선 감시자가 폰을 하나도 못 들어도 다음 프로버 틱이
+    // 그것을 보고 "probes paused - IRK recognises the phone" 을 적고(복구된 것처럼 읽힌다) 상태바도
+    // "IRK" 를 보이며, 복구 직후 바로 찾으려던 탐색(ResetBackoff)이 최대 30초 쉰다.
     void GoDownLocked(ULONGLONG now, ULONGLONG next) {
         DropWatcherLocked();
+        irkMatchTick = 0;
         scan = Scan::Down;
         scanDown = true;
         downSince = now;
@@ -869,9 +903,11 @@ struct BleRssiScanner::Impl {
 
     // watcherMutex 를 쥔 채 부른다. 세워 본 것이 안 됐다 - Down 으로 둔다.
     // 안 되는 동안 매번 적으면 3초마다 한 줄이라, 5분에 한 줄만 적는다.
+    // 세워 본 감시자가 멈추기 전에 IRK 로 푼 것도 지운다 (GoDownLocked 와 같은 까닭).
     void FailLocked(ULONGLONG now, const std::wstring& why, ULONGLONG next,
                     std::vector<std::wstring>& lines) {
         DropWatcherLocked();
+        irkMatchTick = 0;
         scan = Scan::Down;
         nextTry = next;
         if (Elapsed(now, stillLogTick) >= kScanStillLogMs) {
