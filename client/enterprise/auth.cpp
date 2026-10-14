@@ -239,16 +239,61 @@ static bool QueryParam(const std::string& req, const char* key, std::string& out
     return false;
 }
 
+// 취소 신호(수동 리셋 이벤트)가 켜져 있는가. 신호가 없으면(nullptr) 늘 아니다.
+static bool CancelSet(HANDLE cancelEv) {
+    return cancelEv && WaitForSingleObject(cancelEv, 0) == WAIT_OBJECT_0;
+}
+
+enum class SockWait { Ready, TimedOut, Cancelled };
+
 // s 에 읽을 것이 생길 때까지 길어야 ms 만큼 기다린다. 리스너에서는 "들어온
 // 연결이 있다", 받은 소켓에서는 "바이트가 왔거나 상대가 끊었다" 는 뜻이다.
-static bool WaitReadable(SOCKET s, ULONGLONG ms) {
-    fd_set rd;
-    FD_ZERO(&rd);
-    FD_SET(s, &rd);
-    timeval tv{};
-    tv.tv_sec = (long)(ms / 1000);
-    tv.tv_usec = (long)((ms % 1000) * 1000);
-    return select(0, &rd, nullptr, nullptr, &tv) > 0;
+//
+// cancelEv 가 켜지면 남은 시간을 기다리지 않고 바로 Cancelled 로 돌아온다. 예전에는
+// 취소할 길이 없어서, 로그인을 누른 뒤 [등록 내역 삭제] 는 리스너가 브라우저를 다
+// 기다릴 때까지(3분) 거절됐다 (2026-10-15). select 는 이벤트를 같이 기다리지 못하므로
+// 소켓을 잠깐 이벤트에 묶어(WSAEventSelect) 취소 신호와 함께 기다린다.
+// 묶으면 소켓이 논블로킹이 되고, 묶음을 풀어도 그대로 남는다. 그래서 풀고 나서
+// blockingAfter 대로 되돌린다 - 풀지 않은 채로는 FIONBIO 로 되돌리지도 못한다.
+// 리스너에 묶음을 남기지 않는 것은 accept 한 소켓이 그 묶음을 물려받기 때문이다.
+static SockWait WaitReadable(SOCKET s, ULONGLONG ms, HANDLE cancelEv = nullptr,
+                             bool blockingAfter = false) {
+    if (CancelSet(cancelEv)) return SockWait::Cancelled;
+    if (cancelEv) {
+        WSAEVENT ev = WSACreateEvent();
+        if (ev != WSA_INVALID_EVENT && WSAEventSelect(s, ev, FD_ACCEPT | FD_READ | FD_CLOSE) == 0) {
+            // 묶기 전에 이미 와 있던 연결/바이트도 묶는 순간 이벤트를 켠다 (WSAEventSelect 문서).
+            HANDLE hs[2] = { cancelEv, ev };
+            DWORD w = WaitForMultipleObjects(2, hs, FALSE,
+                                             ms >= INFINITE ? INFINITE - 1 : (DWORD)ms);
+            WSAEventSelect(s, nullptr, 0);
+            u_long mode = blockingAfter ? 0 : 1;
+            ioctlsocket(s, FIONBIO, &mode);
+            WSACloseEvent(ev);
+            if (w == WAIT_OBJECT_0) return SockWait::Cancelled;
+            return (w == WAIT_OBJECT_0 + 1) ? SockWait::Ready : SockWait::TimedOut;
+        }
+        if (ev != WSA_INVALID_EVENT) WSACloseEvent(ev);
+        // 이벤트를 못 만들었다 (드물다). 아래 select 를 짧게 끊어 가며 사이사이 신호를 본다.
+    }
+    // 신호가 없으면 예전과 같다: select 한 번으로 ms 를 다 기다린다.
+    const ULONGLONG end = GetTickCount64() + ms;
+    for (;;) {
+        ULONGLONG now = GetTickCount64();
+        ULONGLONG slice = (now < end) ? end - now : 0;
+        if (cancelEv && slice > 200) slice = 200;
+        fd_set rd;
+        FD_ZERO(&rd);
+        FD_SET(s, &rd);
+        timeval tv{};
+        tv.tv_sec = (long)(slice / 1000);
+        tv.tv_usec = (long)((slice % 1000) * 1000);
+        int n = select(0, &rd, nullptr, nullptr, &tv);
+        if (n > 0) return SockWait::Ready;
+        if (n < 0) return SockWait::TimedOut;
+        if (CancelSet(cancelEv)) return SockWait::Cancelled;
+        if (GetTickCount64() >= end) return SockWait::TimedOut;
+    }
 }
 
 // 코드는 토큰 교환 요청의 JSON 에 그대로 끼워 넣는다 (SignInWithGoogle).
@@ -262,10 +307,11 @@ static bool PlausibleCode(const std::string& s) {
 }
 
 bool LoopbackListener::WaitForCode(unsigned timeoutMs, std::string& outCode,
-                                   std::string& outErr) {
+                                   std::string& outErr, void* cancelEvent) {
     outCode.clear();
     outErr.clear();
     if (m_impl->sock == INVALID_SOCKET) return false;
+    HANDLE cancelEv = (HANDLE)cancelEvent;
 
     // 예전에는 select 한 번, accept 한 번이었다. 그래서 이 포트에 먼저 닿은 연결이
     // 무엇이든(포트를 훑는 다른 프로세스, 파비콘 요청) 그것이 로그인의 결과가
@@ -287,9 +333,11 @@ bool LoopbackListener::WaitForCode(unsigned timeoutMs, std::string& outCode,
     SOCKET c = INVALID_SOCKET;
     bool gotCode = false;
     for (;;) {
+        // 취소는 돌 때마다 본다. 기다리는 중에 켜지면 WaitReadable 이 그 자리에서 깬다.
+        if (CancelSet(cancelEv)) return false;
         ULONGLONG now = GetTickCount64();
         if (now >= deadline) return false;
-        if (!WaitReadable(m_impl->sock, deadline - now)) return false;
+        if (WaitReadable(m_impl->sock, deadline - now, cancelEv) != SockWait::Ready) return false;
 
         c = accept(m_impl->sock, nullptr, nullptr);
         if (c == INVALID_SOCKET) {
@@ -313,13 +361,25 @@ bool LoopbackListener::WaitForCode(unsigned timeoutMs, std::string& outCode,
         char buf[2048];
         ULONGLONG connEnd = GetTickCount64() + kConnMs;
         if (connEnd > deadline) connEnd = deadline;
+        bool cancelled = false;
         for (int i = 0; i < 8; ++i) {
             ULONGLONG t = GetTickCount64();
-            if (t >= connEnd || !WaitReadable(c, connEnd - t)) break;
+            if (t >= connEnd) break;
+            // 받은 소켓은 위에서 블로킹으로 되돌렸다 - 기다린 뒤에도 그대로 둔다 (true).
+            SockWait w = WaitReadable(c, connEnd - t, cancelEv, true);
+            if (w == SockWait::Cancelled) { cancelled = true; break; }
+            if (w != SockWait::Ready) break;
             int n = recv(c, buf, sizeof(buf), 0);
             if (n <= 0) break;
             req.append(buf, n);
             if (req.find("\r\n") != std::string::npos) break;
+        }
+        if (cancelled) {
+            // 로그인을 취소했다. 이 연결이 브라우저의 진짜 요청이었어도 답하지 않는다 -
+            // 앱은 이 로그인의 결과를 쓰지 않는다.
+            shutdown(c, SD_BOTH);
+            closesocket(c);
+            return false;
         }
 
         // 우리가 내준 주소는 http://127.0.0.1:<포트> 이고 (SignInWithGoogle)
@@ -732,8 +792,12 @@ static bool ParseSession(const std::string& body, AuthSession& s) {
 // ---------------------------------------------------------------------------
 bool SignInWithGoogle(const std::wstring& supabaseUrl, const std::wstring& anonKey,
                       AuthSession& outSession, std::wstring& outErr,
-                      unsigned timeoutSec) {
+                      unsigned timeoutSec, void* cancelEvent) {
     outErr.clear();
+    HANDLE cancelEv = (HANDLE)cancelEvent;
+    // 취소로 끝난 로그인의 글. 부르는 쪽(main.cpp)은 취소한 로그인의 결과를 버리므로
+    // 사용자에게 뜨지 않는다 - 로그를 읽는 사람이 시간 초과와 가르게만 한다.
+    static const wchar_t kCancelled[] = L"로그인을 취소했다";
     if (supabaseUrl.empty() || anonKey.empty()) {
         outErr = L"서버 주소나 키가 비어 있다";
         return false;
@@ -761,6 +825,9 @@ bool SignInWithGoogle(const std::wstring& supabaseUrl, const std::wstring& anonK
                      + L"&code_challenge=" + UrlEncode(Widen(challenge))
                      + L"&code_challenge_method=s256";
 
+    // 이미 취소됐으면 브라우저를 열지 않는다 - 열면 아무도 기다리지 않는 로그인 창이 남는다.
+    if (CancelSet(cancelEv)) { outErr = kCancelled; return false; }
+
     // 시스템 브라우저로 연다. 임베디드 웹뷰는 구글이 거부한다.
     HINSTANCE r = ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     if ((INT_PTR)r <= 32) {
@@ -769,13 +836,16 @@ bool SignInWithGoogle(const std::wstring& supabaseUrl, const std::wstring& anonK
     }
 
     std::string code, err;
-    if (!listener.WaitForCode(timeoutSec * 1000, code, err)) {
+    if (!listener.WaitForCode(timeoutSec * 1000, code, err, cancelEv)) {
+        if (CancelSet(cancelEv)) { outErr = kCancelled; return false; }
         // err 는 이 포트에 닿은 누구든 넣을 수 있는 글이다. 서버 글과 같은 상한을 걸고,
         // 앱이 한 말로 읽히지 않게 어디서 온 글인지 앞에 붙인다 (MessageBox 에 그대로 뜬다).
         outErr = err.empty() ? L"로그인이 시간 안에 끝나지 않았다"
                              : L"브라우저가 돌려준 오류: " + CapErrorText(Widen(err));
         return false;
     }
+    // 코드를 받은 뒤에 취소됐다. 교환하지 않는다 - 어차피 버릴 세션을 만들 까닭이 없다.
+    if (CancelSet(cancelEv)) { outErr = kCancelled; return false; }
 
     // 코드 -> 토큰. verifier 는 여기서 처음 밖으로 나간다.
     // code 를 이스케이프 없이 끼워 넣어도 되는 것은 WaitForCode 가 따옴표·역슬래시·

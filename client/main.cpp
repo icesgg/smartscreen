@@ -87,12 +87,14 @@ static const wchar_t* kDefaultAnonKey =
 
 // 로그인 스레드가 UI 로 돌려보내는 결과
 struct LoginResult {
+    int          gen = 0;    // 이 로그인을 시작할 때의 g_loginGen. 지금 값과 다르면 취소된 로그인이다
     bool         ok = false;
     std::wstring err;
     std::wstring email;
     std::wstring userId;
     std::wstring refresh;    // DPAPI 로 봉해진 값
     std::wstring phoneToken; // 비어 있으면 "폰에서 아직 로그인 안 함"
+    AuthSession  session;    // ok 일 때 UI 스레드가 심는다 (WM_LOGIN_RESULT 의 SessionAdopt)
 };
 
 // ---------------------------------------------------------------------------
@@ -771,35 +773,78 @@ static DWORD WINAPI ScanThread(LPVOID param) {
 // 그동안 설정 창이 통째로 멎으므로, 여기서 돌리고 결과만 창으로 보낸다.
 static volatile bool g_loginBusy = false;
 
-static DWORD WINAPI LoginThread(LPVOID) {
+// 로그인 세대. UI 스레드에서만 읽고 쓴다. 로그인을 시작할 때와, [등록 내역 삭제] 가
+// 진행 중인 로그인을 취소할 때(CancelLogin) 하나씩 오른다. 작업 스레드는 시작할 때의
+// 값을 결과에 실어 보내고, WM_LOGIN_RESULT 는 지금 값과 다른 결과를 버린다.
+static int g_loginGen = 0;
+// 진행 중인 로그인의 취소 신호 (수동 리셋 이벤트). 작업 스레드는 복제한 자기 사본을
+// 받는다 - 취소한 쪽이 이 핸들을 바로 닫아도 스레드가 보는 신호는 살아 있다
+// (판정 스레드의 정지 이벤트와 같은 방식, StopScanThread 주석).
+static HANDLE g_loginCancelEv = nullptr;
+
+struct LoginThreadParam {
+    int    gen;        // 시작할 때의 g_loginGen
+    HANDLE cancelEv;   // g_loginCancelEv 의 복제본. 스레드가 닫는다
+};
+
+static DWORD WINAPI LoginThread(LPVOID param) {
+    auto* p = (LoginThreadParam*)param;
+    // 예전에는 시작을 적지 않아서, 로그인이 도는 동안 무엇이 막히든 로그로는 로그인이
+    // 돌고 있다는 것조차 알 수 없었다 (2026-10-15 "로그인 중에는 지울 수 없습니다").
+    DbgEvent(L"google login: started");
+
     AppConfig cfg;
     LoadAppConfig(cfg);
     std::wstring url = cfg.serverUrl.empty() ? kDefaultSupabaseUrl : cfg.serverUrl;
     std::wstring key = cfg.anonKey.empty() ? kDefaultAnonKey : cfg.anonKey;
 
     auto* r = new LoginResult{};
+    r->gen = p->gen;
     AuthSession s;
-    if (!SignInWithGoogle(url, key, s, r->err)) {
-        PostMessage(g_hWnd, WM_LOGIN_RESULT, 0, (LPARAM)r);
-        return 0;
+    if (SignInWithGoogle(url, key, s, r->err, kGoogleLoginTimeoutSec, p->cancelEv)) {
+        // 여기까지 왔으면 로그인은 됐다. 뒤에서 무엇이 실패하든 세션은 저장할 값이다.
+        r->ok = true;
+        r->email = s.email;
+        r->userId = s.userId;
+        ProtectSecret(s.refreshToken, r->refresh);
+
+        // 세션은 여기서 심지 않고 결과에 실어 보낸다 (WM_LOGIN_RESULT 가 SessionAdopt).
+        // 예전에는 여기서 심었다. 그러면 [등록 내역 삭제] 가 취소한 로그인도 교환이 이미
+        // 끝났으면 세션이 살아난다 - 버릴 결과인지는 UI 스레드만 안다 (g_loginGen).
+        r->session = s;
+
+        std::wstring token, err;
+        if (!FetchDeviceToken(url, key, s, token, err)) r->err = err;
+        else r->phoneToken = token;   // 빈 값일 수 있다 = 폰에서 아직 로그인 안 함
     }
-    // 여기까지 왔으면 로그인은 됐다. 뒤에서 무엇이 실패하든 세션은 저장할 값이다.
-    r->ok = true;
-    r->email = s.email;
-    r->userId = s.userId;
-    ProtectSecret(s.refreshToken, r->refresh);
-
-    // 살아 있는 세션으로 심는다. 이게 없으면 방금 로그인해도 클립보드 동기화는
-    // 앱을 다시 켤 때까지 "로그인하지 않았다" 로 남는다 - 로그인한 사람에게
-    // 로그인하라고 말하는 상태가 된다.
-    SessionAdopt(s);
-
-    std::wstring token, err;
-    if (!FetchDeviceToken(url, key, s, token, err)) r->err = err;
-    else r->phoneToken = token;   // 빈 값일 수 있다 = 폰에서 아직 로그인 안 함
 
     PostMessage(g_hWnd, WM_LOGIN_RESULT, 0, (LPARAM)r);
+    if (p->cancelEv) CloseHandle(p->cancelEv);
+    delete p;
     return 0;
+}
+
+// 진행 중인 구글 로그인을 취소한다 (UI 스레드). [등록 내역 삭제] 가 부른다 (UnregisterPhone).
+//
+// 그대로 두면 로그인이 끝나면서 계정의 폰 토큰을 config 에 쓴다 - 지웠다고 말한 직후에
+// 등록이 되살아난다. 그래서 예전에는 로그인 중에 지우기를 거절했는데, 리스너가 브라우저를
+// 3분까지 기다리므로 [예] 를 누르고 브라우저를 닫아 버린 사람은 3분 동안 지울 수 없었다
+// (2026-10-15). 이제 지우기가 이긴다:
+//  - 세대를 올린다. 교환이 이미 끝나 결과가 오고 있어도 WM_LOGIN_RESULT 가 버린다.
+//  - 신호를 켠다. 리스너가 브라우저를 기다리던 것을 그 자리에서 그만둔다 (auth.cpp).
+//  - 단추와 g_loginBusy 는 바로 돌려 놓는다. 스레드가 끝나기를 기다리지 않는다 -
+//    토큰 교환 중이었으면 몇 초 더 돌지만 그 결과는 이미 버리기로 했다.
+static void CancelLogin() {
+    if (!g_loginBusy) return;
+    ++g_loginGen;
+    if (g_loginCancelEv) {
+        SetEvent(g_loginCancelEv);
+        CloseHandle(g_loginCancelEv);
+        g_loginCancelEv = nullptr;
+    }
+    g_loginBusy = false;
+    EnableWindow(GetDlgItem(g_hWnd, ID_BTN_REGISTER_PHONE), TRUE);
+    DbgEvent(L"google login: cancelled (registration deleted)");
 }
 
 // ---------------------------------------------------------------------------
@@ -1139,13 +1184,10 @@ static PhoneRegHere PhoneRegisteredHere(const AppConfig& c) {
 }
 
 static void UnregisterPhone(HWND hWnd) {
-    // 로그인이 끝나면 새 토큰이 들어온다 - 지웠다고 말한 직후에 등록이 되살아난다.
-    // 등록 단추는 로그인 중에 꺼지지만 간단 창의 [바꾸기] 는 여기로 바로 온다.
-    if (g_loginBusy) {
-        MessageBoxW(hWnd, L"로그인 중에는 지울 수 없습니다.\n브라우저 창을 확인하세요.",
-                    L"폰 등록", MB_OK | MB_ICONINFORMATION);
-        return;
-    }
+    // 구글 로그인이 도는 중이어도 지운다. 그 로그인은 지우면서 취소한다 (CancelLogin) -
+    // 두면 끝나면서 새 토큰을 넣어, 지웠다고 말한 직후에 등록이 되살아난다.
+    // 예전에는 여기서 거절했다 (등록 단추는 로그인 중에 꺼지지만 간단 창의 [바꾸기] 는
+    // 여기로 바로 온다). 리스너가 브라우저를 3분까지 기다려서, 그동안 지울 수 없었다.
     AppConfig c; LoadAppConfig(c);
     PhoneRegHere reg = PhoneRegisteredHere(c);
     if (!reg.token && !reg.irk) {
@@ -1162,18 +1204,17 @@ static void UnregisterPhone(HWND hWnd) {
     q += (reg.token && reg.irk) ? L"폰 토큰, 기기 키" : reg.token ? L"폰 토큰" : L"기기 키";
     q += L"\n";
     if (g_monitoring) q += L"보호가 켜져 있어 함께 끕니다.\n";
+    // 보호 줄과 같은 규칙: 해당할 때만 붙고, 없으면 빈 줄도 남기지 않는다 (Mac 과 같은 글).
+    if (g_loginBusy) q += L"진행 중인 구글 로그인은 취소합니다.\n";
     q += L"\n구글 로그인과 클립보드 공유는 그대로입니다.\n"
          L"다른 PC 와 서버의 등록은 건드리지 않습니다.";
     if (reg.irk) q += L"\n기기 키는 고급 설정의 [기기 키] 로 다시 넣을 수 있습니다.";
     if (MessageBoxW(hWnd, q.c_str(), L"폰 등록", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
         return;
 
-    // 묻는 동안에도 메시지는 돈다 (간단 창의 단추, 로그인 결과). 처음부터 다시 본다.
-    if (g_loginBusy) {
-        MessageBoxW(hWnd, L"로그인 중에는 지울 수 없습니다.\n브라우저 창을 확인하세요.",
-                    L"폰 등록", MB_OK | MB_ICONINFORMATION);
-        return;
-    }
+    // 묻는 동안에도 메시지는 돈다 (간단 창의 단추, 로그인 결과). 처음부터 다시 본다:
+    // 그 사이 로그인이 끝나 토큰을 썼으면 아래에서 config 를 새로 읽어 그것까지 지우고,
+    // 그 사이 로그인이 시작됐으면 묻던 때 없던 로그인이라도 취소한다 - 지우기로 했다.
     AppConfig cfg; LoadAppConfig(cfg);
     reg = PhoneRegisteredHere(cfg);
     cfg.phoneToken.clear();
@@ -1192,6 +1233,10 @@ static void UnregisterPhone(HWND hWnd) {
     // 아직 못 쓴 로그인 결과에 토큰이 실려 있으면, 다시 쓰는 타이머(FlushAuthSave)가
     // 방금 지운 토큰을 config 에 도로 넣는다. 토큰만 뺀다 - 계정 값은 그대로 써야 한다.
     g_authSave.phoneToken.clear();
+    // 도는 로그인은 저장한 뒤에 취소한다. 못 썼으면(위) 지운 것이 없으니 로그인도 그대로
+    // 둔다 - "못 썼으면 아무것도 바꾸지 않는다". 저장과 여기 사이에는 메시지가 돌지 않으므로
+    // 그 로그인의 결과가 끼어들 틈은 없다.
+    if (g_loginBusy) CancelLogin();
 
     const bool stopped = g_monitoring;
     if (stopped) StopMon();
@@ -2003,10 +2048,36 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                     L"브라우저가 열립니다. 구글 계정으로 로그인하세요.\n\n"
                     L"로그인이 끝나면 브라우저 창을 닫고 여기로 돌아오면 됩니다.",
                     L"폰 등록", MB_OK | MB_ICONINFORMATION);
-                g_loginBusy = true;
-                EnableWindow(GetDlgItem(hWnd, ID_BTN_REGISTER_PHONE), FALSE);
-                // 브라우저에서 보내는 시간이 있어 UI 스레드에서 부르면 창이 멎는다
-                CloseHandle(CreateThread(nullptr, 0, LoginThread, nullptr, 0, nullptr));
+                // 위 안내 창이 떠 있는 동안 간단 창의 단추로 다른 로그인이 이미 시작됐으면
+                // 둘째를 띄우지 않는다. 띄우면 취소 신호(g_loginCancelEv)가 둘째 것으로
+                // 덮여, [등록 내역 삭제] 가 첫째 로그인을 멈추지 못한다.
+                if (g_loginBusy) break;
+                {
+                    // 브라우저에서 보내는 시간이 있어 UI 스레드에서 부르면 창이 멎는다.
+                    // 스레드에는 세대 번호와 취소 신호의 복제본을 준다 (CancelLogin 주석).
+                    auto* lp = new LoginThreadParam{ ++g_loginGen, nullptr };
+                    HANDLE cancelEv = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+                    HANDLE th = nullptr;
+                    if (cancelEv &&
+                        DuplicateHandle(GetCurrentProcess(), cancelEv, GetCurrentProcess(),
+                                        &lp->cancelEv, 0, FALSE, DUPLICATE_SAME_ACCESS))
+                        th = CreateThread(nullptr, 0, LoginThread, lp, 0, nullptr);
+                    if (!th) {
+                        // 예전에는 실패를 보지 않아서, 스레드가 없는데 g_loginBusy 만 켜진 채
+                        // 등록 단추가 앱을 다시 켤 때까지 죽어 있었다.
+                        DbgEvent(L"google login: could not start (err=%lu)", GetLastError());
+                        if (lp->cancelEv) CloseHandle(lp->cancelEv);
+                        delete lp;
+                        if (cancelEv) CloseHandle(cancelEv);
+                        MessageBoxW(hWnd, L"로그인을 시작하지 못했습니다.\n잠시 뒤 다시 시도하세요.",
+                                    L"폰 등록", MB_OK | MB_ICONWARNING);
+                        break;
+                    }
+                    CloseHandle(th);
+                    g_loginCancelEv = cancelEv;
+                    g_loginBusy = true;
+                    EnableWindow(GetDlgItem(hWnd, ID_BTN_REGISTER_PHONE), FALSE);
+                }
                 break;
             }
             // 폰이 GATT 로 내주는 토큰을 한 번 읽어 저장해 둔다 (ble_ident.h).
@@ -2739,7 +2810,17 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
     case WM_LOGIN_RESULT: {
         auto* r = (LoginResult*)lParam;
+        if (r->gen != g_loginGen) {
+            // [등록 내역 삭제] 가 취소한 로그인이다 (CancelLogin). 교환이 이미 끝나 세션을
+            // 들고 왔어도 쓰지 않는다 - config 에도, g_authSave 에도, 세션에도. 취소 때문에
+            // 끝난 것이면 "로그인하지 못했습니다" 도 띄우지 않는다: 사용자가 지우기로 한 것이다.
+            // g_loginBusy 와 단추는 취소할 때 이미 돌려 놓았다. 그 뒤에 새 로그인이 시작됐을
+            // 수 있으므로 여기서는 건드리지 않는다.
+            DbgEvent(L"google login: result ignored (cancelled)");
+            delete r; break;
+        }
         g_loginBusy = false;
+        if (g_loginCancelEv) { CloseHandle(g_loginCancelEv); g_loginCancelEv = nullptr; }
         EnableWindow(GetDlgItem(hWnd, ID_BTN_REGISTER_PHONE), TRUE);
 
         if (!r->ok) {
@@ -2749,6 +2830,12 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 L"폰 등록", MB_OK | MB_ICONWARNING);
             delete r; break;
         }
+
+        // 살아 있는 세션으로 심는다. 이게 없으면 방금 로그인해도 클립보드 동기화는
+        // 앱을 다시 켤 때까지 "로그인하지 않았다" 로 남는다 - 로그인한 사람에게
+        // 로그인하라고 말하는 상태가 된다. 작업 스레드가 아니라 여기서 심는 까닭은
+        // LoginThread 주석 (취소한 로그인의 세션을 살리지 않으려고).
+        SessionAdopt(r->session);
 
         // 봉인(DPAPI)이 실패했으면 r->refresh 가 비어 있다 (LoginThread 의 ProtectSecret).
         // 예전에는 그 빈 값을 authRefresh 에 그대로 써서 저장돼 있던 토큰까지 지웠고,
