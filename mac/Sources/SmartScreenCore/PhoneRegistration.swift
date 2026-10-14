@@ -9,6 +9,9 @@ import Foundation
 // 함께)과 기기 키(bleIrk). 구글 로그인(authRefresh/authEmail/authUserId)과 클립보드 공유는 그대로
 // 둔다 - 폰을 바꾸려는 사람이 로그인부터 다시 하게 만들 이유가 없다. 서버의 등록(device_tokens)과
 // 다른 PC 는 건드리지 않는다 (같은 계정의 다른 PC 는 여전히 그 폰을 알아봐야 한다).
+// 도는 구글 로그인이 있으면 그것은 취소한다 - 끝나면 계정의 토큰을 config 에 써서 지운 등록이 몇 분 뒤
+// 되살아난다. 예전에는 로그인 중에 지우기를 거절했는데, 리스너가 브라우저를 3 분까지 기다리므로
+// 로그인을 시작했다가 그만둔 사람은 그동안 지울 수 없었고, 로그에는 로그인이 돈다는 줄도 없었다.
 // Mac 은 IRK 를 쓰지 않지만 키 이름이 Windows 와 같으므로 bleIrk 도 같이 지운다 - 같은 단추가
 // 두 판에서 같은 것을 지워야 문서가 한 벌로 남는다.
 public enum PhoneRegistration {
@@ -75,14 +78,20 @@ public enum PhoneRegistration {
     /// 지우기 전 확인 (MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2).
     /// monitoring: 보호가 켜져 있으면 함께 끈다고 미리 말한다 - 등록이 없으면 PC 가 폰을 알아보지 못해
     /// 곧바로 화면을 가린다. 꺼져 있으면 그 줄이 통째로 빠진다 (빈 줄을 남기지 않는다).
+    /// loginInFlight: 구글 로그인이 도는 중이다. [예] 를 누르면 그 로그인을 취소한다고 미리 말한다 -
+    /// 브라우저에서 로그인을 마쳐도 이 PC 에 등록되지 않는 까닭을 여기서 알 수 있어야 한다. 보호 줄
+    /// 바로 뒤에 놓고, 없으면 그 줄처럼 통째로 빠진다 (빈 줄을 남기지 않는다).
     /// irkReimport: 지운 기기 키를 [기기 키] 단추로 다시 넣을 수 있는 판인가. Windows 만 true 다 -
     /// Mac 의 [기기 키] 는 "Windows 에서만" 이라고 안내만 하므로 Mac 은 늘 false 를 넘긴다.
-    public static func deleteConfirm(_ p: Present, monitoring: Bool, irkReimport: Bool) -> String {
+    public static func deleteConfirm(_ p: Present, monitoring: Bool, loginInFlight: Bool,
+                                     irkReimport: Bool) -> String {
         let protection = monitoring ? "보호가 켜져 있어 함께 끕니다.\n" : ""
+        let login = loginInFlight ? "진행 중인 구글 로그인은 취소합니다.\n" : ""
         let irkLine = (p.irk && irkReimport) ? "\n기기 키는 고급 설정의 [기기 키] 로 다시 넣을 수 있습니다." : ""
         return "이 PC 에서 폰 등록 내역을 지울까요?\n\n"
             + "지울 것: \(deleteItems(p))\n"
             + protection
+            + login
             + "\n구글 로그인과 클립보드 공유는 그대로입니다.\n"
             + "다른 PC 와 서버의 등록은 건드리지 않습니다."
             + irkLine
@@ -108,9 +117,14 @@ public enum PhoneRegistration {
     /// 있는 사이에 다른 길로 지워졌다). 알림은 띄우지 않고 이 줄만 남긴다. Windows 와 같은 글자다.
     public static let deleteNothingLogLine = "register phone: delete - nothing registered on this PC"
 
-    /// 로그인이 도는 중에는 지우지 않는다. 그 로그인이 끝나면 계정의 토큰을 config 에 쓰므로, 지금
-    /// 지워도 몇 분 뒤 되살아난다 - "지웠습니다" 가 거짓말이 된다.
-    public static let deleteLoginBusyText = "로그인 중에는 지울 수 없습니다.\n브라우저 창을 확인하세요."
+    /// events.log: [등록 내역 삭제] 를 확인해서 도는 구글 로그인을 취소했다. 그 로그인의 결과는 이제
+    /// 버린다 - 두면 끝난 로그인이 계정의 토큰을 config 에 써서 방금 지운 등록이 되살아난다.
+    /// Windows 와 같은 글자다.
+    public static let loginCancelledLogLine = "google login: cancelled (registration deleted)"
+
+    /// events.log: 취소한 로그인의 결과가 왔다 (리스너가 취소로 멈췄거나, 교환이 이미 끝나 있었다).
+    /// config 에도 계정 세션에도 아무것도 쓰지 않고 상자도 띄우지 않는다. Windows 와 같은 글자다.
+    public static let loginResultIgnoredLogLine = "google login: result ignored (cancelled)"
 
     /// config.ini 를 못 썼다. 지운 것이 없으므로 "지웠습니다" 라고 하지 않는다.
     public static let deleteSaveFailedText = "설정을 저장하지 못했습니다. 다시 시도하세요."

@@ -87,39 +87,92 @@ final class PhoneRegistrationTests: XCTestCase {
     }
 
     func testConfirmTokenOnly() {
-        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.tokenOnly, monitoring: false, irkReimport: false),
+        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.tokenOnly, monitoring: false, loginInFlight: false, irkReimport: false),
                        "이 PC 에서 폰 등록 내역을 지울까요?\n\n지울 것: 폰 토큰\n\n구글 로그인과 클립보드 공유는 그대로입니다.\n다른 PC 와 서버의 등록은 건드리지 않습니다.")
-        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.tokenOnly, monitoring: true, irkReimport: false),
+        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.tokenOnly, monitoring: true, loginInFlight: false, irkReimport: false),
                        "이 PC 에서 폰 등록 내역을 지울까요?\n\n지울 것: 폰 토큰\n보호가 켜져 있어 함께 끕니다.\n\n구글 로그인과 클립보드 공유는 그대로입니다.\n다른 PC 와 서버의 등록은 건드리지 않습니다.")
         // 기기 키가 없으면 Windows 에서도 [기기 키] 줄이 붙지 않는다
-        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.tokenOnly, monitoring: false, irkReimport: true),
+        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.tokenOnly, monitoring: false, loginInFlight: false, irkReimport: true),
                        "이 PC 에서 폰 등록 내역을 지울까요?\n\n지울 것: 폰 토큰\n\n구글 로그인과 클립보드 공유는 그대로입니다.\n다른 PC 와 서버의 등록은 건드리지 않습니다.")
     }
 
     func testConfirmIrkOnlyOnMac() {
         // Mac 은 [기기 키] 로 다시 넣을 수 없으므로 그 줄이 없다
-        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.irkOnly, monitoring: false, irkReimport: false),
+        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.irkOnly, monitoring: false, loginInFlight: false, irkReimport: false),
                        "이 PC 에서 폰 등록 내역을 지울까요?\n\n지울 것: 기기 키\n\n구글 로그인과 클립보드 공유는 그대로입니다.\n다른 PC 와 서버의 등록은 건드리지 않습니다.")
-        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.irkOnly, monitoring: true, irkReimport: false),
+        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.irkOnly, monitoring: true, loginInFlight: false, irkReimport: false),
                        "이 PC 에서 폰 등록 내역을 지울까요?\n\n지울 것: 기기 키\n보호가 켜져 있어 함께 끕니다.\n\n구글 로그인과 클립보드 공유는 그대로입니다.\n다른 PC 와 서버의 등록은 건드리지 않습니다.")
     }
 
     func testConfirmBothOnMac() {
-        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.both, monitoring: false, irkReimport: false),
+        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.both, monitoring: false, loginInFlight: false, irkReimport: false),
                        "이 PC 에서 폰 등록 내역을 지울까요?\n\n지울 것: 폰 토큰, 기기 키\n\n구글 로그인과 클립보드 공유는 그대로입니다.\n다른 PC 와 서버의 등록은 건드리지 않습니다.")
-        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.both, monitoring: true, irkReimport: false),
+        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.both, monitoring: true, loginInFlight: false, irkReimport: false),
                        "이 PC 에서 폰 등록 내역을 지울까요?\n\n지울 것: 폰 토큰, 기기 키\n보호가 켜져 있어 함께 끕니다.\n\n구글 로그인과 클립보드 공유는 그대로입니다.\n다른 PC 와 서버의 등록은 건드리지 않습니다.")
     }
 
     func testConfirmWindowsIrkLine() {
         // Windows 판 (irkReimport = true) 의 글. 같은 빌더가 두 판의 글을 낸다는 것을 여기서 묶어 둔다.
-        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.irkOnly, monitoring: false, irkReimport: true),
+        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.irkOnly, monitoring: false, loginInFlight: false, irkReimport: true),
                        "이 PC 에서 폰 등록 내역을 지울까요?\n\n지울 것: 기기 키\n\n구글 로그인과 클립보드 공유는 그대로입니다.\n다른 PC 와 서버의 등록은 건드리지 않습니다.\n기기 키는 고급 설정의 [기기 키] 로 다시 넣을 수 있습니다.")
-        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.both, monitoring: true, irkReimport: true),
+        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.both, monitoring: true, loginInFlight: false, irkReimport: true),
                        "이 PC 에서 폰 등록 내역을 지울까요?\n\n지울 것: 폰 토큰, 기기 키\n보호가 켜져 있어 함께 끕니다.\n\n구글 로그인과 클립보드 공유는 그대로입니다.\n다른 PC 와 서버의 등록은 건드리지 않습니다.\n기기 키는 고급 설정의 [기기 키] 로 다시 넣을 수 있습니다.")
     }
 
-    // ------------------------------------------------------------------ 완료, 로그, 거절
+    // ------------------------------------------------------------------ 확인: 도는 구글 로그인
+
+    // 로그인 중 x 보호 x 지울 것. 로그인 줄은 보호 줄 바로 뒤, 없으면 통째로 빠진다 (빈 줄을 남기지 않는다).
+
+    func testConfirmLoginInFlightTokenOnly() {
+        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.tokenOnly, monitoring: false, loginInFlight: true, irkReimport: false),
+                       "이 PC 에서 폰 등록 내역을 지울까요?\n\n지울 것: 폰 토큰\n진행 중인 구글 로그인은 취소합니다.\n\n구글 로그인과 클립보드 공유는 그대로입니다.\n다른 PC 와 서버의 등록은 건드리지 않습니다.")
+        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.tokenOnly, monitoring: true, loginInFlight: true, irkReimport: false),
+                       "이 PC 에서 폰 등록 내역을 지울까요?\n\n지울 것: 폰 토큰\n보호가 켜져 있어 함께 끕니다.\n진행 중인 구글 로그인은 취소합니다.\n\n구글 로그인과 클립보드 공유는 그대로입니다.\n다른 PC 와 서버의 등록은 건드리지 않습니다.")
+    }
+
+    func testConfirmLoginInFlightIrkOnly() {
+        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.irkOnly, monitoring: false, loginInFlight: true, irkReimport: false),
+                       "이 PC 에서 폰 등록 내역을 지울까요?\n\n지울 것: 기기 키\n진행 중인 구글 로그인은 취소합니다.\n\n구글 로그인과 클립보드 공유는 그대로입니다.\n다른 PC 와 서버의 등록은 건드리지 않습니다.")
+        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.irkOnly, monitoring: true, loginInFlight: true, irkReimport: false),
+                       "이 PC 에서 폰 등록 내역을 지울까요?\n\n지울 것: 기기 키\n보호가 켜져 있어 함께 끕니다.\n진행 중인 구글 로그인은 취소합니다.\n\n구글 로그인과 클립보드 공유는 그대로입니다.\n다른 PC 와 서버의 등록은 건드리지 않습니다.")
+    }
+
+    func testConfirmLoginInFlightBoth() {
+        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.both, monitoring: false, loginInFlight: true, irkReimport: false),
+                       "이 PC 에서 폰 등록 내역을 지울까요?\n\n지울 것: 폰 토큰, 기기 키\n진행 중인 구글 로그인은 취소합니다.\n\n구글 로그인과 클립보드 공유는 그대로입니다.\n다른 PC 와 서버의 등록은 건드리지 않습니다.")
+        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.both, monitoring: true, loginInFlight: true, irkReimport: false),
+                       "이 PC 에서 폰 등록 내역을 지울까요?\n\n지울 것: 폰 토큰, 기기 키\n보호가 켜져 있어 함께 끕니다.\n진행 중인 구글 로그인은 취소합니다.\n\n구글 로그인과 클립보드 공유는 그대로입니다.\n다른 PC 와 서버의 등록은 건드리지 않습니다.")
+    }
+
+    func testConfirmLoginInFlightWindowsIrkLine() {
+        // Windows 판: 로그인 줄과 [기기 키] 줄이 함께 붙어도 각자 자리에 있다
+        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.irkOnly, monitoring: false, loginInFlight: true, irkReimport: true),
+                       "이 PC 에서 폰 등록 내역을 지울까요?\n\n지울 것: 기기 키\n진행 중인 구글 로그인은 취소합니다.\n\n구글 로그인과 클립보드 공유는 그대로입니다.\n다른 PC 와 서버의 등록은 건드리지 않습니다.\n기기 키는 고급 설정의 [기기 키] 로 다시 넣을 수 있습니다.")
+        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.both, monitoring: true, loginInFlight: true, irkReimport: true),
+                       "이 PC 에서 폰 등록 내역을 지울까요?\n\n지울 것: 폰 토큰, 기기 키\n보호가 켜져 있어 함께 끕니다.\n진행 중인 구글 로그인은 취소합니다.\n\n구글 로그인과 클립보드 공유는 그대로입니다.\n다른 PC 와 서버의 등록은 건드리지 않습니다.\n기기 키는 고급 설정의 [기기 키] 로 다시 넣을 수 있습니다.")
+        XCTAssertEqual(PhoneRegistration.deleteConfirm(PhoneRegistrationTests.tokenOnly, monitoring: true, loginInFlight: true, irkReimport: true),
+                       "이 PC 에서 폰 등록 내역을 지울까요?\n\n지울 것: 폰 토큰\n보호가 켜져 있어 함께 끕니다.\n진행 중인 구글 로그인은 취소합니다.\n\n구글 로그인과 클립보드 공유는 그대로입니다.\n다른 PC 와 서버의 등록은 건드리지 않습니다.")
+    }
+
+    func testConfirmLoginLineOnlyWhenInFlight() {
+        // 로그인이 돌지 않으면 그 줄이 어디에도 없다 - 확인 글은 예전 그대로다
+        let cases: [(PhoneRegistration.Present, Bool, Bool)] = [
+            (PhoneRegistrationTests.tokenOnly, false, false), (PhoneRegistrationTests.tokenOnly, true, false),
+            (PhoneRegistrationTests.irkOnly, false, false), (PhoneRegistrationTests.irkOnly, true, true),
+            (PhoneRegistrationTests.both, false, true), (PhoneRegistrationTests.both, true, false),
+        ]
+        for (p, monitoring, irk) in cases {
+            let off = PhoneRegistration.deleteConfirm(p, monitoring: monitoring, loginInFlight: false, irkReimport: irk)
+            let on = PhoneRegistration.deleteConfirm(p, monitoring: monitoring, loginInFlight: true, irkReimport: irk)
+            XCTAssertFalse(off.contains("진행 중인 구글 로그인"))
+            XCTAssertFalse(off.contains("\n\n\n"))
+            // 켜면 그 한 줄만 더해진다
+            XCTAssertEqual(on.replacingOccurrences(of: "진행 중인 구글 로그인은 취소합니다.\n", with: ""), off)
+            XCTAssertFalse(on.contains("\n\n\n"))
+        }
+    }
+
+    // ------------------------------------------------------------------ 완료, 로그, 실패
 
     func testDone() {
         XCTAssertEqual(PhoneRegistration.deleteDone(protectionStopped: false), "이 PC 의 폰 등록 내역을 지웠습니다.")
@@ -152,8 +205,13 @@ final class PhoneRegistrationTests: XCTestCase {
                        "register phone: delete - nothing registered on this PC")
     }
 
-    func testRefuseAndSaveFailedTexts() {
-        XCTAssertEqual(PhoneRegistration.deleteLoginBusyText, "로그인 중에는 지울 수 없습니다.\n브라우저 창을 확인하세요.")
+    func testLoginCancelLogLines() {
+        // Windows client/main.cpp 의 DbgEvent 와 같은 글자
+        XCTAssertEqual(PhoneRegistration.loginCancelledLogLine, "google login: cancelled (registration deleted)")
+        XCTAssertEqual(PhoneRegistration.loginResultIgnoredLogLine, "google login: result ignored (cancelled)")
+    }
+
+    func testSaveFailedText() {
         XCTAssertEqual(PhoneRegistration.deleteSaveFailedText, "설정을 저장하지 못했습니다. 다시 시도하세요.")
     }
 }
