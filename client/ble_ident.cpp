@@ -13,11 +13,14 @@
 #include "ble_ident.h"
 #include "ble_gatt.h"   // SS_IDENT_SERVICE_UUID / SS_IDENT_TOKEN_UUID
 #include <windows.h>
+#include <werapi.h>     // WerSetFlags - 도우미가 죽어도 창을 띄우지 않게
 #include <atomic>
 #include <chrono>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <vector>
 
 using namespace winrt;
 using namespace Windows::Devices::Bluetooth;
@@ -220,6 +223,399 @@ ProbeOutcome ReadPhoneToken(uint64_t addr, bool randomAddr,
     return outcome;
 }
 
+// ---------------------------------------------------------------------------
+// 도우미 프로세스로 탐색하기 (왜 그러는지는 ble_ident.h ReadPhoneTokenIsolated)
+// ---------------------------------------------------------------------------
+
+// 도우미의 종료 코드. 줄과 같은 것을 말한다 - 줄을 못 읽었을 때 로그에 남기는 것은 이쪽이다.
+static const int kHelperExitToken       = 0;
+static const int kHelperExitNotOurs     = 2;
+static const int kHelperExitUnreachable = 3;
+static const int kHelperExitBadArgs     = 64;
+
+// 도우미 안의 시간 제한을 모두 쓰면 25초다 (5+10+5+5). 조금 더 기다린다 - 이것을 넘기면
+// 도우미 안에서도 무언가 멎은 것이다.
+static const DWORD kHelperDeadlineMs = 30000;
+// 답 줄을 받은 뒤 도우미가 끝나기를 기다리는 시간. 끝나는 데서 멎어도 받은 답은 쓴다 -
+// 그러지 않으면 멎을 때마다 탐색 하나가 30초가 된다.
+static const DWORD kHelperExitGraceMs = 2000;
+// 토큰 특성값은 최대 512바이트 = 1024자다. 줄이 이보다 훨씬 길면 망가진 것이다.
+static const size_t kHelperMaxOut = 4096;
+
+static int HexDigit(wchar_t c) {
+    if (c >= L'0' && c <= L'9') return c - L'0';
+    if (c >= L'A' && c <= L'F') return c - L'A' + 10;
+    if (c >= L'a' && c <= L'f') return c - L'a' + 10;
+    return -1;
+}
+
+// why 는 한 줄 안에 있어야 한다. 지금의 글자들은 모두 한 줄이지만, 줄바꿈이 섞여 들면
+// 부모가 줄을 잘못 자르고 탐색 하나를 "helper output" 으로 버린다.
+static std::wstring OneLine(std::wstring s) {
+    for (auto& c : s) if (c < 0x20 || c == 0x7F) c = L' ';
+    return s;
+}
+
+// GUI 서브시스템이라 stdout 은 부모가 넘긴 파이프뿐이다. 손으로 띄웠으면 없다 - 그러면
+// 조용히 넘어간다 (종료 코드는 그대로 결과를 말한다).
+static void HelperWriteLine(const std::wstring& line) {
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (out == nullptr || out == INVALID_HANDLE_VALUE) return;
+    int n = WideCharToMultiByte(CP_UTF8, 0, line.c_str(), (int)line.size(),
+                                nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return;
+    std::string s((size_t)n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, line.c_str(), (int)line.size(), s.data(), n, nullptr, nullptr);
+    const char* p = s.data();
+    DWORD left = (DWORD)s.size();
+    while (left) {
+        DWORD wrote = 0;
+        if (!WriteFile(out, p, left, &wrote, nullptr) || wrote == 0) return;
+        p += wrote;
+        left -= wrote;
+    }
+}
+
+int ReadTokenHelperMain(int argc, wchar_t** argv) {
+    // 엄격하게 본다. 이 길은 블루투스 연결을 연다 - 모양이 다르면 아무것도 하지 않는다.
+    if (!argv || argc != 4 || wcscmp(argv[1], L"--read-token") != 0) return kHelperExitBadArgs;
+    if (wcslen(argv[2]) != 12) return kHelperExitBadArgs;
+    uint64_t addr = 0;
+    for (int i = 0; i < 12; i++) {
+        int v = HexDigit(argv[2][i]);
+        if (v < 0) return kHelperExitBadArgs;
+        addr = (addr << 4) | (uint64_t)v;
+    }
+    bool randomAddr;
+    if (wcscmp(argv[3], L"r") == 0)      randomAddr = true;
+    else if (wcscmp(argv[3], L"p") == 0) randomAddr = false;
+    else return kHelperExitBadArgs;
+
+    // 로그는 부모가 쓴다. 도우미가 쓰면 (늦게 닫은 결과의 NoteLateClose 등) 2초마다 뜨는
+    // 프로세스들이 events.log 한 파일에 섞여 들어가고, 같은 일이 두 번 적힌다.
+    g_debugEvents = false;
+    // 도우미가 죽어도 오류 창을 띄우지 않는다. 2초마다 뜨는 프로세스라 창이 책상 위에 쌓인다.
+    // 죽은 것은 부모가 "helper output" 과 종료 코드로 남긴다.
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    WerSetFlags(WER_FAULT_REPORTING_NO_UI);
+
+    std::wstring tok, why;
+    DWORD took = 0;
+    ProbeOutcome r = ReadPhoneToken(addr, randomAddr, tok, why, &took);
+    wchar_t ms[16];
+    swprintf_s(ms, L"%lu", took);
+    std::wstring line;
+    int rc;
+    switch (r) {
+    case ProbeOutcome::Token:
+        line = L"TOKEN " + tok + L" " + ms;
+        rc = kHelperExitToken;
+        break;
+    case ProbeOutcome::NotOurs:
+        line = L"NOTOURS " + OneLine(why) + L" " + ms;
+        rc = kHelperExitNotOurs;
+        break;
+    default:
+        // why 가 빈 채로 오는 길이 있다 (서비스는 있는데 토큰 특성이 없다). 그러면 칸이 둘
+        // 붙는다 - 부모는 첫 칸과 마지막 칸 사이를 why 로 읽으므로 빈 why 가 그대로 간다.
+        line = L"UNREACHABLE " + OneLine(why) + L" " + ms;
+        rc = kHelperExitUnreachable;
+        break;
+    }
+    HelperWriteLine(line + L"\n");
+    return rc;
+}
+
+// 어느 길로 나가든 닫는다
+struct OwnedHandle {
+    HANDLE h = nullptr;
+    OwnedHandle() = default;
+    explicit OwnedHandle(HANDLE x) : h(x) {}
+    ~OwnedHandle() { reset(); }
+    OwnedHandle(const OwnedHandle&) = delete;
+    OwnedHandle& operator=(const OwnedHandle&) = delete;
+    void reset(HANDLE x = nullptr) {
+        if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        h = x;
+    }
+    HANDLE release() { HANDLE x = h; h = nullptr; return x; }
+};
+
+// 0 은 "성공" 으로 쓰므로 오류 번호가 비어 있으면 대신 하나를 준다
+static DWORD LastErrorOr(DWORD fallback = ERROR_GEN_FAILURE) {
+    DWORD e = GetLastError();
+    return e ? e : fallback;
+}
+
+// 도우미를 모두 담는 작업(job). 한 번 만들고 닫지 않는다 - 앱이 어떻게 끝나든 (정상 종료,
+// 업데이트가 끝내는 것, 작업 관리자) OS 가 이 핸들을 닫고, 그때 남은 도우미가 모두 죽는다.
+// 살아남은 도우미는 SmartScreen.exe 파일을 잡고 있다 - 업데이트(update.cpp)와 release.bat 은
+// 앱이 끝난 뒤에 그 파일을 바꾼다.
+// DIE_ON_UNHANDLED_EXCEPTION: 도우미가 죽을 때 오류 보고 창을 띄우지 않는다 (위 SetErrorMode 와 같은 이유).
+static HANDLE HelperJob(DWORD& err) {
+    static DWORD s_err = 0;
+    static HANDLE s_job = []() -> HANDLE {
+        HANDLE j = CreateJobObjectW(nullptr, nullptr);
+        if (!j) { s_err = LastErrorOr(); return nullptr; }
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+        li.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+        if (!SetInformationJobObject(j, JobObjectExtendedLimitInformation, &li, sizeof(li))) {
+            s_err = LastErrorOr();
+            CloseHandle(j);
+            return nullptr;
+        }
+        return j;
+    }();
+    err = s_err;
+    return s_job;
+}
+
+static std::wstring OwnExePath() {
+    std::wstring p(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD n = GetModuleFileNameW(nullptr, p.data(), (DWORD)p.size());
+        if (n == 0) return std::wstring();
+        if (n < p.size()) { p.resize(n); return p; }
+        if (p.size() >= 32768) return std::wstring();
+        p.resize(p.size() * 2);
+    }
+}
+
+// 도우미를 띄운다. 0 이면 proc 과 readEnd 가 찬다. 아니면 오류 번호이고 아무것도 남기지 않는다.
+static DWORD StartHelper(uint64_t addr, bool randomAddr, OwnedHandle& proc, OwnedHandle& readEnd) {
+    DWORD err = 0;
+    HANDLE job = HelperJob(err);
+    if (!job) return err ? err : ERROR_GEN_FAILURE;
+
+    std::wstring exe = OwnExePath();
+    if (exe.empty()) return LastErrorOr();
+
+    // 파이프는 둘 다 상속되지 않게 만들고, 쓰는 쪽만 CreateProcess 바로 앞에서 상속되게
+    // 바꿨다가 바로 뒤에 닫는다. 이 프로세스의 다른 CreateProcess 는 모두 상속을 끄지만
+    // (update.cpp, irk.cpp), 쓰는 쪽이 다른 자식에게 새면 그 자식이 끝날 때까지 EOF 가 오지 않는다.
+    HANDLE rd = nullptr, wr = nullptr;
+    if (!CreatePipe(&rd, &wr, nullptr, 64 * 1024)) return LastErrorOr();
+    OwnedHandle r(rd), w(wr);
+
+    // 상속 목록에는 쓰는 쪽 하나만. 목록이 없으면 bInheritHandles=TRUE 가 이 프로세스의
+    // 상속 가능한 핸들을 모두 넘긴다 (작업 핸들이 넘어가면 앱이 끝나도 작업이 닫히지 않는다).
+    SIZE_T attrSize = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
+    if (attrSize == 0) return LastErrorOr();
+    std::vector<BYTE> attrBuf(attrSize);
+    auto attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data());
+    if (!InitializeProcThreadAttributeList(attrs, 1, 0, &attrSize)) return LastErrorOr();
+    struct AttrList {
+        LPPROC_THREAD_ATTRIBUTE_LIST a;
+        ~AttrList() { DeleteProcThreadAttributeList(a); }
+    } attrGuard{ attrs };
+    HANDLE inherit[1] = { w.h };   // CreateProcess 가 끝날 때까지 살아 있어야 한다
+    if (!UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                   inherit, sizeof(inherit), nullptr, nullptr))
+        return LastErrorOr();
+    if (!SetHandleInformation(w.h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) return LastErrorOr();
+
+    STARTUPINFOEXW si{};
+    si.StartupInfo.cb = sizeof(si);
+    // FORCEOFFFEEDBACK: GUI 프로그램을 띄우면 마우스 커서가 몇 초 "작업 중" 으로 바뀐다.
+    // 2초마다 띄우므로 이것이 없으면 커서가 내내 돈다.
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES | STARTF_FORCEOFFFEEDBACK;
+    si.StartupInfo.hStdOutput = w.h;   // stdin, stderr 는 없다
+    si.lpAttributeList = attrs;
+
+    wchar_t args[64];
+    swprintf_s(args, L" --read-token %012llX %c",
+               (unsigned long long)addr, randomAddr ? L'r' : L'p');
+    std::wstring cmd = L"\"" + exe + L"\"" + args;   // CreateProcessW 는 쓰기 가능한 버퍼를 요구한다
+
+    // 멈춘 채로 띄워 작업에 넣은 뒤에 돌린다. 넣기 전에 돌면 그 틈에 앱이 끝났을 때 살아남는다.
+    PROCESS_INFORMATION pi{};
+    BOOL ok = CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, TRUE,
+                             EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_SUSPENDED,
+                             nullptr, nullptr, &si.StartupInfo, &pi);
+    if (!ok) err = LastErrorOr();
+    // 내 사본은 바로 닫는다 - 그래야 도우미가 끝날 때 읽는 쪽에 EOF 가 온다
+    w.reset();
+    if (!ok) return err;
+    OwnedHandle p(pi.hProcess), t(pi.hThread);
+    // 작업에 넣지 못한 도우미는 앱보다 오래 살 수 있다 (HelperJob 주석) - 띄우지 못한 것으로 친다
+    if (!AssignProcessToJobObject(job, p.h) || ResumeThread(t.h) == (DWORD)-1) {
+        err = LastErrorOr();
+        TerminateProcess(p.h, ERROR_GEN_FAILURE);
+        WaitForSingleObject(p.h, 5000);
+        return err;
+    }
+    proc.reset(p.release());
+    readEnd.reset(r.release());
+    return 0;
+}
+
+// 파이프에 지금 있는 것을 모두 읽는다. 막혀 기다리지 않는다 (PeekNamedPipe) - 쓰는 쪽을
+// 누가 쥐고 있든 마감은 지킨다. false = EOF (쓰는 쪽이 모두 닫혔다).
+static bool DrainPipe(HANDLE rd, std::string& out, bool& tooLong) {
+    for (;;) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr)) return false;
+        if (avail == 0) return true;
+        char buf[512];
+        DWORD got = 0;
+        if (!ReadFile(rd, buf, (std::min)(avail, (DWORD)sizeof(buf)), &got, nullptr)) return false;
+        size_t room = out.size() < kHelperMaxOut ? kHelperMaxOut - out.size() : 0;
+        if (got > room) tooLong = true;
+        out.append(buf, (std::min)((size_t)got, room));
+    }
+}
+
+enum class HelperEnd { Exited, TimedOut, Aborted };
+
+// 도우미가 끝날 때까지 (EOF 또는 프로세스 끝), 답 줄을 받고 잠깐 더, 또는 마감까지 모은다.
+static HelperEnd CollectHelper(HANDLE proc, HANDLE rd, HANDLE abortEvent, ULONGLONG deadline,
+                               std::string& out, bool& tooLong) {
+    HANDLE waits[2] = { proc, abortEvent };
+    DWORD nWaits = abortEvent ? 2 : 1;
+    bool haveLine = false;
+    for (;;) {
+        if (!DrainPipe(rd, out, tooLong)) return HelperEnd::Exited;
+        if (!haveLine && out.find('\n') != std::string::npos) {
+            haveLine = true;
+            deadline = (std::min)(deadline, GetTickCount64() + kHelperExitGraceMs);
+        }
+        ULONGLONG now = GetTickCount64();
+        if (now >= deadline) return HelperEnd::TimedOut;
+        DWORD slice = (DWORD)(std::min)(deadline - now, (ULONGLONG)100);
+        DWORD w = WaitForMultipleObjects(nWaits, waits, FALSE, slice);
+        if (w == WAIT_OBJECT_0) {
+            // 끝났다. 쓴 것은 이미 파이프에 있으니 남은 것만 읽는다. EOF 는 기다리지 않는다 -
+            // 쓰는 쪽이 어딘가에 새어 있으면 오지 않는다.
+            DrainPipe(rd, out, tooLong);
+            return HelperEnd::Exited;
+        }
+        if (w == WAIT_OBJECT_0 + 1) return HelperEnd::Aborted;
+        if (w == WAIT_FAILED) Sleep(slice);   // 기다릴 수 없으면 쉬어 가며 돈다 - 마감은 그대로
+    }
+}
+
+// 도우미의 줄을 읽는다. 모양이 조금이라도 다르면 false 이고 아무것도 바꾸지 않는다.
+// "<종류> <가운데> <ms>\n" - 가운데는 첫 칸과 마지막 칸 사이 (why 에는 칸이 있다, 비어 있을 수 있다).
+static bool ParseHelperLine(const std::string& out, ProbeOutcome& outcome,
+                            std::wstring& tokenHex, std::wstring& why, DWORD& ms) {
+    size_t nl = out.find('\n');
+    if (nl == std::string::npos || nl + 1 != out.size()) return false;   // 정확히 한 줄
+    std::string line = out.substr(0, nl);
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    for (unsigned char c : line) if (c < 0x20 || c == 0x7F) return false;
+    size_t sp1 = line.find(' ');
+    size_t sp2 = line.rfind(' ');
+    if (sp1 == std::string::npos || sp2 == sp1) return false;
+    std::string kind = line.substr(0, sp1);
+    std::string mid = line.substr(sp1 + 1, sp2 - sp1 - 1);
+    std::string num = line.substr(sp2 + 1);
+
+    if (num.empty() || num.size() > 10) return false;
+    unsigned long long v = 0;
+    for (char c : num) {
+        if (c < '0' || c > '9') return false;
+        v = v * 10 + (unsigned)(c - '0');
+    }
+    if (v > 0xFFFFFFFFull) return false;
+
+    ProbeOutcome r;
+    if (kind == "TOKEN") {
+        if (mid.empty()) return false;
+        for (char c : mid) if (HexDigit((wchar_t)(unsigned char)c) < 0) return false;
+        r = ProbeOutcome::Token;
+    } else if (kind == "NOTOURS") {
+        r = ProbeOutcome::NotOurs;
+    } else if (kind == "UNREACHABLE") {
+        r = ProbeOutcome::Unreachable;
+    } else {
+        return false;
+    }
+    std::wstring wmid;
+    if (!mid.empty()) {
+        int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, mid.data(), (int)mid.size(),
+                                    nullptr, 0);
+        if (n <= 0) return false;
+        wmid.resize((size_t)n);
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, mid.data(), (int)mid.size(),
+                            wmid.data(), n);
+    }
+    outcome = r;
+    if (r == ProbeOutcome::Token) { tokenHex = wmid; why.clear(); }
+    else                          { tokenHex.clear(); why = wmid; }
+    ms = (DWORD)v;
+    return true;
+}
+
+ProbeOutcome ReadPhoneTokenIsolated(uint64_t addr, bool randomAddr,
+                                    std::wstring& tokenHex, std::wstring& why,
+                                    DWORD* elapsedMs, HANDLE abortEvent) {
+    tokenHex.clear();
+    why.clear();
+    ULONGLONG t0 = GetTickCount64();
+    auto wallMs = [t0]() { return (DWORD)(GetTickCount64() - t0); };
+
+    if (abortEvent && WaitForSingleObject(abortEvent, 0) == WAIT_OBJECT_0) {
+        why = L"helper stopped";
+        if (elapsedMs) *elapsedMs = 0;
+        return ProbeOutcome::Unreachable;
+    }
+
+    OwnedHandle proc, rd;
+    DWORD err = StartHelper(addr, randomAddr, proc, rd);
+    if (err != 0) {
+        // 탐색을 안 하는 것보다는 예전처럼 이 프로세스 안에서 하는 것이 낫다
+        static std::atomic<bool> s_saidFallback{ false };
+        if (!s_saidFallback.exchange(true))
+            DbgEvent(L"ident: probe helper could not start (err=%lu) - probing in-process", err);
+        return ReadPhoneToken(addr, randomAddr, tokenHex, why, elapsedMs);
+    }
+    static std::atomic<bool> s_saidHelper{ false };
+    if (!s_saidHelper.exchange(true))
+        DbgEvent(L"ident: probes run in a helper process");
+
+    std::string out;
+    bool tooLong = false;
+    HelperEnd end = CollectHelper(proc.h, rd.h, abortEvent, t0 + kHelperDeadlineMs, out, tooLong);
+
+    // 아직 살아 있으면 끝낸다. EOF 로 나왔으면 조금 기다린다 - 핸들이 닫히는 것(EOF)이
+    // 프로세스가 끝났다고 표시되는 것보다 조금 앞선다.
+    DWORD waitMs = (end == HelperEnd::Exited) ? kHelperExitGraceMs : 0;
+    if (WaitForSingleObject(proc.h, waitMs) != WAIT_OBJECT_0) {
+        TerminateProcess(proc.h, ERROR_TIMEOUT);
+        WaitForSingleObject(proc.h, 5000);
+    }
+    DWORD exitCode = 0;
+    if (!GetExitCodeProcess(proc.h, &exitCode)) exitCode = 0xFFFFFFFF;
+
+    if (end == HelperEnd::Aborted) {
+        why = L"helper stopped";
+        if (elapsedMs) *elapsedMs = wallMs();
+        return ProbeOutcome::Unreachable;
+    }
+    DrainPipe(rd.h, out, tooLong);   // 끊기 바로 앞에 쓴 것
+
+    ProbeOutcome r = ProbeOutcome::Unreachable;
+    DWORD helperMs = 0;
+    if (!tooLong && ParseHelperLine(out, r, tokenHex, why, helperMs)) {
+        if (elapsedMs) *elapsedMs = helperMs;
+        return r;
+    }
+    if (end == HelperEnd::TimedOut) {
+        why = L"helper timeout";
+    } else {
+        why = L"helper output";
+        // 줄 없이 끝난 것은 거의 도우미가 죽은 것이다. 무엇으로 죽었는지는 종료 코드에만 있다.
+        static std::atomic<bool> s_saidOutput{ false };
+        if (!s_saidOutput.exchange(true))
+            DbgEvent(L"ident: probe helper gave no usable line (exit=0x%08lX, %u bytes)",
+                     exitCode, (unsigned)out.size());
+    }
+    if (elapsedMs) *elapsedMs = wallMs();
+    return ProbeOutcome::Unreachable;
+}
+
 bool RegisterPhone(int scanSec, std::wstring& tokenHex, std::wstring& why) {
     tokenHex.clear();
     why.clear();
@@ -265,6 +661,8 @@ bool RegisterPhone(int scanSec, std::wstring& tokenHex, std::wstring& why) {
     }
     DbgEvent(L"register: candidate %012llX rssi=%d dBm", (unsigned long long)best, bestRssi);
 
+    // 등록은 사람이 버튼을 눌러 한 번 하는 일이라 예전대로 이 프로세스 안에서 읽는다.
+    // 도우미(ReadPhoneTokenIsolated)는 프로버가 몇 시간씩 되풀이하는 탐색을 위한 것이다.
     std::wstring reason;
     if (ReadPhoneToken(best, bestRandom, tokenHex, reason) != ProbeOutcome::Token) {
         why = L"연결은 했지만 토큰을 읽지 못했습니다 (" + reason + L")";

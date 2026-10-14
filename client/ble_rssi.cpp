@@ -15,7 +15,7 @@
 #include <winrt/Windows.Storage.Streams.h>
 
 #include "ble_rssi.h"
-#include "ble_ident.h"  // ReadPhoneToken - 연결로 신원 확인
+#include "ble_ident.h"  // ReadPhoneTokenIsolated - 연결로 신원 확인 (도우미 프로세스에서)
 #include "ble_gatt.h"   // SS_IDENT_SERVICE_UUID (컴패니언 앱이 광고하는 UUID)
 #include <windows.h>
 #include <bcrypt.h>
@@ -560,11 +560,18 @@ struct BleRssiScanner::Impl {
             // STATE 줄 꼬리(ProbeTagForLog)용. 읽는 쪽은 시작을 먼저 보고 0 이면 끝을 본다.
             // 그래서 끝난 시각을 먼저 적고 시작을 지운다 - 거꾸로면 방금 끝난 탐색이
             // 꼬리에서 한 번 빠진다 (시작은 지워졌는데 끝은 지난 탐색의 것).
+            // 도우미 프로세스를 띄우는 시간도 탐색 중으로 센다 - 그동안 이 스레드는 결과를 기다린다.
             probeStartTick = (std::max)(GetTickCount64(), 1ULL);
-            ProbeOutcome r = ReadPhoneToken(pick, pickRnd, tok, why, &took);
+            // 탐색은 짧게 사는 도우미 프로세스에서 한다 (ble_ident.h ReadPhoneTokenIsolated).
+            // took 은 도우미 안의 ReadPhoneToken 시간이라 로그 숫자는 예전과 같은 뜻이다.
+            // proberStop 을 넘겨서 앱이 끝날 때 도는 도우미를 바로 끊는다 - 도우미의 마감(30초)이
+            // 소멸자가 이 스레드를 기다리는 시간(30초)과 같아, 끝까지 기다리면 Impl 이 먼저 지워진다.
+            ProbeOutcome r = ReadPhoneTokenIsolated(pick, pickRnd, tok, why, &took, proberStop);
             ULONGLONG done = GetTickCount64();
             probeEndTick = done;
             probeStartTick = 0;
+            // 앱이 끝나는 중이다. 끊긴 탐색은 결과가 아니다 - 실패로 적지 않고 나간다.
+            if (WaitForSingleObject(proberStop, 0) == WAIT_OBJECT_0) break;
             // 연결에 수 초가 걸리므로 등록된 값은 붙잡고 있지 않고 지금 다시 읽는다.
             // 탐색 중에 등록이 바뀌었으면 새 값으로 판정하는 편이 맞다.
             std::wstring want;

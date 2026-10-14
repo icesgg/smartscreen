@@ -25,11 +25,36 @@ enum class ProbeOutcome {
     Unreachable,  // 붙지 못했다 - 일시적일 수 있다
 };
 
-// 한 주소에 붙어 신원 토큰을 읽는다. 블로킹, 보통 1~3초, 최악 10초.
+// 한 주소에 붙어 신원 토큰을 읽는다. 블로킹, 보통 1~3초, 최악 25초 (5+10+5+5).
 // why에는 사유가 들어간다 (이벤트 로그용). elapsedMs는 실제 걸린 시간.
 ProbeOutcome ReadPhoneToken(uint64_t addr, bool randomAddr,
                             std::wstring& tokenHex, std::wstring& why,
                             DWORD* elapsedMs = nullptr);
+
+// ReadPhoneToken 과 같은 일을 짧게 사는 도우미 프로세스에서 한다. 결과와 why 의 글자는
+// ReadPhoneToken 그대로이고, elapsedMs 는 도우미 안에서 잰 ReadPhoneToken 시간이다
+// (로그의 숫자가 예전과 견줄 수 있게). 도우미가 답하지 못하면 Unreachable 이고 why 는
+// "helper timeout" / "helper output", elapsedMs 는 이쪽에서 잰 시간이다.
+//
+// 왜: 데스크톱 로그(2026-10-15)에서 오래 돈 프로세스의 탐색이 40분 동안 여러 주소에서
+// 모두 80~110ms 만에 Unreachable 이었다 - 폰까지 가지도 않고 이 PC 의 스택이 거절했다.
+// 블루투스를 껐다 켜도 그대로였고, 앱을 다시 켜자 첫 시도에 묶였다. 프로세스 안의 무엇이
+// 그렇게 만드는지는 아직 모른다. 탐색마다 새 프로세스를 쓰면 무엇이 쌓이든 그 프로세스와
+// 함께 OS 가 거둔다.
+//
+// 도우미를 띄우지 못하면 이 프로세스 안에서 ReadPhoneToken 을 부른다 (로그에 한 번 남긴다).
+// abortEvent 가 신호되면 도는 도우미를 바로 끊고 Unreachable "helper stopped" 를 준다 -
+// 앱이 끝날 때 프로버 스레드를 30초씩 붙잡지 않게.
+ProbeOutcome ReadPhoneTokenIsolated(uint64_t addr, bool randomAddr,
+                                    std::wstring& tokenHex, std::wstring& why,
+                                    DWORD* elapsedMs = nullptr, HANDLE abortEvent = nullptr);
+
+// 도우미 쪽: SmartScreen.exe --read-token <주소 16진 12자리> <r|p>
+// wWinMain 이 다른 무엇보다 먼저 부르고, 돌려준 값으로 프로세스를 끝낸다.
+// stdout 에 UTF-8 한 줄을 쓴다:
+//   "TOKEN <hex> <ms>" (0) | "NOTOURS <why> <ms>" (2) | "UNREACHABLE <why> <ms>" (3)
+// 인자가 조금이라도 다르면 아무것도 쓰지 않고 64. events.log 와 config.ini 는 건드리지 않는다.
+int ReadTokenHelperMain(int argc, wchar_t** argv);
 
 // 등록: 앱을 화면에 띄운 폰을 찾아 토큰을 읽는다.
 // 포그라운드에서는 iOS가 이름과 서비스 UUID를 광고에 그대로 실으므로 후보가
