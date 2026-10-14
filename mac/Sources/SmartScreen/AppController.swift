@@ -131,6 +131,12 @@ final class AppController: NSObject, GuardEngineHost {
     private var startAfterRegister = false
     /// 로그인 결과의 이메일 (등록 완료 상자에 쓴다)
     private var lastLoginEmail = ""
+    /// 구글 로그인의 세대. [등록 내역 삭제] 가 도는 로그인을 취소할 때 하나 올린다. 결과는 시작할 때의
+    /// 세대를 싣고 와서, 지금 것과 다르면 버린다 ([시작] 의 session 과 같은 방법). 취소해도 교환이 이미
+    /// 끝났으면 결과는 오는데, 그것을 받으면 방금 지운 토큰이 config 에 되살아난다.
+    private var loginGen = 0
+    /// 도는 로그인의 취소 신호. loginBusy 인 동안만 있다.
+    private var loginCancel: Auth.LoginCancel?
     /// 잠자기 / 화면 꺼짐 알림의 구독 (observePowerEvents). 앱이 사는 동안 쥔다.
     private var powerObservers: [NSObjectProtocol] = []
 
@@ -159,12 +165,16 @@ final class AppController: NSObject, GuardEngineHost {
 
     /// 로그인 일꾼의 결과 (Windows LoginResult)
     private struct LoginResult {
+        /// 이 로그인을 시작할 때의 loginGen. 지금 것과 다르면 취소된 로그인의 결과다.
+        var gen = 0
         var ok = false
         var err = ""
         var email = ""
         var userId = ""
         var refresh = ""
         var phoneToken = ""
+        /// 받은 세션. 계정 세션에 심는 것은 onLoginResult 가 세대를 본 뒤에 한다.
+        var session: AuthTokens?
     }
 
     override init() {
@@ -1179,13 +1189,12 @@ final class AppController: NSObject, GuardEngineHost {
     /// [등록 내역 삭제]: 이 Mac 의 폰 토큰(overflow 비트와 함께)과 기기 키를 지운다. 구글 로그인과
     /// 클립보드 공유는 그대로, 서버의 등록과 다른 PC 는 건드리지 않는다 (PhoneRegistration 머리말).
     /// 폰을 바꾸거나 남의 폰을 잘못 등록했을 때, 지금까지는 config.ini 를 손으로 고치는 길밖에 없었다.
+    /// 구글 로그인이 도는 중이면 확인 상자에 그것을 취소한다고 쓰고, [예] 면 취소한 뒤 지운다.
     /// 단추 동작에서 불린다 (main.async 블록 안이 아니다) - 여기서 바로 알림을 띄워도 된다.
     private func deleteRegistration() {
-        // 도는 로그인은 끝나면 계정의 토큰을 config 에 쓴다. 지금 지우면 몇 분 뒤 되살아난다.
-        if loginBusy {
-            Alerts.info(PhoneRegistration.deleteLoginBusyText, title: AppController.registerTitle)
-            return
-        }
+        // 도는 구글 로그인은 거절하지 않는다 - 확인 상자에 취소한다고 쓰고, [예] 면 취소한다
+        // (cancelLoginForDelete). 예전에는 "로그인 중에는 지울 수 없습니다" 로 거절했는데, 리스너가
+        // 브라우저를 3 분까지 기다리므로 로그인을 시작했다가 그만둔 사람은 그동안 지울 수 없었다.
         // 블루투스 등록 중이면 registerPhone 이 상자를 띄우기 전에 막는다. 끝나면 읽은 토큰을 저장하므로
         // 같은 이유로 여기서도 막아 둔다.
         if bleRegisterBusy {
@@ -1201,17 +1210,18 @@ final class AppController: NSObject, GuardEngineHost {
         }
         // 되돌릴 수 없는 일이라 Return 이 [아니오] 다 (MB_DEFBUTTON2). Mac 은 [기기 키] 로 IRK 를 다시 넣을
         // 수 없으므로 그 안내 줄은 없다 (irkReimport: false).
-        let confirm = PhoneRegistration.deleteConfirm(asked, monitoring: monitoring, irkReimport: false)
+        let confirm = PhoneRegistration.deleteConfirm(asked, monitoring: monitoring, loginInFlight: loginBusy,
+                                                      irkReimport: false)
         if !Alerts.yesNo(confirm, title: AppController.registerTitle, defaultNo: true, warning: true) {
             return
         }
         // 확인 상자가 떠 있는 동안에도 main 큐와 타이머는 돈다 (Alerts 머리말) - 다시 본다.
         if isExiting { return }
-        if loginBusy {
-            Alerts.info(PhoneRegistration.deleteLoginBusyText, title: AppController.registerTitle)
-            return
-        }
         if bleRegisterBusy { return }
+        // 지금 도는 로그인을 멈춘다. 상자를 띄울 때 돌던 것이든 상자가 떠 있는 사이에 시작된 것이든 같다 -
+        // 지우겠다고 확인했고, 두면 그 로그인이 끝나며 계정의 토큰을 써서 방금 지운 등록이 되살아난다.
+        // 그 사이에 끝나 토큰을 이미 썼다면 아래에서 config 를 새로 읽어 지금 있는 것을 지운다.
+        if loginBusy { cancelLoginForDelete() }
         // 그 사이에 끝난 로그인이 토큰을 썼을 수 있다. 지우는 것도 로그에 남기는 것도 지금 있는 것이다 -
         // 한 번 읽은 사본으로 보고, 그 사본을 고쳐 저장한다.
         // 그 사이에 지울 것이 없어졌어도 (다른 길로 지워졌다) 그대로 간다: 지우겠다고 확인한 사람에게 완료를
@@ -1251,6 +1261,20 @@ final class AppController: NSObject, GuardEngineHost {
         Alerts.info(PhoneRegistration.deleteDone(protectionStopped: stopped), title: AppController.registerTitle)
     }
 
+    /// [등록 내역 삭제] 를 확인했을 때 도는 구글 로그인을 취소한다 (메인 전용).
+    /// 세대를 올려 그 로그인의 결과를 낡은 것으로 만들고 (onLoginResult 가 아무것도 쓰지 않고 버린다),
+    /// 리스너를 깨워 브라우저 기다리기를 바로 그만두게 한다. 일꾼이 끝나기를 기다리지 않고 단추를 곧바로
+    /// 되살린다 - 다음 로그인은 새 세대로 돌고, 늦게 온 예전 결과는 세대가 달라 섞이지 않는다.
+    private func cancelLoginForDelete() {
+        if !loginBusy { return }
+        loginGen &+= 1
+        loginCancel?.cancel()
+        loginCancel = nil
+        loginBusy = false
+        updateRegisterButton()
+        EventLog.write(PhoneRegistration.loginCancelledLogLine)
+    }
+
     private func registerViaAccount() {
         // [폰 등록] 은 로그인 중에 꺼져 있지만 간단 창은 여전히 이 명령을 보낼 수 있다
         if loginBusy {
@@ -1274,26 +1298,38 @@ final class AppController: NSObject, GuardEngineHost {
     /// LoginThread. 브라우저에서 사용자가 쓰는 시간이 있어 최악 몇 분이다 - 메인에서 기다리면 다 멎는다.
     private func startLoginWorker() {
         let timeout = AppController.loginTimeoutSec
+        // 결과가 이 세대를 싣고 온다. [등록 내역 삭제] 가 취소하면 세대가 바뀌어 결과를 버린다.
+        let gen = loginGen
+        let cancel = Auth.LoginCancel()
+        loginCancel = cancel
+        // 시작도 남긴다. 리스너는 브라우저를 3 분까지 기다리는데, 예전에는 그동안 로그인이 돈다는 줄이
+        // 없어서 [등록 내역 삭제] 가 "로그인 중" 으로 거절된 까닭을 events.log 로 알 수 없었다.
+        // Windows LoginThread 와 같은 글자다.
+        EventLog.write("google login: started")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let cfg = ConfigStore.load()   // 읽기만 한다
             let url = ServerDefaults.url(cfg)
             let key = ServerDefaults.key(cfg)
             var r = LoginResult()
-            let signed = Auth.signInWithGoogle(url: url, key: key, timeoutSec: timeout)
+            r.gen = gen
+            let signed = Auth.signInWithGoogle(url: url, key: key, timeoutSec: timeout, cancel: cancel)
             if let s = signed.0 {
                 // 여기까지 왔으면 로그인은 됐다. 뒤에서 무엇이 실패하든 세션은 저장할 값이다.
                 r.ok = true
                 r.email = s.email
                 r.userId = s.userId
                 r.refresh = SecretSeal.protect(s.refresh) ?? ""
-                // 살아 있는 세션으로 심는다. 이게 없으면 방금 로그인해도 클립보드 동기화는 앱을
-                // 다시 켤 때까지 "로그인하지 않았다" 로 남는다.
-                AccountSession.shared.adopt(s)
-                let fetched = Auth.fetchDeviceToken(url: url, key: key, access: s.access)
-                if let token = fetched.0 {
-                    r.phoneToken = token   // 빈 값일 수 있다 = 폰에서 아직 로그인 안 함
-                } else {
-                    r.err = fetched.1
+                // 살아 있는 세션으로 심는 것은 onLoginResult 가 한다 (메인에서, 세대를 본 뒤에). 여기서
+                // 심으면 그 사이에 취소된 로그인의 세션도 클립보드 동기화가 쓰게 된다.
+                r.session = s
+                // 취소됐으면 결과를 버릴 것이므로 폰 토큰을 물으러 가지 않는다
+                if !cancel.isCancelled {
+                    let fetched = Auth.fetchDeviceToken(url: url, key: key, access: s.access)
+                    if let token = fetched.0 {
+                        r.phoneToken = token   // 빈 값일 수 있다 = 폰에서 아직 로그인 안 함
+                    } else {
+                        r.err = fetched.1
+                    }
                 }
             } else {
                 r.err = signed.1
@@ -1321,7 +1357,16 @@ final class AppController: NSObject, GuardEngineHost {
 
     /// WM_LOGIN_RESULT
     private func onLoginResult(_ r: LoginResult) {
+        // [등록 내역 삭제] 가 취소한 로그인의 결과다 (취소로 멈췄거나, 교환이 이미 끝나 있었다). 받으면
+        // 방금 지운 토큰이 config 에 되살아나므로 config 에도, 계정 세션에도 아무것도 쓰지 않고, 상자도
+        // 띄우지 않는다 - 취소 때문에 실패한 것을 "로그인하지 못했습니다" 라고 알리지 않는다.
+        // loginBusy 와 단추도 건드리지 않는다: 취소할 때 이미 풀었고, 지금 도는 것은 새 로그인일 수 있다.
+        if r.gen != loginGen {
+            EventLog.write(PhoneRegistration.loginResultIgnoredLogLine)
+            return
+        }
         loginBusy = false
+        loginCancel = nil
         updateRegisterButton()
 
         if !r.ok {
@@ -1329,6 +1374,12 @@ final class AppController: NSObject, GuardEngineHost {
             showSimpleForResult()
             Alerts.warning("로그인하지 못했습니다.\n\n\(r.err)", title: AppController.registerTitle)
             return
+        }
+
+        // 살아 있는 세션으로 심는다. 이게 없으면 방금 로그인해도 클립보드 동기화는 앱을 다시 켤 때까지
+        // "로그인하지 않았다" 로 남는다. 세대를 본 뒤라 취소된 로그인의 세션은 여기 오지 않는다.
+        if let s = r.session {
+            AccountSession.shared.adopt(s)
         }
 
         // 봉인이 실패했으면 refresh 가 비어 있다. 예전에는 그 빈 값을 authRefresh 에 그대로 써서
