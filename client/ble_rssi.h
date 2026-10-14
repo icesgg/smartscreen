@@ -47,9 +47,11 @@ public:
 
     // 대상 기기 이름으로 BLE 스캔 시작 (iPhone BLE 주소 ≠ Classic BT 주소이므로 이름 매칭)
     // targetAddress: 기기의 공개(identity) 주소. LE 본딩된 기기는 이름 없이도 주소로 매칭됨
+    // false 면 지금은 감시자를 못 세웠다 (라디오 꺼짐 등). 그래도 Stop 전까지는 감시 스레드가
+    // 3초마다 다시 세워 본다. 도는 중에 멈춘 감시자도 같은 식으로 다시 세운다.
     bool Start(const std::wstring& targetDeviceName, uint64_t targetAddress = 0);
 
-    // 스캔 중지
+    // 스캔 중지. 다시 세우는 중이었으면 그것도 멈춘다 (그 시도가 끝나기를 기다렸다가 내린다).
     void Stop();
 
     // 칼만 필터 적용된 스무딩 RSSI 반환 (dBm, 음수값. 예: -65)
@@ -64,8 +66,17 @@ public:
     // BLE 신호를 수신 중인지 (타임아웃 이내 수신 있음)
     bool IsReceiving() const;
 
-    // BLE 스캐너가 사용 가능한지 (WinRT 초기화 성공 여부)
+    // BLE 스캐너가 사용 가능한지. 이번 Start 이후 광고 감시자를 한 번이라도 세웠으면 true.
+    // 도중에 감시자가 멈춰 다시 세우는 중이어도 true 로 둔다. 판정(main.cpp ScanThread)이
+    // 이 값으로 갈래를 고르는데, 멈췄다고 false 로 내리면 블루투스를 껐다 켜는 순간
+    // bleTimeoutSec 을 기다리지 않고 바로 부재(또는 latency 폴백)로 넘어간다 - 예전에는
+    // 멈춘 감시자에서 광고가 안 오는 것으로 bleTimeoutSec 뒤에 부재가 됐고, 그대로 둔다.
+    // 멈춘 것은 IsScanStopped 로 본다.
     bool IsAvailable() const;
+
+    // 광고 감시자가 멈춰서 다시 세우는 중인지 (블루투스를 껐다 켬, 동글을 뺐다 꽂음,
+    // 처음 Start 때 라디오가 꺼져 있었음). 상태바가 보여 주는 데 쓴다. 판정은 보지 않는다.
+    bool IsScanStopped() const;
 
     // 최근 10초간 수신한 대상 기기 광고 수 (초당 환산). 튜닝 시 신호가 얼마나 촘촘한지 확인용
     double RecentPacketRate() const;

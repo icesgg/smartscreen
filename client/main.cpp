@@ -1426,16 +1426,23 @@ static void OnResult(ProbeResult* r) {
                                                   : g_bleScanner.IrkRecognisesPhone() ? L"IRK"
                                                   : L"IRK/토큰 대기")
         :                                        (g_hasIrk ? L"토큰+IRK" : L"토큰");
+    // 광고 감시자가 멈춰 다시 세우는 중이면 (블루투스를 껐다 켬 등) 초당 수신 건수 자리에 그렇게
+    // 적는다. 예전에는 0.0/s 로만 보여서, 폰이 조용한 것인지 이 PC 가 못 듣는 것인지 갈리지 않았다.
+    const bool scanStopped = g_bleScanner.IsScanStopped();
+    wchar_t rate[48];
+    if (scanStopped) wcscpy_s(rate, L"광고 스캔 멈춤 - 다시 켜는 중");
+    else swprintf_s(rate, L"%.1f/s", g_bleScanner.RecentPacketRate());
     if(r->bleAvailable)
         // 초당 수신 건수: 신호가 얼마나 촘촘한지 보면서 임계값을 잡을 수 있다
         // g_targetName 은 상대 기기가 정한 이름이라 길이를 믿을 수 없다 - _TRUNCATE 로 쓴다
-        _snwprintf_s(status,_countof(status),_TRUNCATE,L"  \"%s\"  |  %s  |  RSSI: %d dBm%s  |  %.1f/s  |  Near>=%d dBm  |  ID: %s  |  GATT: %s  |  Idle: %ds",
+        _snwprintf_s(status,_countof(status),_TRUNCATE,L"  \"%s\"  |  %s  |  RSSI: %d dBm%s  |  %s  |  Near>=%d dBm  |  ID: %s  |  GATT: %s  |  Idle: %ds",
             g_targetName.c_str(),StateStr(r->state),r->rssiDbm,r->gatt?L" (GATT)":L"",
-            g_bleScanner.RecentPacketRate(),
+            rate,
             r->gatt?g_gattRssiThreshold:g_nearRssiThreshold,idSt,gattSt,g_nCountdown);
     else
-        _snwprintf_s(status,_countof(status),_TRUNCATE,L"  \"%s\"  |  %s  |  Latency: %lu ms  |  BLE: N/A  |  ID: %s  |  GATT: %s  |  Idle: %ds",
-            g_targetName.c_str(),StateStr(r->state),r->latencyMs,idSt,gattSt,g_nCountdown);
+        _snwprintf_s(status,_countof(status),_TRUNCATE,L"  \"%s\"  |  %s  |  Latency: %lu ms  |  BLE: %s  |  ID: %s  |  GATT: %s  |  Idle: %ds",
+            g_targetName.c_str(),StateStr(r->state),r->latencyMs,
+            scanStopped ? rate : L"N/A",idSt,gattSt,g_nCountdown);
     SetWindowTextW(g_hStatus,status);
     UpdateOverlayState();
 }

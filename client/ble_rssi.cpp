@@ -11,6 +11,7 @@
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Devices.Bluetooth.h>
 #include <winrt/Windows.Devices.Bluetooth.Advertisement.h>
+#include <winrt/Windows.Devices.Radios.h>
 #include <winrt/Windows.Storage.Streams.h>
 
 #include "ble_rssi.h"
@@ -20,10 +21,12 @@
 #include <bcrypt.h>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <map>
+#include <memory>
 #include <vector>
 
 using namespace winrt;
@@ -72,15 +75,21 @@ void KalmanFilter::Reset() {
 // BLE RSSI 스캐너 내부 구현 (PIMPL)
 // ---------------------------------------------------------------------------
 struct BleRssiScanner::Impl {
+    // 감시자, 그 콜백 토큰, 아래 "광고 감시자 복구" 상태는 watcherMutex 를 쥐고 바꾼다.
+    // Start/Stop(UI 스레드)과 감시 스레드(WatchLoop)가 함께 만진다.
+    std::mutex watcherMutex;
     BluetoothLEAdvertisementWatcher watcher{ nullptr };
     winrt::event_token receivedToken{};
+    winrt::event_token stoppedToken{};
     std::wstring targetName;           // 매칭할 대상 기기 이름
     uint64_t targetAddr{ 0 };          // 매칭할 대상 주소 (LE 본딩 시 Windows가 RPA를 identity 주소로 해석)
     std::atomic<int> rawRssi{ -100 };  // 최신 raw RSSI (dBm)
     std::atomic<int> smoothedRssi{ -100 }; // 칼만 필터 적용 RSSI
     std::atomic<bool> receiving{ false };   // 신호 수신 중
-    std::atomic<bool> available{ false };   // WinRT 사용 가능
-    std::atomic<bool> running{ false };     // 스캔 실행 중
+    std::atomic<bool> available{ false };   // 이번 Start 이후 감시자를 세운 적이 있다 (IsAvailable 주석)
+    // 스캔을 돌릴 때 (Start ~ Stop). 감시자가 멈춰 다시 세우는 중이어도 true - 바꾸는 쪽은
+    // watcherMutex 를 쥔다. 감시자가 실제로 도는지는 scanDown 이 말한다.
+    std::atomic<bool> running{ false };
     std::atomic<ULONGLONG> lastReceivedTick{ 0 }; // 마지막 수신 시각 (콜백 스레드에서 기록)
     KalmanFilter kalman{ 1.0, 10.0 };      // RSSI 스무딩 필터 (Q=초당 1.0, R=10.0)
     std::atomic<DWORD> timeoutMs{ 90000 };  // 이 시간 동안 수신 없으면 "끊김" (iOS 백그라운드 광고는 간격이 수십 초까지 벌어짐)
@@ -424,7 +433,11 @@ struct BleRssiScanner::Impl {
             // 스캔이 꺼져 있으면 논다. 스레드를 Impl 수명 내내 살려 두는 이유는
             // 연결 한 번이 최악 10초라 Stop 에서 조인하면 UI 가 그만큼 멈추기 때문이다.
             // 쉬던 이유는 조용히 내려놓는다 - 다시 시작하면 그 세션에서 처음부터 적는다.
-            if (!running || !identOn) { pause = Pause::None; continue; }
+            // 감시자가 멈춰 다시 세우는 중일 때도 논다. 라디오가 꺼져 있으면 붙어 볼 수도 없고,
+            // 그 실패가 연속 실패로 쌓이면 폰 탓처럼 읽힌다. 다시 서면 재시도 간격을 비우고
+            // (WatchTick) 쉬던 이유도 처음부터 적는다 - "probes paused - IRK ..." 가 다시 보이면
+            // 다시 선 감시자가 폰을 듣고 있다는 뜻이다.
+            if (!running || !identOn || scanDown) { pause = Pause::None; continue; }
             ULONGLONG now = GetTickCount64();
 
             // 쉴지 정한다. 바뀔 때만 한 줄. 쉬기 시작하면 연속 실패도 끝낸다 -
@@ -605,6 +618,394 @@ struct BleRssiScanner::Impl {
         std::transform(tgtLower.begin(), tgtLower.end(), tgtLower.begin(), ::towlower);
         return advLower.find(tgtLower) != std::wstring::npos;
     }
+
+    // 광고 하나. 감시자의 Received 콜백 스레드에서 온다. 어느 감시자의 것이든 같게 다룬다 -
+    // 처음 세운 것이든 복구로 다시 세운 것이든 설정과 처리가 같아야 한다.
+    void OnReceived(BluetoothLEAdvertisementReceivedEventArgs const& args) {
+        // 광고 패킷에서 기기 이름 추출
+        std::wstring advName;
+        try {
+            auto localName = args.Advertisement().LocalName();
+            if (!localName.empty()) {
+                advName = std::wstring(localName.c_str());
+            }
+        } catch (...) {}
+
+        uint64_t addr = args.BluetoothAddress();
+        int16_t rssi = args.RawSignalStrengthInDBm();  // dBm, 음수값
+
+        // 이 광고가 "내 폰"인지. IRK 해석이 유일하게 폰을 특정하는 방법이라 먼저 본다.
+        uint64_t bound = boundAddr.load();
+        if (bound == 0 && identOn && addr != 0) {
+            uint64_t q = addr;
+            if (quietAddr.compare_exchange_strong(q, 0)) {
+                // 놓아준 주소가 돌아왔다 (위 quietAddr 주석). 한 번만 일어나도록 비교-교환으로.
+                uint64_t none = 0;
+                if (boundAddr.compare_exchange_strong(none, addr)) {
+                    bound = addr;
+                    DbgEvent(L"ident: %012llX back, bound again", (unsigned long long)addr);
+                }
+            }
+        }
+        bool identMatch = (bound != 0 && addr == bound);
+        if (identMatch) {
+            boundSeenTick = GetTickCount64();
+        } else if (identOn) {
+            // 아직 못 묶었으면 후보로만 쌓아 둔다. 붙는 일은 프로버 스레드가 한다.
+            int bit = SingleOverflowBit(args.Advertisement());
+            if (bit >= 0) {
+                std::lock_guard<std::mutex> lock(candMutex);
+                auto& c = cands[addr];
+                c.rnd = (args.BluetoothAddressType()
+                         != Windows::Devices::Bluetooth::BluetoothAddressType::Public);
+                c.rssi = rssi; c.bit = bit; c.seen = GetTickCount64();
+            }
+        }
+
+        // IRK 해석은 묶인 주소여도 따로 본다. 탐색을 쉴지(IrkRecognisesPhone)가
+        // 여기서 정해지는데, 묶인 주소라고 건너뛰면 IRK 가 폰을 알아보는 동안에도
+        // 30초 뒤 "IRK has not matched" 로 읽힌다. 주소별 캐시라 다시 계산하지는 않는다.
+        bool irkMatch = ResolveRpa(addr);
+        if (irkMatch) irkMatchTick = (std::max)(GetTickCount64(), 1ULL);
+
+        bool matched = identMatch
+            || irkMatch
+            || NameContains(advName, targetName)
+            || (targetAddr != 0 && addr == targetAddr)
+            // 서비스 UUID 는 앱 설치본마다 같으므로 폰을 특정하지 못한다.
+            // IRK 도 토큰도 없을 때의 임시방편일 뿐이다.
+            || (!HasIrk() && !identOn && HasOurService(args.Advertisement()));
+        int smoothedInt = -100;
+
+        // -127 dBm은 실제 측정값이 아니라 Windows가 "범위 이탈"을 알리는 표식 → 필터에 넣지 않음
+        bool validRssi = (rssi > -127);
+
+        if (matched && validRssi) {
+            // 칼만 필터로 스무딩 후 공개 상태 갱신
+            {
+                std::lock_guard<std::mutex> lock(kalmanMutex);
+                ULONGLONG prev = lastReceivedTick;
+                double dt = prev ? (GetTickCount64() - prev) / 1000.0 : 1.0;
+                smoothedInt = (int)std::lround(kalman.Update((double)rssi, dt));
+            }
+            rawRssi = rssi;
+            smoothedRssi = smoothedInt;
+            ULONGLONG nowTick = GetTickCount64();
+            lastReceivedTick = nowTick;
+            receiving = true;
+            NotePacket(nowTick);
+            SetEvent(packetEvent);
+        }
+
+        // 진단 로그: 주변 모든 광고를 기록해 대상 기기가 어떤 형태로 보이는지 확인
+        if (logFile) {
+            const wchar_t* addrType = L"?";
+            int companyId = -1;
+            std::wstring payload, svcUuid;
+            try {
+                switch (args.BluetoothAddressType()) {
+                case Windows::Devices::Bluetooth::BluetoothAddressType::Public: addrType = L"public"; break;
+                case Windows::Devices::Bluetooth::BluetoothAddressType::Random: addrType = L"random"; break;
+                default: break;
+                }
+                auto md = args.Advertisement().ManufacturerData();
+                if (md.Size() > 0) {
+                    companyId = md.GetAt(0).CompanyId();
+                    // 제조사 데이터 앞 24바이트 (Apple: 첫 바이트가 메시지 종류. 0x01=앱 백그라운드 광고, 0x10=Nearby Info 등)
+                    auto buf = md.GetAt(0).Data();
+                    auto reader = Windows::Storage::Streams::DataReader::FromBuffer(buf);
+                    uint32_t n = (std::min)(buf.Length(), (uint32_t)24);
+                    wchar_t hx[4];
+                    for (uint32_t i = 0; i < n; i++) { swprintf_s(hx, L"%02X", reader.ReadByte()); payload += hx; }
+                }
+                auto uuids = args.Advertisement().ServiceUuids();
+                if (uuids.Size() > 0) svcUuid = winrt::to_hstring(uuids.GetAt(0)).c_str();
+            } catch (...) {}
+            LogAdv(addr, addrType, companyId, advName, matched, rssi, smoothedInt, payload, svcUuid);
+        }
+    }
+
+    // ---- 광고 감시자 복구 ----
+    // 블루투스를 끄고 켜거나(설정, 동글 재연결, 드라이버 재시작) 라디오가 잠깐 사라지면 감시자는
+    // Aborted 로 멈추고 스스로 다시 서지 않는다. 예전에는 아무도 다시 세우지 않아서, 라디오가
+    // 돌아와도 [중지]/[시작] 이나 앱을 다시 띄울 때까지 광고를 하나도 못 들었다.
+    //  - 2026-10-07 노트북: 블루투스를 껐다 켜자 라디오도 GATT 광고도 살아났는데 이 감시자만
+    //    멈춘 채였다. 폰을 못 알아봐 감시를 다시 시작할 때까지 검은 화면이 거듭 떴다.
+    //  - 2026-10-15 데스크톱(동글): 폰 앱을 다시 설치하고 열어도, 블루투스를 껐다 켜도 안 붙다가
+    //    앱을 다시 띄우니 붙었다.
+    // 감시 스레드(WatchLoop)가 멈춘 것을 알아채고 같은 설정과 콜백으로 새 감시자를 세운다.
+    //
+    // 상태 (watcherMutex 로 지킨다):
+    //   Off    - 돌릴 때가 아니다 (Start 전, Stop 뒤). 감시 스레드는 아무것도 하지 않는다
+    //   Up     - 감시자가 돈다. Stopped 콜백이 오거나, 놓쳤어도 상태가 Aborted/Stopped 이면 Down
+    //   Down   - 내려놓았다. nextTry 에 새로 세워 본다 (3초 간격, 라디오가 켜지면 바로)
+    //   Trying - 새로 세웠다. 그 감시자가 광고를 하나라도 받거나 10초 동안 Started 이면 Up.
+    //            그 전에 멈추면 Down. 세우자마자 Started 라고 했다가 몇 초 뒤 Aborted 가 되는
+    //            경우가 있어 바로 Up 으로 치지 않는다 - 치면 라디오가 꺼진 동안 3초마다
+    //            "restarted" 와 "stopped" 가 번갈아 찍힌다.
+    // Stop 이 이긴다: 세워 보는 일은 전부 잠금 안에서 하고, Stop 은 같은 잠금 안에서 running 을
+    // 내린 뒤 감시자를 내린다. 감시 스레드는 잠금을 쥐면 먼저 Off 인지 본다.
+    enum class Scan { Off, Up, Down, Trying };
+    Scan scan = Scan::Off;
+    ULONGLONG downSince = 0;     // 멈춘 것을 안 시각 ("restarted after" 의 기준)
+    ULONGLONG nextTry = 0;       // Down: 다음에 세워 볼 시각
+    ULONGLONG tryTick = 0;       // Trying: 세운 시각
+    ULONGLONG stillLogTick = 0;  // 마지막 "still stopped" 줄. 처음에는 멈춘 시각
+    static constexpr ULONGLONG kScanRetryMs = 3000;
+    static constexpr ULONGLONG kScanConfirmMs = 10000;
+    static constexpr ULONGLONG kScanStillLogMs = 300000;
+
+    // 콜백 스레드가 잠금 없이 쓰는 것. 콜백은 watcherMutex 를 잡지 않는다 - 우리가 잠금을 쥔 채
+    // watcher.Stop() 을 부를 때 Stopped 콜백이 같은 잠금을 기다리면 서로 멈춘다.
+    std::atomic<uint32_t> wGen{ 0 };        // 세운 감시자마다 +1. 콜백이 지금 감시자의 것인지 본다
+    std::atomic<uint32_t> stoppedGen{ 0 };  // Stopped 가 온 감시자
+    std::atomic<int> stoppedErr{ -1 };      // 그때의 BluetoothError
+    std::atomic<uint32_t> heardGen{ 0 };    // 마지막으로 광고를 받은 감시자
+    std::atomic<bool> scanDown{ false };    // Down 또는 Trying. 상태바(IsScanStopped)와 프로버가 본다
+    std::atomic<bool> radioBack{ false };   // 블루투스 라디오가 꺼졌다 켜졌다. 감시 스레드가 가져간다
+    HANDLE watchThread{ nullptr };
+    HANDLE watchStop{ nullptr };            // manual-reset. 소멸자만 신호한다
+    HANDLE watchWake{ nullptr };            // auto-reset. Stopped 콜백과 라디오 변화가 감시 스레드를 바로 깨운다
+
+    static std::wstring BtErrorName(int e) {
+        using BE = Windows::Devices::Bluetooth::BluetoothError;
+        switch ((BE)e) {
+        case BE::Success:               return L"Success";
+        case BE::RadioNotAvailable:     return L"RadioNotAvailable";
+        case BE::ResourceInUse:         return L"ResourceInUse";
+        case BE::DeviceNotConnected:    return L"DeviceNotConnected";
+        case BE::OtherError:            return L"OtherError";
+        case BE::DisabledByPolicy:      return L"DisabledByPolicy";
+        case BE::NotSupported:          return L"NotSupported";
+        case BE::DisabledByUser:        return L"DisabledByUser";
+        case BE::ConsentRequired:       return L"ConsentRequired";
+        case BE::TransportNotSupported: return L"TransportNotSupported";
+        default: break;
+        }
+        return Fmt(L"BluetoothError %d", e);
+    }
+
+    // Stopped 콜백. 알리기만 한다 (위 주석 - 잠그지 않는다).
+    void OnStopped(uint32_t gen, int err) {
+        if (gen != wGen.load()) return;   // 이미 내려놓은 감시자
+        stoppedErr = err;                 // 읽는 쪽은 gen 을 먼저 보므로 사유를 먼저 쓴다
+        stoppedGen = gen;
+        if (watchWake) SetEvent(watchWake);
+    }
+
+    // watcherMutex 를 쥔 채 부른다. 콜백을 떼고 멈추고 놓는다. 이미 Aborted 여도 Stop 은 불러 둔다.
+    void DropWatcherLocked() {
+        if (!watcher) return;
+        try { watcher.Received(receivedToken); } catch (...) {}
+        try { watcher.Stopped(stoppedToken); } catch (...) {}
+        try { watcher.Stop(); } catch (...) {}
+        watcher = nullptr;
+        receivedToken = {};
+        stoppedToken = {};
+    }
+
+    // watcherMutex 를 쥔 채 부른다. 지금 감시자가 멈췄는지. Stopped 콜백이 알린 것을 먼저 보고,
+    // 콜백을 놓쳤어도 상태(Aborted/Stopped)를 읽어서 안다.
+    bool WatcherStoppedLocked(std::wstring& why) {
+        if (!watcher) { why = L"no watcher"; return true; }
+        if (stoppedGen.load() == wGen.load()) { why = BtErrorName(stoppedErr.load()); return true; }
+        try {
+            auto st = watcher.Status();
+            if (st == BluetoothLEAdvertisementWatcherStatus::Aborted) { why = L"Aborted"; return true; }
+            if (st == BluetoothLEAdvertisementWatcherStatus::Stopped) { why = L"Stopped"; return true; }
+        } catch (winrt::hresult_error const& e) {
+            why = Fmt(L"status 0x%08X", (unsigned)e.code());
+            return true;
+        } catch (...) {
+            why = L"status unreadable";
+            return true;
+        }
+        return false;
+    }
+
+    // watcherMutex 를 쥔 채 부른다. 같은 설정과 콜백으로 새 감시자를 세워 시작한다.
+    // 처음 Start 와 복구가 같이 쓴다. Start() 가 던지거나 시작하자마자 멈춰 있으면
+    // 내려놓고 사유를 why 에 담아 false.
+    bool StartWatcherLocked(std::wstring& why) {
+        DropWatcherLocked();
+        uint32_t gen = ++wGen;
+        try {
+            watcher = BluetoothLEAdvertisementWatcher();
+            // 스캔 모드: Active (디바이스에 Scan Response 요청 → 더 많은 정보)
+            watcher.ScanningMode(BluetoothLEScanningMode::Active);
+            receivedToken = watcher.Received(
+                [this, gen](BluetoothLEAdvertisementWatcher const&,
+                            BluetoothLEAdvertisementReceivedEventArgs const& args) {
+                    heardGen.store(gen, std::memory_order_relaxed);
+                    OnReceived(args);
+                });
+            stoppedToken = watcher.Stopped(
+                [this, gen](BluetoothLEAdvertisementWatcher const&,
+                            BluetoothLEAdvertisementWatcherStoppedEventArgs const& args) {
+                    int err = -1;
+                    try { err = (int)args.Error(); } catch (...) {}
+                    OnStopped(gen, err);
+                });
+            watcher.Start();
+            if (!WatcherStoppedLocked(why)) return true;
+        } catch (winrt::hresult_error const& e) {
+            why = Fmt(L"start 0x%08X", (unsigned)e.code());
+        } catch (...) {
+            why = L"start failed";
+        }
+        DropWatcherLocked();
+        return false;
+    }
+
+    // watcherMutex 를 쥔 채 부른다. Up 이던 감시자가 멈췄다 - 내려놓고 복구를 시작한다.
+    void GoDownLocked(ULONGLONG now, ULONGLONG next) {
+        DropWatcherLocked();
+        scan = Scan::Down;
+        scanDown = true;
+        downSince = now;
+        stillLogTick = now;
+        nextTry = next;
+    }
+
+    // watcherMutex 를 쥔 채 부른다. 세워 본 것이 안 됐다 - Down 으로 둔다.
+    // 안 되는 동안 매번 적으면 3초마다 한 줄이라, 5분에 한 줄만 적는다.
+    void FailLocked(ULONGLONG now, const std::wstring& why, ULONGLONG next,
+                    std::vector<std::wstring>& lines) {
+        DropWatcherLocked();
+        scan = Scan::Down;
+        nextTry = next;
+        if (Elapsed(now, stillLogTick) >= kScanStillLogMs) {
+            lines.push_back(Fmt(L"v1 advertisement scan: still stopped (%s) - retrying", why.c_str()));
+            stillLogTick = now;
+        }
+    }
+
+    // 감시 스레드가 1초마다(또는 깨울 때) 부른다. 상태는 위 "광고 감시자 복구" 주석.
+    void WatchTick() {
+        std::vector<std::wstring> lines;
+        bool restarted = false;
+        {
+            std::lock_guard<std::mutex> lock(watcherMutex);
+            // 라디오 소식은 꺼져 있어도 가져가 버린다 - 다음 Start 는 어차피 새로 세운다
+            bool back = radioBack.exchange(false);
+            if (scan == Scan::Off) return;
+            ULONGLONG now = GetTickCount64();
+            std::wstring why;
+            if (scan == Scan::Up) {
+                if (WatcherStoppedLocked(why)) {
+                    GoDownLocked(now, now + kScanRetryMs);
+                    lines.push_back(Fmt(L"v1 advertisement scan: stopped (%s)", why.c_str()));
+                } else if (back) {
+                    // 라디오가 꺼졌다 켜졌는데 감시자는 아직 Started 라고 한다. 꺼질 때 Stopped 가
+                    // 왔어야 하는데 안 왔다면 듣지 못하는 감시자일 수 있다. 앱을 다시 띄운 것과
+                    // 같게 새로 세운다 - 멀쩡했어도 잃는 것은 1초 남짓이다.
+                    GoDownLocked(now, now);
+                    lines.push_back(L"v1 advertisement scan: bluetooth radio came back on - recreating the watcher");
+                }
+            } else if (scan == Scan::Trying) {
+                if (back) {
+                    // 라디오가 꺼져 있을 때 세운 감시자일 수 있다 - 바로 다시 세운다
+                    FailLocked(now, L"radio off and on", now, lines);
+                } else if (WatcherStoppedLocked(why)) {
+                    FailLocked(now, why, (std::max)(now, tryTick + kScanRetryMs), lines);
+                } else if (heardGen.load() == wGen.load() || Elapsed(now, tryTick) >= kScanConfirmMs) {
+                    scan = Scan::Up;
+                    scanDown = false;
+                    available = true;   // 처음 Start 때 못 세웠던 경우 - 이제부터 광고 판정을 쓴다
+                    lines.push_back(Fmt(L"v1 advertisement scan: restarted after %llus",
+                                        (unsigned long long)(Elapsed(now, downSince) / 1000)));
+                    restarted = true;
+                }
+            }
+            if (scan == Scan::Down && (back || now >= nextTry)) {
+                if (StartWatcherLocked(why)) {
+                    scan = Scan::Trying;
+                    tryTick = now;
+                } else {
+                    FailLocked(now, why, now + kScanRetryMs, lines);
+                }
+            }
+        }
+        LogLines(lines);
+        // 멈춘 동안 못 한 탐색은 폰 탓이 아니다. 감시를 새로 시작할 때(Start)처럼 재시도 간격과
+        // 못-붙음 금지를 비워 다음 2초 틱에 바로 찾는다 - ResetProbeBackoff 보다 한 걸음 더.
+        if (restarted) ResetBackoff(true);
+    }
+
+    // 블루투스 라디오 하나의 켜짐/꺼짐 구독. 감시 스레드가 쥐고 있다가 끝날 때 뗀다.
+    struct RadioSub {
+        Windows::Devices::Radios::Radio radio{ nullptr };
+        winrt::event_token token{};
+    };
+
+    // 1 켜짐, 0 꺼짐(Off, Disabled), -1 모름
+    static int RadioOnOff(Windows::Devices::Radios::RadioState s) {
+        using RS = Windows::Devices::Radios::RadioState;
+        return s == RS::On ? 1 : (s == RS::Off || s == RS::Disabled) ? 0 : -1;
+    }
+
+    // 블루투스 라디오가 꺼졌다 켜지면 감시 스레드를 바로 깨워 1초 틱도 3초 간격도 기다리지 않고
+    // 감시자를 다시 세운다. 그리고 로그에 남긴다 - 사용자가 껐다 켠 것이 이 PC 에 닿았는지 보인다.
+    // 이쪽이 안 돼도(라디오를 못 찾음, 동글을 뺐다 꽂아 라디오 객체가 바뀜) 복구는 Stopped 와
+    // 3초 시도로 된다. 그래서 켜짐/꺼짐을 보고 시도를 막지는 않는다 - 낡은 라디오 객체가 "꺼짐" 에
+    // 머물면 영영 다시 세우지 않게 된다.
+    std::vector<RadioSub> WatchRadios() {
+        using namespace Windows::Devices::Radios;
+        std::vector<RadioSub> subs;
+        std::wstring why;
+        try {
+            auto op = Radio::GetRadiosAsync();
+            if (op.wait_for(std::chrono::seconds(5)) != winrt::Windows::Foundation::AsyncStatus::Completed) {
+                try { op.Cancel(); } catch (...) {}
+                why = L"radio list timeout";
+            } else {
+                for (auto const& r : op.GetResults()) {
+                    if (r.Kind() != RadioKind::Bluetooth) continue;
+                    auto last = std::make_shared<std::atomic<int>>(-1);
+                    try { *last = RadioOnOff(r.State()); } catch (...) {}
+                    RadioSub s;
+                    s.radio = r;
+                    s.token = r.StateChanged(
+                        [this, last](Radio const& sender, winrt::Windows::Foundation::IInspectable const&) {
+                            int now = -1;
+                            try { now = RadioOnOff(sender.State()); } catch (...) {}
+                            if (now < 0) return;
+                            int was = last->exchange(now);
+                            if (was == now) return;   // 같은 상태로 두 번 오기도 한다
+                            DbgEvent(L"bluetooth: radio %s", now ? L"on" : L"off");
+                            if (now == 1 && was == 0) radioBack = true;
+                            if (watchWake) SetEvent(watchWake);
+                        });
+                    subs.push_back(s);
+                }
+                if (subs.empty()) why = L"no Bluetooth radio";
+            }
+        } catch (winrt::hresult_error const& e) {
+            why = Fmt(L"0x%08X", (unsigned)e.code());
+        } catch (...) {
+            why = L"unknown error";
+        }
+        if (!why.empty()) DbgEvent(L"bluetooth: radio watch unavailable (%s)", why.c_str());
+        return subs;
+    }
+
+    // 감시 스레드. 프로버처럼 Impl 수명 내내 산다 (소멸자가 멈춘다). 감시가 꺼져 있으면
+    // WatchTick 이 바로 돌아오므로 1초마다 깨어나도 하는 일이 없다.
+    static DWORD WINAPI WatchThunk(LPVOID p) { ((Impl*)p)->WatchLoop(); return 0; }
+
+    void WatchLoop() {
+        try { winrt::init_apartment(winrt::apartment_type::multi_threaded); } catch (...) {}
+        std::vector<RadioSub> radios = WatchRadios();
+        HANDLE waits[2] = { watchStop, watchWake };
+        for (;;) {
+            DWORD w = WaitForMultipleObjects(2, waits, FALSE, 1000);
+            if (w == WAIT_OBJECT_0) break;
+            // 두 핸들은 Impl 수명 내내 산다. 그래도 대기가 실패하면 쉬지 않고 돌지 않게 한다
+            if (w == WAIT_FAILED) Sleep(1000);
+            WatchTick();
+        }
+        for (auto& s : radios) { try { s.radio.StateChanged(s.token); } catch (...) {} }
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -619,6 +1020,14 @@ BleRssiScanner::BleRssiScanner() : m_impl(new Impl()) {}
 
 BleRssiScanner::~BleRssiScanner() {
     Stop();
+    if (m_impl->watchThread) {
+        SetEvent(m_impl->watchStop);
+        // 라디오 목록을 받는 중이면(최악 5초) 그것이 끝나야 나온다
+        WaitForSingleObject(m_impl->watchThread, 10000);
+        CloseHandle(m_impl->watchThread);
+    }
+    if (m_impl->watchStop) CloseHandle(m_impl->watchStop);
+    if (m_impl->watchWake) CloseHandle(m_impl->watchWake);
     if (m_impl->proberThread) {
         SetEvent(m_impl->proberStop);
         WaitForSingleObject(m_impl->proberThread, 30000);
@@ -653,182 +1062,86 @@ bool BleRssiScanner::Start(const std::wstring& targetDeviceName, uint64_t target
     m_impl->gattLinkSince = 0;
     m_impl->ResetBackoff(true);
 
-    try {
-        // WinRT COM 초기화 (MTA)
-        // 이미 초기화되어 있으면 무시됨
-        try { winrt::init_apartment(winrt::apartment_type::multi_threaded); }
-        catch (...) { /* 이미 초기화됨 - 정상 */ }
+    // WinRT COM 초기화 (MTA)
+    // 이미 초기화되어 있으면 무시됨
+    try { winrt::init_apartment(winrt::apartment_type::multi_threaded); }
+    catch (...) { /* 이미 초기화됨 - 정상 */ }
 
-        // 진단 로그 열기 (설정된 경우)
-        if (!m_impl->logPath.empty()) {
-            std::lock_guard<std::mutex> lock(m_impl->logMutex);
-            m_impl->lastLoggedTick.clear();
-            // 모니터링 중에도 다른 프로그램에서 읽을 수 있도록 공유 모드로 열기
-            m_impl->logFile = _wfsopen(m_impl->logPath.c_str(), L"a,ccs=UTF-8", _SH_DENYWR);
-            if (m_impl->logFile) {
-                fwprintf(m_impl->logFile, L"# session target=%s\n", targetDeviceName.c_str());
-                fwprintf(m_impl->logFile, L"time,address,addrType,company,name,matched,rawRssi,smoothedRssi,mfgData,svcUuid\n");
-            }
+    // 진단 로그 열기 (설정된 경우)
+    if (!m_impl->logPath.empty()) {
+        std::lock_guard<std::mutex> lock(m_impl->logMutex);
+        m_impl->lastLoggedTick.clear();
+        // 모니터링 중에도 다른 프로그램에서 읽을 수 있도록 공유 모드로 열기
+        m_impl->logFile = _wfsopen(m_impl->logPath.c_str(), L"a,ccs=UTF-8", _SH_DENYWR);
+        if (m_impl->logFile) {
+            fwprintf(m_impl->logFile, L"# session target=%s\n", targetDeviceName.c_str());
+            fwprintf(m_impl->logFile, L"time,address,addrType,company,name,matched,rawRssi,smoothedRssi,mfgData,svcUuid\n");
         }
-
-        // BLE Advertisement Watcher 생성
-        m_impl->watcher = BluetoothLEAdvertisementWatcher();
-
-        // 스캔 모드: Active (디바이스에 Scan Response 요청 → 더 많은 정보)
-        m_impl->watcher.ScanningMode(BluetoothLEScanningMode::Active);
-
-        // 광고 수신 콜백 등록
-        m_impl->receivedToken = m_impl->watcher.Received(
-            [this](BluetoothLEAdvertisementWatcher const&,
-                   BluetoothLEAdvertisementReceivedEventArgs const& args)
-        {
-            // 광고 패킷에서 기기 이름 추출
-            std::wstring advName;
-            try {
-                auto localName = args.Advertisement().LocalName();
-                if (!localName.empty()) {
-                    advName = std::wstring(localName.c_str());
-                }
-            } catch (...) {}
-
-            uint64_t addr = args.BluetoothAddress();
-            int16_t rssi = args.RawSignalStrengthInDBm();  // dBm, 음수값
-
-            // 이 광고가 "내 폰"인지. IRK 해석이 유일하게 폰을 특정하는 방법이라 먼저 본다.
-            uint64_t bound = m_impl->boundAddr.load();
-            if (bound == 0 && m_impl->identOn && addr != 0) {
-                uint64_t q = addr;
-                if (m_impl->quietAddr.compare_exchange_strong(q, 0)) {
-                    // 놓아준 주소가 돌아왔다 (위 quietAddr 주석). 한 번만 일어나도록 비교-교환으로.
-                    uint64_t none = 0;
-                    if (m_impl->boundAddr.compare_exchange_strong(none, addr)) {
-                        bound = addr;
-                        DbgEvent(L"ident: %012llX back, bound again", (unsigned long long)addr);
-                    }
-                }
-            }
-            bool identMatch = (bound != 0 && addr == bound);
-            if (identMatch) {
-                m_impl->boundSeenTick = GetTickCount64();
-            } else if (m_impl->identOn) {
-                // 아직 못 묶었으면 후보로만 쌓아 둔다. 붙는 일은 프로버 스레드가 한다.
-                int bit = Impl::SingleOverflowBit(args.Advertisement());
-                if (bit >= 0) {
-                    std::lock_guard<std::mutex> lock(m_impl->candMutex);
-                    auto& c = m_impl->cands[addr];
-                    c.rnd = (args.BluetoothAddressType()
-                             != Windows::Devices::Bluetooth::BluetoothAddressType::Public);
-                    c.rssi = rssi; c.bit = bit; c.seen = GetTickCount64();
-                }
-            }
-
-            // IRK 해석은 묶인 주소여도 따로 본다. 탐색을 쉴지(IrkRecognisesPhone)가
-            // 여기서 정해지는데, 묶인 주소라고 건너뛰면 IRK 가 폰을 알아보는 동안에도
-            // 30초 뒤 "IRK has not matched" 로 읽힌다. 주소별 캐시라 다시 계산하지는 않는다.
-            bool irkMatch = m_impl->ResolveRpa(addr);
-            if (irkMatch) m_impl->irkMatchTick = (std::max)(GetTickCount64(), 1ULL);
-
-            bool matched = identMatch
-                || irkMatch
-                || Impl::NameContains(advName, m_impl->targetName)
-                || (m_impl->targetAddr != 0 && addr == m_impl->targetAddr)
-                // 서비스 UUID 는 앱 설치본마다 같으므로 폰을 특정하지 못한다.
-                // IRK 도 토큰도 없을 때의 임시방편일 뿐이다.
-                || (!m_impl->HasIrk() && !m_impl->identOn
-                    && Impl::HasOurService(args.Advertisement()));
-            int smoothedInt = -100;
-
-            // -127 dBm은 실제 측정값이 아니라 Windows가 "범위 이탈"을 알리는 표식 → 필터에 넣지 않음
-            bool validRssi = (rssi > -127);
-
-            if (matched && validRssi) {
-                // 칼만 필터로 스무딩 후 공개 상태 갱신
-                {
-                    std::lock_guard<std::mutex> lock(m_impl->kalmanMutex);
-                    ULONGLONG prev = m_impl->lastReceivedTick;
-                    double dt = prev ? (GetTickCount64() - prev) / 1000.0 : 1.0;
-                    smoothedInt = (int)std::lround(m_impl->kalman.Update((double)rssi, dt));
-                }
-                m_impl->rawRssi = rssi;
-                m_impl->smoothedRssi = smoothedInt;
-                ULONGLONG nowTick = GetTickCount64();
-                m_impl->lastReceivedTick = nowTick;
-                m_impl->receiving = true;
-                m_impl->NotePacket(nowTick);
-                SetEvent(m_impl->packetEvent);
-            }
-
-            // 진단 로그: 주변 모든 광고를 기록해 대상 기기가 어떤 형태로 보이는지 확인
-            if (m_impl->logFile) {
-                const wchar_t* addrType = L"?";
-                int companyId = -1;
-                std::wstring payload, svcUuid;
-                try {
-                    switch (args.BluetoothAddressType()) {
-                    case Windows::Devices::Bluetooth::BluetoothAddressType::Public: addrType = L"public"; break;
-                    case Windows::Devices::Bluetooth::BluetoothAddressType::Random: addrType = L"random"; break;
-                    default: break;
-                    }
-                    auto md = args.Advertisement().ManufacturerData();
-                    if (md.Size() > 0) {
-                        companyId = md.GetAt(0).CompanyId();
-                        // 제조사 데이터 앞 24바이트 (Apple: 첫 바이트가 메시지 종류. 0x01=앱 백그라운드 광고, 0x10=Nearby Info 등)
-                        auto buf = md.GetAt(0).Data();
-                        auto reader = Windows::Storage::Streams::DataReader::FromBuffer(buf);
-                        uint32_t n = (std::min)(buf.Length(), (uint32_t)24);
-                        wchar_t hx[4];
-                        for (uint32_t i = 0; i < n; i++) { swprintf_s(hx, L"%02X", reader.ReadByte()); payload += hx; }
-                    }
-                    auto uuids = args.Advertisement().ServiceUuids();
-                    if (uuids.Size() > 0) svcUuid = winrt::to_hstring(uuids.GetAt(0)).c_str();
-                } catch (...) {}
-                m_impl->LogAdv(addr, addrType, companyId, advName, matched, rssi, smoothedInt, payload, svcUuid);
-            }
-        });
-
-        // 스캔 시작
-        m_impl->watcher.Start();
-        m_impl->available = true;
-        m_impl->running = true;
-
-        if (!m_impl->proberThread && m_impl->identOn) {
-            m_impl->proberStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-            m_impl->proberThread = CreateThread(nullptr, 0, Impl::ProberThunk, m_impl, 0, nullptr);
-        }
-        return true;
-
-    } catch (winrt::hresult_error const&) {
-        // WinRT 초기화 실패 (BLE 어댑터 없음, Windows 10 미만 등)
-        m_impl->available = false;
-        m_impl->running = false;
-        return false;
-    } catch (...) {
-        m_impl->available = false;
-        m_impl->running = false;
-        return false;
     }
+
+    // 감시 스레드: 감시자가 멈추면 다시 세운다 (Impl 의 "광고 감시자 복구" 주석).
+    // 프로버처럼 Impl 수명 내내 산다. 감시자보다 먼저 띄운다 - 세우자마자 멈춰도 깨울 곳이 있게.
+    DWORD watchErr = 0;
+    if (!m_impl->watchStop) m_impl->watchStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!m_impl->watchWake) m_impl->watchWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!m_impl->watchThread) {
+        if (m_impl->watchStop && m_impl->watchWake)
+            m_impl->watchThread = CreateThread(nullptr, 0, Impl::WatchThunk, m_impl, 0, nullptr);
+        if (!m_impl->watchThread) watchErr = GetLastError();
+    }
+
+    // BLE Advertisement Watcher 생성 + 시작 (설정과 콜백은 StartWatcherLocked)
+    std::wstring why;
+    bool ok;
+    {
+        std::lock_guard<std::mutex> lock(m_impl->watcherMutex);
+        ok = m_impl->StartWatcherLocked(why);
+        m_impl->running = true;
+        if (ok) {
+            m_impl->scan = Impl::Scan::Up;
+            m_impl->scanDown = false;
+            m_impl->available = true;
+        } else {
+            // 처음부터 못 세웠다 (라디오 꺼짐, 어댑터 없음 등). 예전에는 여기서 끝이라 감시가
+            // 도는 내내 광고 없이 돌았다. 이제는 도중에 멈춘 것과 같게 감시 스레드가 3초마다
+            // 세워 본다. 서기 전까지 available 은 예전처럼 false - 판정은 광고 없이 간다.
+            ULONGLONG now = GetTickCount64();
+            m_impl->GoDownLocked(now, now + Impl::kScanRetryMs);
+            m_impl->available = false;
+        }
+    }
+    if (!ok) DbgEvent(L"v1 advertisement scan: stopped (%s)", why.c_str());
+    // 감시 스레드가 없으면 멈춘 감시자를 아무도 다시 세우지 않는다 (예전과 같은 상태). 드러내 둔다.
+    if (!m_impl->watchThread)
+        DbgEvent(L"v1 advertisement scan: watchdog thread could not start (err=%lu)", watchErr);
+
+    if (!m_impl->proberThread && m_impl->identOn) {
+        m_impl->proberStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        m_impl->proberThread = CreateThread(nullptr, 0, Impl::ProberThunk, m_impl, 0, nullptr);
+    }
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
 // Stop - BLE 스캔 중지
 // ---------------------------------------------------------------------------
 void BleRssiScanner::Stop() {
-    if (!m_impl->running) return;
-
-    try {
-        if (m_impl->watcher) {
-            m_impl->watcher.Received(m_impl->receivedToken);
-            m_impl->watcher.Stop();
-            m_impl->watcher = nullptr;
-        }
-    } catch (...) {}
+    {
+        // 감시 스레드가 다시 세우는 중이면 그 시도가 끝나기를 기다렸다가 내린다 - Stop 이 이긴다.
+        // running 을 이 잠금 안에서 내리므로 그 뒤로 감시 스레드는 새로 세우지 않는다.
+        std::lock_guard<std::mutex> lock(m_impl->watcherMutex);
+        if (!m_impl->running) return;
+        m_impl->DropWatcherLocked();
+        m_impl->scan = Impl::Scan::Off;
+        m_impl->scanDown = false;
+        m_impl->running = false;
+    }
 
     {
         std::lock_guard<std::mutex> lock(m_impl->logMutex);
         if (m_impl->logFile) { fclose(m_impl->logFile); m_impl->logFile = nullptr; }
     }
 
-    m_impl->running = false;
     m_impl->receiving = false;
 
     // 프로버 스레드는 그대로 두고(위 주석 참고) 묶인 주소만 버린다.
@@ -1030,4 +1343,11 @@ bool BleRssiScanner::IsReceiving() const {
 // ---------------------------------------------------------------------------
 bool BleRssiScanner::IsAvailable() const {
     return m_impl->available;
+}
+
+// ---------------------------------------------------------------------------
+// 광고 감시자가 멈춰 다시 세우는 중인지 (Impl 의 "광고 감시자 복구" 주석)
+// ---------------------------------------------------------------------------
+bool BleRssiScanner::IsScanStopped() const {
+    return m_impl->scanDown;
 }
