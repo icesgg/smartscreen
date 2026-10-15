@@ -78,6 +78,7 @@ using System; using System.Runtime.InteropServices;
 public class SSWin {
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string c, IntPtr n);
   [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
 }
 "@
 
@@ -448,24 +449,41 @@ try {
     $sys = Join-Path $env:SystemRoot 'System32\smartscreen.exe'
     $procs = @(Get-Process SmartScreen -ErrorAction SilentlyContinue | Where-Object { $_.Path -and ($_.Path -ne $sys) })
     if ($procs.Count -gt 0) {
+        # 탐색 도우미(SmartScreen.exe --read-token, client/ble_ident.cpp)도 이름과 경로가 같고 2~3초
+        # 살다 끝난다. Get-Process 는 PID 순이고 새 PID 가 더 작을 수 있어 $procs[0] 이 도우미일 수
+        # 있다 - 그것을 기다리면 도우미가 끝나자마자 "끝남" 이라 하고 아직 끝나는 중인 앱을 두고
+        # 빌드로 넘어간다 (링크가 exe 를 못 열어 "빌드 실패" 로 잘못 멈춘다). 그래서 본 앱은 창으로
+        # 찾고, 끝나기는 그 경로의 프로세스가 하나도 남지 않을 때까지 기다린다 (도우미도 exe 를 잡는다).
         $script:closedPath = $procs[0].Path
-        Write-Host "   떠 있음: $script:closedPath"
         # 오버레이의 [종료] 와 같은 길 (WM_COMMAND / ID_OVL_EXIT = 401). 강제 종료보다 이쪽이 낫다.
         $ovl = [SSWin]::FindWindow("SmartScreenOverlay", [IntPtr]::Zero)
+        $main = [IntPtr]::Zero
+        if ($ovl -eq [IntPtr]::Zero) { $main = [SSWin]::FindWindow("SmartScreenBT", [IntPtr]::Zero) }
+        $win = if ($ovl -ne [IntPtr]::Zero) { $ovl } else { $main }
+        if ($win -eq [IntPtr]::Zero) {
+            Fail "SmartScreen 창을 못 찾았다 (프로세스는 있다: $script:closedPath). 오버레이의 [종료] 로 끄고 다시 해라"
+        }
+        $appPid = [uint32]0
+        [void][SSWin]::GetWindowThreadProcessId($win, [ref]$appPid)
+        $app = $null
+        if ($appPid -ne 0) { $app = Get-Process -Id $appPid -ErrorAction SilentlyContinue }
+        if ($app -and $app.Path) { $script:closedPath = $app.Path }
+        Write-Host "   떠 있음: $script:closedPath"
         if ($ovl -ne [IntPtr]::Zero) {
             [void][SSWin]::SendMessage($ovl, 0x111, [IntPtr]401, [IntPtr]0)
             Write-Host "   오버레이에 [종료] 를 보냈다"
         } else {
-            $main = [SSWin]::FindWindow("SmartScreenBT", [IntPtr]::Zero)
-            if ($main -ne [IntPtr]::Zero) { [void][SSWin]::SendMessage($main, 0x10, [IntPtr]0, [IntPtr]0); Write-Host "   설정 창에 닫기를 보냈다 (오버레이 없음)" }
-            else { Fail "SmartScreen 창을 못 찾았다 (프로세스는 있다: $script:closedPath). 오버레이의 [종료] 로 끄고 다시 해라" }
+            [void][SSWin]::SendMessage($main, 0x10, [IntPtr]0, [IntPtr]0)
+            Write-Host "   설정 창에 닫기를 보냈다 (오버레이 없음)"
         }
         # 정상 종료는 BLE 스레드(최대 15초)와 클립보드·업데이트 일꾼을 기다린다. 넉넉히 준다.
+        # PID 가 아니라 경로로 본다 - 앱이 끝난 뒤 그 PID 를 다른 프로세스가 받아도 헷갈리지 않는다.
         $gone = $false
         Write-Host -NoNewline "   끝나기를 기다린다 "
         for ($i = 0; $i -lt 120; $i++) {
             Start-Sleep -Milliseconds 500
-            if (-not (Get-Process -Id $procs[0].Id -ErrorAction SilentlyContinue)) { $gone = $true; break }
+            $left = @(Get-Process SmartScreen -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $script:closedPath })
+            if ($left.Count -eq 0) { $gone = $true; break }
             if ($i % 4 -eq 3) { Write-Host -NoNewline "." }
         }
         Write-Host ""

@@ -34,7 +34,8 @@ ProbeOutcome ReadPhoneToken(uint64_t addr, bool randomAddr,
 // ReadPhoneToken 과 같은 일을 짧게 사는 도우미 프로세스에서 한다. 결과와 why 의 글자는
 // ReadPhoneToken 그대로이고, elapsedMs 는 도우미 안에서 잰 ReadPhoneToken 시간이다
 // (로그의 숫자가 예전과 견줄 수 있게). 도우미가 답하지 못하면 Unreachable 이고 why 는
-// "helper timeout" / "helper output", elapsedMs 는 이쪽에서 잰 시간이다.
+// "helper timeout" / "helper output 0x<종료 코드>" (죽여도 끝나지 않았으면 ", not reaped" 가
+// 붙는다), elapsedMs 는 이쪽에서 잰 시간이다.
 //
 // 왜: 데스크톱 로그(2026-10-15)에서 오래 돈 프로세스의 탐색이 40분 동안 여러 주소에서
 // 모두 80~110ms 만에 Unreachable 이었다 - 폰까지 가지도 않고 이 PC 의 스택이 거절했다.
@@ -43,6 +44,8 @@ ProbeOutcome ReadPhoneToken(uint64_t addr, bool randomAddr,
 // 함께 OS 가 거둔다.
 //
 // 도우미를 띄우지 못하면 이 프로세스 안에서 ReadPhoneToken 을 부른다 (로그에 한 번 남긴다).
+// 뜨기는 하는데 답하지 못하는 것이 연달아 3번이면 15분 동안 이 프로세스 안에서 부르고 다시
+// 해 본다 (또 실패하면 기간을 두 배로, 최대 2시간). 들어갈 때와 돌아올 때 로그에 한 줄씩.
 // abortEvent 가 신호되면 도는 도우미를 바로 끊고 Unreachable "helper stopped" 를 준다 -
 // 앱이 끝날 때 프로버 스레드를 30초씩 붙잡지 않게.
 ProbeOutcome ReadPhoneTokenIsolated(uint64_t addr, bool randomAddr,
