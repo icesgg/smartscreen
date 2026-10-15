@@ -15,7 +15,47 @@ SmartScreen 프로젝트를 이어서 개발한다. 저장소: C:\work\smartscre
 - 같은 구글 계정으로 로그인한 PC 끼리 클립보드를 주고받는다 (docs/CLIPBOARD.md)
 - 새 버전을 서버에 올리면 모든 PC 가 스스로 받아 간다 (docs/UPDATE.md)
 
-## 직전 세션 (뒤쪽): 폰 등록 창에 [등록 내역 삭제] (2026-10-06, main, 아직 안 내놓음 = 다음 release.bat 이 1.1.12)
+## 직전 세션 (마지막): 폰 앱이 돌아와도 PC 가 스스로 다시 붙게 (2026-10-15, main, 아직 안 내놓음 = 다음 release.bat 이 1.1.13)
+
+사용자 보고: 아이폰 SSBeacon 이 만료(무료 계정 7일)돼 데스크톱이 폰을 잃었고, 앱을 다시 설치해 열어도 데스크톱이 다시 붙지
+않았다. Windows 설정에서 블루투스를 껐다 켜도 안 되고, SmartScreen 을 죽였다 다시 켜야 붙었다. **데스크톱 로그(사용자가 붙여
+넣음)로 가렸다**: 데스크톱은 IRK 도 GATT 도 없어 토큰 확인 연결이 한 번 성공해야 폰을 안다(`irk=0`, GATT 줄 없음, `lostMeansFar=0`).
+전날 저녁 확인 연결은 2~3초에 붙었고(만료된 앱이라 `is not our phone (ident service absent)`), 아침 06:39:58 `service discovery
+timeout` 하나 뒤로 40분 동안 **여러 주소에 `Unreachable` 이 79~110 ms 만에** 났다 (x8, x4, x3 - 폰까지 가 보지도 않은 거절).
+07:22:39 재시작 5초 뒤 `bound to 7E4562EA756E (2641ms)` → NEAR. = 오래 돈 프로세스 안에서 LE 연결 경로가 막혔고 새 프로세스는
+첫 시도에 붙는다 (노트북 로그의 "앱 시작·깨어남 직후에만 붙는다" 와 같은 모양). 블루투스 껐다 켜기는 따로 스캐너를 멈추게 했다.
+로그 사본: 이 세션의 스크래치 `desktop-events-2026-10-15.txt` (저장소에는 없음).
+
+들어간 것 (브랜치 `bt-recover` 를 main 에 합침, 워크플로 셋 - 구현·반박 검증 검토·고치기):
+- **확인 연결을 매번 짧은 보조 프로세스에서** (Windows): `SmartScreen.exe --read-token <주소 12 hex> <r|p>` 가 ReadPhoneToken
+  한 번을 하고 `TOKEN <hex> <ms>` / `NOTOURS <why> <ms>` / `UNREACHABLE <why> <ms>` 한 줄을 stdout 에 쓰고 끝난다. WinMain 맨
+  앞에서 처리 (뮤텍스·config·events.log·창 없음, 인자 엄격 검사, 틀리면 exit 64). 부모는 파이프(HANDLE_LIST 로 쓰기 끝만 상속) +
+  잡 오브젝트(JOB_LIST 로 처음부터 잡 안에서 생성, KILL_ON_JOB_CLOSE - 업데이트·release 때 exe 를 잠그지 않게) + 30초 마감. 줄을
+  못 받거나 마감이면 `helper output 0x<exit>` / `helper timeout`. 보조가 3번 연달아 자기 탓으로 실패하면 15분(최대 2시간까지
+  두 배) in-process 로 물러남. 로그: `ident: probes run in a helper process`, `ident: probe helper could not start (err=N) - probing
+  in-process`, `ident: probe helper failed N times in a row (last: ...) - probing in-process for M min` / `... works again`.
+  BLE 등록(RegisterPhone)은 그대로 in-process. `tools/release.ps1` 은 창의 PID 경로로 같은 경로의 SmartScreen 이 다 끝나길
+  기다린다 (보조가 exe 를 잡으므로)
+- **블루투스를 껐다 켜면 광고 스캐너가 스스로 다시 선다** (Windows): watcher Stopped 이벤트 + 1초 감시 스레드(Off/Up/Down/Trying),
+  3초마다 새 watcher, `Windows.Devices.Radios` 로 라디오가 다시 켜지면 즉시. 로그 `v1 advertisement scan: stopped (<BluetoothError>)`,
+  `... still stopped (...) - retrying` (5분에 한 줄), `... restarted after <S>s`, `... bluetooth radio came back on - recreating the
+  watcher`, `bluetooth: radio on|off`. 상태바 `광고 스캔 멈춤 - 다시 켜는 중`. IsAvailable 은 일부러 예전 뜻(판정은 끄는 순간이 아니라
+  bleTimeoutSec 뒤에 부재). 다시 서면 재시도 대기를 비우고, 멈추기 전의 IRK 일치는 지운다 (거짓 `probes paused` 방지)
+- 시간 초과된 연결 작업을 `Cancel()` 하고 늦게 온 결과도 닫는다 (`ident: closed a late ... after giving up`)
+- **화면에 떠 있는 폰 앱도 확인 연결 후보** (Windows, 검토에서 나옴): 예전에는 overflow 비트 광고만 후보였다 - Xcode 로 다시 깔고
+  앱을 띄운 채 기다리면 폰을 잠그기 전까지 붙을 수 없었다. 일반 목록의 신원 UUID 광고를 sure 후보로 (Mac 과 같게),
+  bound 줄에 `, app on screen`
+- Mac: 블루투스를 끄는 순간 available 을 내려 바로 부재가 되던 것 → Windows 처럼 유지 (Core ScanAvailability, 상태바만 멈춤 표시),
+  다시 켜지면 `scan: restarted after <S>s (bluetooth back on)` + 재시도 대기 비우기
+- **[등록 내역 삭제] 가 "로그인 중에는 지울 수 없습니다" 로 막던 것** (사용자 보고): [예](구글 로그인)를 누른 뒤 180초 동안 그랬다.
+  이제 확인 창에 `진행 중인 구글 로그인은 취소합니다.` 를 붙이고 [예] 면 로그인을 실제로 취소(리스너를 즉시 깨움)한 뒤 지운다.
+  늦게 온 결과는 세대 번호로 버린다. 로그 `google login: started`, `google login: cancelled (registration deleted)`,
+  `google login: result ignored (cancelled)` (Windows 는 `google login: could not start (err=N)` 도). 두 판 모두 "취소 → 저장" 순서
+- 확인: Windows 별도 폴더 빌드, 보조 모드 실행(`--read-token 000000000000 r` → exit 3, 창·뮤텍스·로그 영향 없음), 부모 경로 하네스
+  (핸들 누수 0, 잡으로 고아 없음), Mac CI (아래 상태). **실기 확인은 안 했다** - 아래 "남은 작업"
+- 설명서 두 개: 문제 해결에 "여러 PC 가 한꺼번에 폰을 못 찾는다" (앱 만료), Windows 는 `AdvScan.exe 15` 의 0건 = PC 블루투스
+
+## 그 앞 세션: 폰 등록 창에 [등록 내역 삭제] (2026-10-06, 1.1.12 로 나감)
 
 사용자 요청 ("폰 등록 팝업창에 등록내역삭제 버튼도"). 사용자가 정한 것: **이 PC 의 폰 토큰 + 기기 키(IRK) 를 지우고 구글
 로그인(클립보드 공유)은 그대로**, 서버 `device_tokens` 와 다른 PC 는 건드리지 않음, **보호가 켜져 있으면 함께 끈다**. Mac 은
@@ -514,6 +554,15 @@ A 에서 스크린캡처하면 B 에서 Ctrl+V 로 붙는다. 연결고리는 �
 
 ## 남은 작업
 
+### 1.1.13 실기 확인 (폰 앱이 돌아올 때 스스로 다시 붙는지)
+
+- 데스크톱: 받은 뒤 events.log 에 `ident: probes run in a helper process`, 폰을 잃었다 찾을 때 `bound to` 가 몇 초 만에 오는지.
+  확인 연결이 다시 79~110 ms `Unreachable` 로 막히는지 (보조 프로세스면 매번 새로 시작하므로 안 막혀야 한다)
+- 블루투스 껐다 켜기: `v1 advertisement scan: stopped (...)` → `restarted after Ns` → `ident: probes paused` 또는 `bound to`
+- 폰 앱을 위로 밀어 종료했다 다시 열기: 앱을 띄운 채로도 `bound to ... , app on screen` 가 오는지
+- [등록하기] → [예] 로 로그인을 시작해 두고 바로 [등록 내역 삭제]: 확인 창의 취소 줄, `google login: started` → `cancelled
+  (registration deleted)` → `register phone: registration deleted` → `result ignored (cancelled)`
+
 ### 1.1.12 [등록 내역 삭제] 실기 확인
 
 노트북: 간단 창 '내 폰' [바꾸기] → 창 왼쪽 아래 [등록 내역 삭제] → 확인 창 [예] → "아직 등록하지 않았어요" / [등록하기],
@@ -822,7 +871,7 @@ Apple 계정으로 Xcode 에서 깐 앱은 **설치 후 7일이면 서명이 만
 같은 날 노트북에는 별개의 일이 둘 겹쳤다. (1) 09:59 ~ 11:29 블루투스가 주변 광고를 **하나도** 못 받았다 (`AdvScan.exe 15` 가
 0건, 라디오 On, 장치 OK, Windows 이벤트 기록 없음) - 설정에서 블루투스를 껐다 켜니 1,288건. (2) 그 껐다 켜기에서 **앱의 광고
 스캐너(WinRT watcher)가 멈춘 채 다시 시작되지 않았다** - GATT 광고 쪽은 `GATT advertisement restart #4` 로 스스로 살아났지만
-`client/ble_rssi.cpp` 의 watcher 에는 Stopped 처리가 없다. [보호 꺼짐→켜짐] 으로만 풀린다 (결함, 아직 안 고침).
+`client/ble_rssi.cpp` 의 watcher 에는 Stopped 처리가 없었다 → 1.1.13 에서 고쳤다 (위 "직전 세션 (마지막)").
 가르는 순서: `AdvScan.exe 15` 의 "주변 광고 N건" (0 이면 PC 블루투스) → 폰의 SSBeacon 이 열리는지 (안 열리면 만료) →
 앱 로그의 `ident: probes paused/resumed` (IRK 가 폰을 듣는지).
 
