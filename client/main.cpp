@@ -1215,13 +1215,20 @@ static void UnregisterPhone(HWND hWnd) {
     // 묻는 동안에도 메시지는 돈다 (간단 창의 단추, 로그인 결과). 처음부터 다시 본다:
     // 그 사이 로그인이 끝나 토큰을 썼으면 아래에서 config 를 새로 읽어 그것까지 지우고,
     // 그 사이 로그인이 시작됐으면 묻던 때 없던 로그인이라도 취소한다 - 지우기로 했다.
+    //
+    // 로그인은 저장보다 먼저 취소한다 (Mac deleteRegistration 과 같은 순서). 처음에는 저장에
+    // 성공한 뒤에 취소해서, 저장이 실패하면 확인 창에 "취소합니다" 라고 말해 놓고 로그인은
+    // 그대로 돌았다. 그 로그인이 끝나면 방금 지우겠다고 한 폰이 "폰을 등록했습니다" 로 다시
+    // 등록되고, 같은 실패에서 로그도 Mac 과 갈렸다. 저장이 실패해도 사용자가 확인한 취소는
+    // 지키고, 등록은 그대로 둔 채 "다시 시도하세요" 만 알린다.
+    if (g_loginBusy) CancelLogin();
     AppConfig cfg; LoadAppConfig(cfg);
     reg = PhoneRegisteredHere(cfg);
     cfg.phoneToken.clear();
     cfg.phoneOvfBit = -1;   // 이 폰에서 배운 비트다
     cfg.bleIrk.clear();
-    // 못 썼으면 아무것도 바꾸지 않는다. 보호를 끄거나 스캐너를 비운 뒤에 못 쓴 것을 알면,
-    // 화면은 "지웠다" 인데 다음 실행에서 예전 등록으로 다시 돈다.
+    // 못 썼으면 (위에서 취소한 로그인 말고는) 아무것도 바꾸지 않는다. 보호를 끄거나 스캐너를
+    // 비운 뒤에 못 쓴 것을 알면, 화면은 "지웠다" 인데 다음 실행에서 예전 등록으로 다시 돈다.
     // (읽지 못한 config 는 SaveAppConfig 가 거절한다 - 기본값으로 덮지 않는다.)
     if (!SaveAppConfig(cfg)) {
         // Mac (PhoneRegistration.deleteSaveFailedLogLine) 과 같은 글자 - 두 판을 grep 한 줄로 찾는다
@@ -1233,10 +1240,6 @@ static void UnregisterPhone(HWND hWnd) {
     // 아직 못 쓴 로그인 결과에 토큰이 실려 있으면, 다시 쓰는 타이머(FlushAuthSave)가
     // 방금 지운 토큰을 config 에 도로 넣는다. 토큰만 뺀다 - 계정 값은 그대로 써야 한다.
     g_authSave.phoneToken.clear();
-    // 도는 로그인은 저장한 뒤에 취소한다. 못 썼으면(위) 지운 것이 없으니 로그인도 그대로
-    // 둔다 - "못 썼으면 아무것도 바꾸지 않는다". 저장과 여기 사이에는 메시지가 돌지 않으므로
-    // 그 로그인의 결과가 끼어들 틈은 없다.
-    if (g_loginBusy) CancelLogin();
 
     const bool stopped = g_monitoring;
     if (stopped) StopMon();
