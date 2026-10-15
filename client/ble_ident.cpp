@@ -241,6 +241,17 @@ static const DWORD kHelperDeadlineMs = 30000;
 static const DWORD kHelperExitGraceMs = 2000;
 // 토큰 특성값은 최대 512바이트 = 1024자다. 줄이 이보다 훨씬 길면 망가진 것이다.
 static const size_t kHelperMaxOut = 4096;
+// 도우미 자체가 답하지 못한 것("helper output" / "helper timeout")이 연달아 이만큼이면 한동안
+// 이 프로세스 안에서 탐색한다. 도우미가 뜨기는 하는데 매번 죽는 PC (뜬 자식을 죽이는 보안
+// 프로그램, 새 프로세스마다 0xC0000142 로 죽는 데스크톱 힙 고갈) 에서는 그러지 않으면 모든
+// 탐색이 Unreachable 이고 자기 폰도 영영 묶이지 않는다 - 앱을 다시 켜도 새 프로세스가 같은
+// 도우미를 쓰니 낫지 않는다. 도우미가 직접 말한 UNREACHABLE 은 세지 않는다 (폰이 안 닿은 것이다).
+static const int kHelperFailLimit = 3;
+// 이 프로세스 안에서 탐색하는 기간. 끝나면 도우미를 다시 해 본다 - 도우미를 쓰는 까닭(오래 돈
+// 프로세스가 LE 연결을 막는 것)이 있으니 영영 버리지는 않는다. 다시 해 본 첫 번에 또 실패하면
+// 바로 돌아오고 기간을 두 배로 늘린다 (최대 2시간) - 늘 망가진 PC 에서 시험과 로그 줄을 줄인다.
+static const ULONGLONG kHelperInProcMs    = 15ULL * 60 * 1000;
+static const ULONGLONG kHelperInProcMaxMs = 120ULL * 60 * 1000;
 
 static int HexDigit(wchar_t c) {
     if (c >= L'0' && c <= L'9') return c - L'0';
@@ -349,6 +360,7 @@ static DWORD LastErrorOr(DWORD fallback = ERROR_GEN_FAILURE) {
 
 // 도우미를 모두 담는 작업(job). 한 번 만들고 닫지 않는다 - 앱이 어떻게 끝나든 (정상 종료,
 // 업데이트가 끝내는 것, 작업 관리자) OS 가 이 핸들을 닫고, 그때 남은 도우미가 모두 죽는다.
+// 도우미는 만들어질 때부터 이 작업 안에 있다 (StartHelper 의 작업 목록) - 작업 밖에 있는 순간이 없다.
 // 살아남은 도우미는 SmartScreen.exe 파일을 잡고 있다 - 업데이트(update.cpp)와 release.bat 은
 // 앱이 끝난 뒤에 그 파일을 바꾼다.
 // DIE_ON_UNHANDLED_EXCEPTION: 도우미가 죽을 때 오류 보고 창을 띄우지 않는다 (위 SetErrorMode 와 같은 이유).
@@ -398,21 +410,37 @@ static DWORD StartHelper(uint64_t addr, bool randomAddr, OwnedHandle& proc, Owne
     if (!CreatePipe(&rd, &wr, nullptr, 64 * 1024)) return LastErrorOr();
     OwnedHandle r(rd), w(wr);
 
+    // 속성 둘: 상속할 핸들 목록과 넣을 작업 목록.
     // 상속 목록에는 쓰는 쪽 하나만. 목록이 없으면 bInheritHandles=TRUE 가 이 프로세스의
     // 상속 가능한 핸들을 모두 넘긴다 (작업 핸들이 넘어가면 앱이 끝나도 작업이 닫히지 않는다).
+    // 작업 목록: 도우미를 처음부터 작업 안에서 만든다 (커널이 프로세스를 만들 때 넣는다).
+    // 예전에는 멈춘 채로 띄운 뒤 AssignProcessToJobObject 로 넣고 재개했다. 그 사이에 앱이
+    // 끝나면 (업데이트의 TerminateProcess, 작업 관리자, 크래시) 아직 한 줄도 돌지 않은 도우미가
+    // 작업 밖에 멈춘 채 남았다 - 아무도 재개하지도 죽이지도 않고, SmartScreen.exe 를 잡고 있어
+    // 업데이트의 .bak 삭제와 release.ps1 이 막힌다. 틈은 생각보다 넓다 - 커널이 프로세스를 만든
+    // 뒤에도 CreateProcess 안에서 할 일이 남아 있어, 노트북에서 재 보니 몇 ms 였다 (부모를 그
+    // 사이에 죽이면 대부분 남았다). 만들 때 넣으면 그 틈이 없다. 멈춘 채로
+    // 띄웠다가 재개하는 모양(보안 프로그램이 프로세스 할로잉으로 볼 수 있는 모양)도 없어진다.
+    // 이 속성은 Win10 1607 부터다. 그 전 Windows 에는 탐색에 쓰는 BLE API(1703)도 없다 -
+    // 실패하면 띄우지 못한 것으로 친다 (부르는 쪽이 이 프로세스 안에서 탐색한다).
     SIZE_T attrSize = 0;
-    InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
+    InitializeProcThreadAttributeList(nullptr, 2, 0, &attrSize);
     if (attrSize == 0) return LastErrorOr();
     std::vector<BYTE> attrBuf(attrSize);
     auto attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data());
-    if (!InitializeProcThreadAttributeList(attrs, 1, 0, &attrSize)) return LastErrorOr();
+    if (!InitializeProcThreadAttributeList(attrs, 2, 0, &attrSize)) return LastErrorOr();
     struct AttrList {
         LPPROC_THREAD_ATTRIBUTE_LIST a;
         ~AttrList() { DeleteProcThreadAttributeList(a); }
     } attrGuard{ attrs };
-    HANDLE inherit[1] = { w.h };   // CreateProcess 가 끝날 때까지 살아 있어야 한다
+    // 두 배열은 CreateProcess 가 끝날 때까지 살아 있어야 한다 (속성 목록은 가리키기만 한다)
+    HANDLE inherit[1] = { w.h };
+    HANDLE jobs[1] = { job };
     if (!UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
                                    inherit, sizeof(inherit), nullptr, nullptr))
+        return LastErrorOr();
+    if (!UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+                                   jobs, sizeof(jobs), nullptr, nullptr))
         return LastErrorOr();
     if (!SetHandleInformation(w.h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) return LastErrorOr();
 
@@ -429,24 +457,18 @@ static DWORD StartHelper(uint64_t addr, bool randomAddr, OwnedHandle& proc, Owne
                (unsigned long long)addr, randomAddr ? L'r' : L'p');
     std::wstring cmd = L"\"" + exe + L"\"" + args;   // CreateProcessW 는 쓰기 가능한 버퍼를 요구한다
 
-    // 멈춘 채로 띄워 작업에 넣은 뒤에 돌린다. 넣기 전에 돌면 그 틈에 앱이 끝났을 때 살아남는다.
+    // 작업 목록(위) 덕분에 CreateProcess 가 돌아올 때 도우미는 이미 작업 안에 있다 -
+    // 멈춘 채로 띄울 까닭이 없다. 작업에 넣지 못하면 CreateProcess 자체가 실패한다.
     PROCESS_INFORMATION pi{};
     BOOL ok = CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, TRUE,
-                             EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_SUSPENDED,
+                             EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
                              nullptr, nullptr, &si.StartupInfo, &pi);
     if (!ok) err = LastErrorOr();
     // 내 사본은 바로 닫는다 - 그래야 도우미가 끝날 때 읽는 쪽에 EOF 가 온다
     w.reset();
     if (!ok) return err;
-    OwnedHandle p(pi.hProcess), t(pi.hThread);
-    // 작업에 넣지 못한 도우미는 앱보다 오래 살 수 있다 (HelperJob 주석) - 띄우지 못한 것으로 친다
-    if (!AssignProcessToJobObject(job, p.h) || ResumeThread(t.h) == (DWORD)-1) {
-        err = LastErrorOr();
-        TerminateProcess(p.h, ERROR_GEN_FAILURE);
-        WaitForSingleObject(p.h, 5000);
-        return err;
-    }
-    proc.reset(p.release());
+    CloseHandle(pi.hThread);
+    proc.reset(pi.hProcess);
     readEnd.reset(r.release());
     return 0;
 }
@@ -548,6 +570,38 @@ static bool ParseHelperLine(const std::string& out, ProbeOutcome& outcome,
     return true;
 }
 
+// 도우미 자체 실패를 세고, 이 프로세스 안에서 탐색할 기간을 정한다 (kHelperFailLimit 주석).
+// 탐색은 프로버 스레드 하나에서만 돌지만 값 몇 개라 atomic 으로 둔다.
+static std::atomic<int>       s_helperFails{ 0 };              // 연달아 실패한 수
+static std::atomic<ULONGLONG> s_inProcUntil{ 0 };              // 0 이 아니면 이때까지 이 프로세스 안에서
+static std::atomic<ULONGLONG> s_inProcMs{ kHelperInProcMs };   // 지난 기간의 길이 (다시 실패하면 두 배)
+static std::atomic<bool>      s_helperRetry{ false };          // 기간이 끝나고 도우미를 다시 해 보는 중
+
+// 도우미가 줄로 답했다 (TOKEN / NOTOURS / UNREACHABLE 무엇이든 - 도우미는 제 일을 했다)
+static void NoteHelperAnswered() {
+    s_helperFails = 0;
+    if (s_helperRetry.exchange(false)) DbgEvent(L"ident: probe helper works again");
+}
+
+// 도우미 자체가 답하지 못했다. why 는 그 사유 (종료 코드가 들어 있다).
+// 이번 탐색은 그대로 Unreachable 로 돌려준다 - 바로 이 프로세스 안에서 다시 하면 탐색 하나가
+// 30초를 넘겨 앱이 끝날 때 프로버 스레드를 기다리는 시간(30초)을 넘길 수 있다. 다음 탐색부터 바꾼다.
+static void NoteHelperFailed(const std::wstring& why) {
+    int n = ++s_helperFails;
+    bool retry = s_helperRetry.exchange(false);
+    if (!retry && n < kHelperFailLimit) return;
+    ULONGLONG len = retry ? (std::min)(s_inProcMs.load() * 2, kHelperInProcMaxMs) : kHelperInProcMs;
+    s_inProcMs = len;
+    s_helperFails = 0;
+    s_inProcUntil = GetTickCount64() + len;
+    if (retry)
+        DbgEvent(L"ident: probe helper failed again (%s) - probing in-process for %llu min",
+                 why.c_str(), len / 60000);
+    else
+        DbgEvent(L"ident: probe helper failed %d times in a row (last: %s) - probing in-process for %llu min",
+                 n, why.c_str(), len / 60000);
+}
+
 ProbeOutcome ReadPhoneTokenIsolated(uint64_t addr, bool randomAddr,
                                     std::wstring& tokenHex, std::wstring& why,
                                     DWORD* elapsedMs, HANDLE abortEvent) {
@@ -560,6 +614,16 @@ ProbeOutcome ReadPhoneTokenIsolated(uint64_t addr, bool randomAddr,
         why = L"helper stopped";
         if (elapsedMs) *elapsedMs = 0;
         return ProbeOutcome::Unreachable;
+    }
+
+    // 도우미가 연달아 실패해서 한동안 이 프로세스 안에서 탐색하는 중이다 (kHelperFailLimit 주석)
+    ULONGLONG until = s_inProcUntil.load();
+    if (until != 0) {
+        if (t0 < until) return ReadPhoneToken(addr, randomAddr, tokenHex, why, elapsedMs);
+        // 기간이 끝났다 - 도우미를 다시 해 본다. 어떻게 됐는지는 NoteHelperAnswered /
+        // NoteHelperFailed 가 한 줄로 적는다.
+        s_inProcUntil = 0;
+        s_helperRetry = true;
     }
 
     OwnedHandle proc, rd;
@@ -581,15 +645,19 @@ ProbeOutcome ReadPhoneTokenIsolated(uint64_t addr, bool randomAddr,
 
     // 아직 살아 있으면 끝낸다. EOF 로 나왔으면 조금 기다린다 - 핸들이 닫히는 것(EOF)이
     // 프로세스가 끝났다고 표시되는 것보다 조금 앞선다.
+    // reaped: 죽였는데도 5초 안에 끝나지 않으면 false - 커널 안(블루투스 드라이버 같은 곳)에서
+    // 멎은 것이다. 이 변경이 의심하는 스택 정체와 이어질 수 있어 사유에 따로 적는다.
     DWORD waitMs = (end == HelperEnd::Exited) ? kHelperExitGraceMs : 0;
+    bool reaped = true;
     if (WaitForSingleObject(proc.h, waitMs) != WAIT_OBJECT_0) {
         TerminateProcess(proc.h, ERROR_TIMEOUT);
-        WaitForSingleObject(proc.h, 5000);
+        reaped = (WaitForSingleObject(proc.h, 5000) == WAIT_OBJECT_0);
     }
     DWORD exitCode = 0;
     if (!GetExitCodeProcess(proc.h, &exitCode)) exitCode = 0xFFFFFFFF;
 
     if (end == HelperEnd::Aborted) {
+        // 앱이 끝나는 중이다 - 도우미의 잘잘못이 아니니 세지 않는다
         why = L"helper stopped";
         if (elapsedMs) *elapsedMs = wallMs();
         return ProbeOutcome::Unreachable;
@@ -599,19 +667,28 @@ ProbeOutcome ReadPhoneTokenIsolated(uint64_t addr, bool randomAddr,
     ProbeOutcome r = ProbeOutcome::Unreachable;
     DWORD helperMs = 0;
     if (!tooLong && ParseHelperLine(out, r, tokenHex, why, helperMs)) {
+        NoteHelperAnswered();
         if (elapsedMs) *elapsedMs = helperMs;
         return r;
     }
     if (end == HelperEnd::TimedOut) {
-        why = L"helper timeout";
+        why = reaped ? L"helper timeout" : L"helper timeout, not reaped";
     } else {
-        why = L"helper output";
-        // 줄 없이 끝난 것은 거의 도우미가 죽은 것이다. 무엇으로 죽었는지는 종료 코드에만 있다.
+        // 줄 없이 끝난 것은 거의 도우미가 죽은 것이다. 무엇으로 죽었는지는 종료 코드에만 있다
+        // (도우미는 오류 창도 stderr 도 없다). 그래서 사유에 넣는다 - 그러면 첫 실패 줄과 묶음 줄
+        // ("x<N> since ... (last: ...)") 에 매번 실린다. 한 번만 적으면 첫 실패가 일시적인 것
+        // (로그온 직후 백신 검사 등) 일 때 몇 시간 뒤 다른 까닭으로 계속 죽어도 그 까닭이 어디에도 없다.
+        // 0x000005B4 (ERROR_TIMEOUT) 는 줄 없이 EOF 를 낸 뒤 끝나지 않아 이쪽이 죽인 것이다.
+        wchar_t b[64];
+        swprintf_s(b, L"helper output 0x%08lX%s", exitCode, reaped ? L"" : L", not reaped");
+        why = b;
+        // 몇 바이트가 왔는지는 처음 한 번만 (빈 것인지 망가진 줄인지 가르는 데는 그것이면 된다)
         static std::atomic<bool> s_saidOutput{ false };
         if (!s_saidOutput.exchange(true))
             DbgEvent(L"ident: probe helper gave no usable line (exit=0x%08lX, %u bytes)",
                      exitCode, (unsigned)out.size());
     }
+    NoteHelperFailed(why);
     if (elapsedMs) *elapsedMs = wallMs();
     return ProbeOutcome::Unreachable;
 }
