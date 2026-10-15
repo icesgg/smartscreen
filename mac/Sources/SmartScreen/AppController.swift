@@ -137,6 +137,8 @@ final class AppController: NSObject, GuardEngineHost {
     private var loginGen = 0
     /// 도는 로그인의 취소 신호. loginBusy 인 동안만 있다.
     private var loginCancel: Auth.LoginCancel?
+    /// 받아들인 로그인 세션을 AccountSession 에 심는 줄 (onLoginResult). 메인이 그 lock 에 막히지 않게 한다.
+    private static let adoptQueue = DispatchQueue(label: "com.icesgg.smartscreen.adopt", qos: .userInitiated)
     /// 잠자기 / 화면 꺼짐 알림의 구독 (observePowerEvents). 앱이 사는 동안 쥔다.
     private var powerObservers: [NSObjectProtocol] = []
 
@@ -1221,6 +1223,9 @@ final class AppController: NSObject, GuardEngineHost {
         // 지금 도는 로그인을 멈춘다. 상자를 띄울 때 돌던 것이든 상자가 떠 있는 사이에 시작된 것이든 같다 -
         // 지우겠다고 확인했고, 두면 그 로그인이 끝나며 계정의 토큰을 써서 방금 지운 등록이 되살아난다.
         // 그 사이에 끝나 토큰을 이미 썼다면 아래에서 config 를 새로 읽어 지금 있는 것을 지운다.
+        // 저장보다 먼저 취소한다 (Windows UnregisterPhone 도 같은 순서다). 저장이 실패해도 확인 상자에서
+        // 사용자가 받아들인 "진행 중인 구글 로그인은 취소합니다" 는 지킨다 - 두면 그 로그인이 끝나며
+        // 지우겠다고 한 폰을 "폰을 등록했습니다" 로 다시 등록한다. 등록은 그대로 두고 다시 시도하라고만 한다.
         if loginBusy { cancelLoginForDelete() }
         // 그 사이에 끝난 로그인이 토큰을 썼을 수 있다. 지우는 것도 로그에 남기는 것도 지금 있는 것이다 -
         // 한 번 읽은 사본으로 보고, 그 사본을 고쳐 저장한다.
@@ -1231,7 +1236,8 @@ final class AppController: NSObject, GuardEngineHost {
         var c = ConfigStore.load()
         let found = registrationOnThisMac(c)
 
-        // 먼저 저장한다. 못 쓰면 아무것도 바꾸지 않은 채 돌아간다 - 보호도, 스캐너가 아는 폰도 그대로다.
+        // 먼저 저장한다. 못 쓰면 (위에서 취소한 로그인 말고는) 아무것도 바꾸지 않은 채 돌아간다 - 보호도,
+        // 스캐너가 아는 폰도 그대로다.
         // 보호부터 끄면 저장이 실패했을 때 등록은 남았는데 보호만 꺼진 채가 된다. 저장과 아래 중지 사이에는
         // 다른 메인 일이 끼어들지 않는다 (같은 메인 차례 안이다).
         PhoneRegistration.clear(&c)
@@ -1378,8 +1384,13 @@ final class AppController: NSObject, GuardEngineHost {
 
         // 살아 있는 세션으로 심는다. 이게 없으면 방금 로그인해도 클립보드 동기화는 앱을 다시 켤 때까지
         // "로그인하지 않았다" 로 남는다. 세대를 본 뒤라 취소된 로그인의 세션은 여기 오지 않는다.
+        // 심는 일 자체는 메인에서 하지 않는다. adopt 는 AccountSession 의 lock 을 잡는데, 클립보드 일꾼이
+        // 토큰을 갱신하는 동안 그 lock 을 네트워크 요청 내내 쥔다 (AuthSession 머리말) - 메인이 거기 걸리면
+        // 잠금 화면, 오버레이, 타이머가 서버가 답할 때까지 멎는다. 받아들이기로 이미 정했으니 늦게 심겨도
+        // 취소나 지우기와 엇갈리지 않는다 (지우기는 세션을 건드리지 않는다). 줄을 세우는 큐라 로그인이
+        // 잇달아 와도 심는 순서는 받은 순서다.
         if let s = r.session {
-            AccountSession.shared.adopt(s)
+            AppController.adoptQueue.async { AccountSession.shared.adopt(s) }
         }
 
         // 봉인이 실패했으면 refresh 가 비어 있다. 예전에는 그 빈 값을 authRefresh 에 그대로 써서
