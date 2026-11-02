@@ -581,6 +581,8 @@ A 에서 스크린캡처하면 B 에서 Ctrl+V 로 붙는다. 연결고리는 �
 - 데스크톱: 받은 뒤 events.log 에 `ident: probes run in a helper process`, 폰을 잃었다 찾을 때 `bound to` 가 몇 초 만에 오는지.
   확인 연결이 다시 79~110 ms `Unreachable` 로 막히는지 (보조 프로세스면 매번 새로 시작하므로 안 막혀야 한다)
 - 블루투스 껐다 켜기: `v1 advertisement scan: stopped (...)` → `restarted after Ns` → `ident: probes paused` 또는 `bound to`
+  → **확인됨 (노트북 2026-11-02 20:06)**: `stopped (Success)` + `bluetooth: radio off` → 12초 뒤 `bluetooth: radio on` →
+  `STATE FAR -> NEAR (adv rssi=-58)` → `restarted after 13s` → `ident: probes paused - IRK recognises the phone`. 앱 재시작 없이
 - 폰 앱을 위로 밀어 종료했다 다시 열기: 앱을 띄운 채로도 `bound to ... , app on screen` 가 오는지
 - [등록하기] → [예] 로 로그인을 시작해 두고 바로 [등록 내역 삭제]: 확인 창의 취소 줄, `google login: started` → `cancelled
   (registration deleted)` → `register phone: registration deleted` → `result ignored (cancelled)`
@@ -1087,6 +1089,11 @@ client_id 와 secret 이 짝이 안 맞으면 **authorize 는 통과하고 토�
 
 스캔은 멀쩡한데 연결 개시만 전부 Unreachable 이 되는 상태. 라디오 껐다 켜기로는 안
 풀리고 재부팅이 필요했다. (폰이 실제로 멀리 있을 때도 같은 로그가 나온다.)
+**노트북은 블루투스가 통째로 귀를 닫는 일도 두 번 있었다** (2026-10-07 09:59 ~ 11:29, 2026-11-02 19:46 ~ 20:06): 인텔 내장
+블루투스가 라디오 On, 장치 OK 인 채로 주변 광고를 0건 받는다 (`AdvScan.exe 15`). 폰과의 GATT 도 그때 끊긴다 (11-02 19:49:47
+`GATT client lost (last rssi=-48 dBm)` - 폰은 바로 옆이었다). Windows 설정에서 블루투스를 껐다 켜면 풀리고, 1.1.13 부터는 앱이
+스캐너를 스스로 다시 세운다. Windows 이벤트 로그에는 아무것도 안 남는다. 사용자에게 "주변 신호 2분째 0건이면 알려 주기" 를
+제안했다 (아직 정하지 않음).
 2026-10-15 데스크톱(USB 동글 `00:1a:7d`)에서도 났다: 확인 연결이 79~110 ms 에 `Unreachable`, `ProbeScan.exe` 도
 `Disconnected` → **동글을 뽑았다 다시 꽂으니 풀렸다.** 토큰만 쓰는 PC 는 이 상태에서 폰을 영영 못 알아본다 - 기기 키(IRK)가
 있으면 연결 없이 광고만으로 알아보므로 영향이 없다. 노트북 2026-10-15 실험: 이 상태에서는 보조 프로세스든 같은 프로세스든,
