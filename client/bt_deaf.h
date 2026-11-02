@@ -20,9 +20,9 @@
 enum class RadioHealth {
     Ok,               // 알릴 것 없음
     Toggling,         // 앱이 지금 블루투스를 껐다 켜는 중
-    NeedsUserToggle,  // 광고를 못 받는데 앱이 껐다 켤 수 없었다 (권한, 라디오, 30분 안에 이미 함)
+    NeedsUserToggle,  // 광고를 못 받는데 앱이 껐다 켤 수 없었다 (권한, 라디오, 30분에 두 번 다 씀)
     NeedsRestart,     // 껐다 켜도 광고가 안 돌아왔다
-    RadioOff,         // 껐다가 다시 켜지 못했다
+    RadioOff,         // 라디오가 꺼져 있다 (앱이 껐다가 다시 켜지 못했거나, 껐다 켜려 할 때 이미 꺼져 있었다)
 };
 
 // 간단 창 상태 칸의 둘째 줄. 한 줄에 안 들어가면 그리는 쪽이 " · " 에서 두 줄로 나눈다.
@@ -57,14 +57,19 @@ struct BtRadioOps {
     virtual ~BtRadioOps() = default;
     virtual ULONGLONG Now() = 0;
     virtual void Sleep(DWORD ms) = 0;
-    // 앱이 끝나는 중. 그래도 꺼 둔 라디오는 켜고 나간다 - 기다림만 줄인다.
+    // 앱이 끝나는 중 (소멸자), 또는 Windows 가 끝나는 중 (WM_QUERYENDSESSION). 아직 끄지 않았으면
+    // 끄지 않는다. 이미 껐으면 그래도 켜고 나간다 - 쉼과 기다림만 줄인다.
     virtual bool Stopping() = 0;
     // 라디오를 바꿔도 되는지 (Radio::RequestAccessAsync). 한 번 묻고 기억한다. 안 되면 why.
-    virtual bool Access(std::wstring& why) = 0;
+    // lasting: 답을 받은 거절이다 (DeniedByUser 등) - 다시 물어도 같다. 시간 넘김, 예외는 false.
+    virtual bool Access(std::wstring& why, bool& lasting) = 0;
     // 껐다 켤 블루투스 라디오를 고른다. 없으면 why.
     virtual bool Find(std::wstring& why) = 0;
     // SetStateAsync. 받아들여졌으면 true. timeoutMs 안에 답이 없거나 거절되면 why.
+    // 답이 없던 끄기 요청은 끊지 않는다 - 이미 갔을 수 있다. OffPending 이 그것이 아직 도는지 본다.
     virtual bool Set(bool on, DWORD timeoutMs, std::wstring& why) = 0;
+    // 답이 없던 SetStateAsync(Off) 가 아직 끝나지 않았다. 늦게 먹히면 켠 뒤에 라디오가 꺼진다.
+    virtual bool OffPending() = 0;
     // 1 켜짐, 0 꺼짐, -1 모름
     virtual int State() = 0;
 };
@@ -73,6 +78,8 @@ struct BtToggleResult {
     bool ok = false;        // 꺼졌다가 다시 켜졌다
     bool wentOff = false;   // 라디오가 실제로 꺼졌었다. 30분 규칙은 이것만 센다
     bool leftOff = false;   // 켜기를 끝내 못 했다 (그래도 시도는 다 했다)
+    bool wasOff = false;    // 껐다 켜려 할 때 라디오가 이미 꺼져 있었다 (건드리지 않았다)
+    bool lasting = false;   // 다시 해도 같은 이유로 안 된다 (권한 거절). 아니면 5분 뒤 다시 해 본다
     int  onTries = 0;       // 켜기를 몇 번 했나
     ULONGLONG tookMs = 0;   // 끄기 요청부터 켜짐 확인까지
     std::wstring why;       // ok 가 아니면 이유
@@ -82,14 +89,25 @@ using BtLogSink = std::function<void(const std::wstring&)>;
 
 // 껐다 켠다: 끄기 요청, 꺼짐 확인 (5초까지), 3초 쉼, 켜기 요청, 켜짐 확인 (10초까지).
 // 켜기가 안 되면 5초 간격으로 세 번 더 한다. 라디오를 꺼 둔 채로 끝내지 않으려는 것이다.
+// 끄기 요청이 답이 없으면 그것이 끝나기를 15초 더 기다린 뒤 켜고, 켠 뒤에도 몇 초 지켜본다 -
+// 늦게 먹힌 끄기가 켜기보다 뒤에 오면 꺼진 채 남는다.
 // 켜기 시도마다의 실패는 log 로 바로 적는다 (없으면 안 적는다 - --bt-reset).
 BtToggleResult BtToggleRadio(BtRadioOps& r, const BtLogSink& log);
 
 // 감시 스레드의 1초 틱이 부르는 판단. 잠금은 부르는 쪽이 쥔다 (ble_rssi.cpp watcherMutex).
+//
+// 자동으로 껐다 켜는 때:
+//   - 귀먹음을 처음 알아챘을 때.
+//   - 귀먹음이 이어지는 동안에도, 막혔던 까닭이 풀리면 다시 한다. 30분에 두 번을 다 써서 막혔으면
+//     창이 비는 때, 라디오를 끄지도 못한 실패(시간 넘김 등)면 5분 뒤 (또 안 되면 10, 20, 30분 뒤).
+//     권한 거절은 다시 하지 않는다.
+//   - 하지 않는 때: 껐다 켠 뒤 광고가 안 돌아왔다 (NeedsRestart) - 또 해 봐야 같다.
 class BtDeafWatch {
 public:
     static constexpr ULONGLONG kDeafMs = 120000;              // 이만큼 아무 광고도 없으면 귀먹음
-    static constexpr ULONGLONG kToggleGapMs = 30ULL * 60000;  // 자동으로 껐다 켜는 것은 30분에 한 번
+    static constexpr ULONGLONG kToggleGapMs = 30ULL * 60000;  // 자동으로 껐다 켜는 것은 30분에
+    static constexpr size_t    kMaxToggles = 2;               // 두 번까지 (이어폰 등도 같이 끊긴다)
+    static constexpr ULONGLONG kRetryMs = 5ULL * 60000;       // 라디오를 끄지도 못한 실패 뒤 다시 해 보기
     // 틱 사이가 이보다 벌어지면 PC 가 잠들었던 것이다. GetTickCount64 는 잠든 시간도 센다 -
     // 그대로 두면 깨자마자 "120초 동안 광고 없음" 으로 읽고 라디오를 껐다 켠다.
     static constexpr ULONGLONG kGapMs = 10000;
@@ -104,22 +122,35 @@ public:
 
     // true 면 지금 라디오를 껐다 켠다. 결과는 Toggled 로 돌려준다.
     bool Tick(const In& in, std::vector<std::wstring>& lines);
-    // 껐다 켠 결과. sameSession 이 아니면 (그사이 Stop/Start) 알림은 건드리지 않고 적기만 한다.
+    // 껐다 켠 결과. sameSession 이 아니면 (그사이 Stop/Start) 알림은 건드리지 않고 적기만 한다 -
+    // 앱이 끄고 못 켠 것(leftOff)만은 예외로 세션과 상관없이 알린다.
     void Toggled(const BtToggleResult& r, ULONGLONG now, bool sameSession, std::vector<std::wstring>& lines);
-    // Start, Stop. 알림을 지운다. 마지막으로 껐다 켠 시각(30분 규칙)은 남긴다.
+    // Start, Stop. 알림을 지운다. 마지막으로 껐다 켠 시각(30분 규칙)과 앱이 끄고 못 켠 것은 남긴다.
     void Reset();
+    // 감시가 꺼져 있을 때(Tick 을 안 부를 때) 라디오가 다시 켜졌다는 소식. 앱이 끄고 못 켠 것을 내린다.
+    void RadioBack();
     RadioHealth Health() const { return health_; }
     bool Deaf() const { return deaf_; }
 
 private:
+    bool CanToggle(ULONGLONG now);   // 30분에 두 번을 넘지 않는다. 지난 것은 지운다
+    void StartToggle(const wchar_t* line, std::vector<std::wstring>& lines);
+
     bool deaf_ = false;
     ULONGLONG deafSince_ = 0;      // 귀먹음을 알아챈 시각 ("heard again after" 의 기준)
     ULONGLONG advMark_ = 0;        // 그때의 마지막 광고. 이보다 새 광고가 오면 끝
-    ULONGLONG toggledAt_ = 0;      // 마지막 자동 껐다 켜기 (라디오가 실제로 꺼졌던 것만). 0 = 없음
-    bool toggleHelped_ = false;    // 그 뒤로 광고가 다시 들렸다
+    std::vector<ULONGLONG> toggledAt_;  // 30분 안의 자동 껐다 켜기 (라디오가 실제로 꺼졌던 것만)
+    bool toggleHelped_ = false;    // 마지막 껐다 켜기 뒤로 광고가 다시 들렸다
     bool toggledThisEpisode_ = false;
     ULONGLONG waitSince_ = 0;      // 라디오가 다시 켜진 뒤 광고를 기다리기 시작한 시각. 0 = 안 기다림
     bool restartSaid_ = false;
+    bool limited_ = false;         // 30분에 두 번을 다 써서 손으로 하라고 했다 - 창이 비면 다시 한다
+    ULONGLONG retryAt_ = 0;        // 라디오를 끄지도 못한 실패 뒤 다시 해 볼 시각. 0 = 없음
+    ULONGLONG retryGap_ = kRetryMs;  // 다음 실패 뒤의 간격. 5분에서 두 배씩, 30분까지. 귀먹음마다 처음부터
+    ULONGLONG limitSaidFor_ = 0;   // "already toggled within 30 min" 을 적은 창 (그 창의 첫 껐다 켜기)
+    bool quiet_ = false;           // 이번 귀먹음은 같은 창에서 되풀이된 것 - 시작도 끝도 적지 않는다
+    bool leftOff_ = false;         // 앱이 라디오를 끄고 다시 켜지 못했다. Reset 이 지우지 않는다
+    ULONGLONG leftOffAt_ = 0;
     ULONGLONG lastTick_ = 0;
     ULONGLONG resumedAt_ = 0;      // 잠들었다 깬 시각 (kGapMs)
     RadioHealth health_ = RadioHealth::Ok;

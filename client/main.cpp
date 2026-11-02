@@ -2792,6 +2792,31 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         SimpleRefresh();
         break;
 
+    case WM_QUERYENDSESSION:
+        // Windows 가 끝나려 한다 (종료, 재시작, 로그오프). 이때는 WM_ENDSESSION 뒤에 프로세스가 그냥
+        // 끝나서 ~BleRssiScanner 의 기다림이 돌지 않는다. 앱이 블루투스를 껐다 켜는 도중이면 꺼진
+        // 채로 끝나고, Windows 는 그 꺼짐을 기억해 다음 부팅에도 꺼져 있다 (이어폰까지). 그래서 새로
+        // 껐다 켜지는 않게 하고, 하는 중이면 쉬지 않고 켜게 한 뒤 (SetSessionEnding) 종료 화면에
+        // 까닭을 띄워 둔다. 막지는 않는다 - TRUE.
+        g_bleScanner.SetSessionEnding(true);
+        if (g_bleScanner.IsTogglingRadio())
+            ShutdownBlockReasonCreate(hWnd, L"블루투스를 다시 켜는 중이에요");
+        return TRUE;
+
+    case WM_ENDSESSION:
+        if (wParam) {
+            // 정말 끝난다. 라디오를 다시 켤 때까지 기다린다 (켜기가 안 되면 다시 해 보는 것까지 30초).
+            if (g_bleScanner.IsTogglingRadio()) {
+                DbgEvent(L"bluetooth: Windows is ending the session during the radio toggle - waiting for it to finish");
+                bool done = g_bleScanner.FinishRadioToggle(30000);
+                DbgEvent(L"bluetooth: radio toggle %s before the session ended", done ? L"finished" : L"still running");
+            }
+        } else {
+            g_bleScanner.SetSessionEnding(false);   // 종료가 취소됐다
+        }
+        ShutdownBlockReasonDestroy(hWnd);
+        return 0;
+
     case WM_POWERBROADCAST: {
         // 잠자기와 깨어남을 기록만 한다 (Mac 의 SLEEP / WAKE 와 같은 글자). 행동은 바꾸지 않는다 -
         // 깬 뒤의 판정은 판정 스레드가 잠든 시간을 직접 재서 다룬다 (ScanThread, kWakeGraceMs).

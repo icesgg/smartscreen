@@ -99,16 +99,21 @@ const wchar_t* AccessName(Windows::Devices::Radios::RadioAccessStatus s) {
 
 class WinRadioOps : public BtRadioOps {
 public:
-    // stop: 신호되면 앱이 끝나는 중이다 (감시 스레드의 watchStop). --bt-reset 은 nullptr.
-    explicit WinRadioOps(HANDLE stop) : stop_(stop) {}
+    // stop: 신호되면 앱이 끝나는 중이다 (감시 스레드의 watchStop). ending: Windows 가 끝나는 중
+    // (BleRssiScanner::SetSessionEnding). --bt-reset 은 둘 다 nullptr.
+    WinRadioOps(HANDLE stop, const std::atomic<bool>* ending) : stop_(stop), ending_(ending) {}
 
     ULONGLONG Now() override { return GetTickCount64(); }
     void Sleep(DWORD ms) override { ::Sleep(ms); }
-    bool Stopping() override { return stop_ && WaitForSingleObject(stop_, 0) == WAIT_OBJECT_0; }
+    bool Stopping() override {
+        return (stop_ && WaitForSingleObject(stop_, 0) == WAIT_OBJECT_0) || (ending_ && ending_->load());
+    }
 
     // 한 번 묻고 기억한다. 포장 안 된 데스크톱 앱이라 묻는 창 없이 바로 답이 온다 (이 노트북은
-    // Allowed). 답을 못 받은 것(시간 넘김, 예외)은 기억하지 않는다 - 다음 귀먹음에서 다시 묻는다.
-    bool Access(std::wstring& why) override {
+    // Allowed). 답을 못 받은 것(시간 넘김, 예외)은 기억하지 않는다 - 다음에 다시 묻는다 (lasting
+    // false: 감시 스레드가 5분 뒤 다시 해 본다). 답을 받은 거절은 lasting.
+    bool Access(std::wstring& why, bool& lasting) override {
+        lasting = false;
         using namespace Windows::Devices::Radios;
         using winrt::Windows::Foundation::AsyncStatus;
         static std::mutex m;
@@ -135,6 +140,7 @@ public:
         }
         if (cached == RadioAccessStatus::Allowed) return true;
         why = AccessName(cached);
+        lasting = true;
         return false;
     }
 
@@ -191,6 +197,8 @@ public:
             auto op = radio_.SetStateAsync(on ? RadioState::On : RadioState::Off);
             if (op.wait_for(std::chrono::milliseconds(timeoutMs)) == AsyncStatus::Started) {
                 // 끊지 않는다 - 요청은 이미 갔을 수 있다. 부르는 쪽이 상태를 보고 판단한다.
+                // 끄기는 쥐고 있는다 - 늦게 먹히면 켠 뒤에 라디오가 꺼진다 (OffPending).
+                if (!on) pendingOff_ = op;
                 why = L"no answer";
                 return false;
             }
@@ -203,6 +211,15 @@ public:
             why = L"failed";
         }
         return false;
+    }
+
+    bool OffPending() override {
+        if (!pendingOff_) return false;
+        try {
+            return pendingOff_.Status() == winrt::Windows::Foundation::AsyncStatus::Started;
+        } catch (...) {
+            return false;
+        }
     }
 
     int State() override {
@@ -218,7 +235,9 @@ public:
 
 private:
     HANDLE stop_;
+    const std::atomic<bool>* ending_;
     Windows::Devices::Radios::Radio radio_{ nullptr };
+    winrt::Windows::Foundation::IAsyncOperation<Windows::Devices::Radios::RadioAccessStatus> pendingOff_{ nullptr };
 };
 
 // --bt-reset 의 결과 줄. GUI 서브시스템이라 stdout 은 부모가 넘긴 파이프(PowerShell 의 | 등)뿐이다.
@@ -250,7 +269,7 @@ void ResetWriteLine(const std::wstring& line) {
 
 int BleRadioResetMain() {
     try { winrt::init_apartment(winrt::apartment_type::multi_threaded); } catch (...) {}
-    WinRadioOps ops(nullptr);
+    WinRadioOps ops(nullptr, nullptr);
     // 켜기 시도마다의 줄은 버린다 - 이 모드는 한 줄만 쓴다. 꺼 둔 채 끝나면 그 줄이 말한다.
     BtToggleResult r = BtToggleRadio(ops, nullptr);
     ResetWriteLine(r.ok ? RFmt(L"OK toggled in %llus\n", r.tookMs / 1000) : L"FAIL " + r.why + L"\n");
@@ -1005,6 +1024,10 @@ struct BleRssiScanner::Impl {
     // 감시 스레드가 라디오를 껐다 켜는 중. 프로버는 그동안 쉬고 (실패가 폰 탓으로 쌓인다),
     // 소멸자는 더 기다린다 (라디오를 꺼 둔 채 끝나면 안 된다).
     std::atomic<bool> toggling{ false };
+    // Windows 가 끝나는 중 (WM_QUERYENDSESSION). 새로 껐다 켜지 않고, 껐다 켜는 중이면 쉬지 않고
+    // 켠다 (WinRadioOps::Stopping). 그때는 소멸자가 돌지 않으므로 main.cpp 가 FinishRadioToggle 로
+    // 다시 켜질 때까지 기다린다. 종료가 취소되면 내린다.
+    std::atomic<bool> ending{ false };
     std::atomic<HWND> notifyWnd{ nullptr };      // Health 가 바뀌면 여기로 notifyMsg (SetHealthNotify)
     std::atomic<UINT> notifyMsg{ 0 };
 
@@ -1024,7 +1047,7 @@ struct BleRssiScanner::Impl {
     // 라디오만 만지기 때문이다: StateChanged 처리기는 원자값과 이벤트만 건드리고, 감시자는 껐다 켠
     // 뒤의 다음 틱에서 늘 하던 복구(Stopped -> Down -> 다시 세움)가 다시 세운다.
     void ToggleRadioNow(uint32_t session) {
-        WinRadioOps ops(watchStop);
+        WinRadioOps ops(watchStop, &ending);
         BtToggleResult r = BtToggleRadio(ops, [](const std::wstring& l) { DbgEvent(L"%s", l.c_str()); });
         std::vector<std::wstring> lines;
         bool changed;
@@ -1173,9 +1196,17 @@ struct BleRssiScanner::Impl {
         uint32_t session = 0;
         {
             std::lock_guard<std::mutex> lock(watcherMutex);
-            // 라디오 소식은 꺼져 있어도 가져가 버린다 - 다음 Start 는 어차피 새로 세운다
+            // 라디오 소식은 꺼져 있어도 가져가 버린다 - 다음 Start 는 어차피 새로 세운다.
             bool back = radioBack.exchange(false);
-            if (scan == Scan::Off) return;
+            if (scan == Scan::Off) {
+                // 다만 앱이 끄고 못 켠 라디오(RadioOff - Stop/Start 도 지우지 않는다)가 다시 켜졌으면
+                // 여기서 내린다. PostMessage 는 기다리지 않으므로 잠금 안에서 알려도 된다.
+                if (back) {
+                    deafWatch.RadioBack();
+                    if (PublishHealthLocked()) NotifyHealth();
+                }
+                return;
+            }
             ULONGLONG now = GetTickCount64();
             std::wstring why;
             if (scan == Scan::Up) {
@@ -1686,4 +1717,23 @@ RadioHealth BleRssiScanner::Health() const {
 void BleRssiScanner::SetHealthNotify(HWND hwnd, UINT msg) {
     m_impl->notifyMsg = msg;   // 읽는 쪽은 창을 먼저 본다 - 메시지 번호를 먼저 둔다
     m_impl->notifyWnd = hwnd;
+}
+
+void BleRssiScanner::SetSessionEnding(bool ending) {
+    m_impl->ending = ending;
+}
+
+bool BleRssiScanner::IsTogglingRadio() const {
+    return m_impl->toggling.load();
+}
+
+bool BleRssiScanner::FinishRadioToggle(DWORD maxMs) {
+    // 감시 스레드는 toggling 을 내리기 전에 라디오를 다시 켜 둔다 (또는 켜기를 다 해 봤다).
+    // UI 스레드가 끝나는 중에 잠깐 기다리는 것이라 이벤트를 따로 두지 않고 들여다본다.
+    ULONGLONG until = GetTickCount64() + maxMs;
+    while (m_impl->toggling.load()) {
+        if (GetTickCount64() >= until) return false;
+        Sleep(100);
+    }
+    return true;
 }

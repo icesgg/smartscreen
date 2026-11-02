@@ -81,11 +81,20 @@ public:
 
     // 블루투스 알림 (bt_deaf.h). 감시자가 돌고 있는데 어느 기기의 광고도 120초 동안 없으면
     // 라디오가 귀먹은 것으로 보고 감시 스레드가 블루투스를 껐다 켠다. 그 진행과, 안 됐을 때
-    // 사용자가 할 일을 이 값으로 알린다. 광고가 하나라도 다시 오면, 그리고 Start/Stop 에서 Ok.
+    // 사용자가 할 일을 이 값으로 알린다. 광고가 하나라도 다시 오면, 그리고 Start/Stop 에서 Ok -
+    // 앱이 끄고 다시 켜지 못한 라디오(RadioOff)만은 라디오가 다시 켜질 때까지 남는다.
     RadioHealth Health() const;
     // Health 가 바뀌면 감시 스레드가 hwnd 에 msg 를 보낸다 (PostMessage). 화면은 그 스레드에서
     // 고친다 - 감시 스레드는 창을 만지지 않는다.
     void SetHealthNotify(HWND hwnd, UINT msg);
+    // Windows 가 끝나려 한다 (WM_QUERYENDSESSION: true) / 종료가 취소됐다 (WM_ENDSESSION FALSE: false).
+    // 끝나는 동안은 새로 껐다 켜지 않고, 껐다 켜는 중이면 쉬지 않고 바로 켠다. 이때는 프로세스가
+    // WM_ENDSESSION 뒤에 그냥 끝나서 소멸자의 기다림이 돌지 않는다 - 그래서 FinishRadioToggle.
+    void SetSessionEnding(bool ending);
+    // 감시 스레드가 지금 라디오를 껐다 켜는 중인가.
+    bool IsTogglingRadio() const;
+    // 껐다 켜는 중이면 끝날 때까지(라디오를 다시 켤 때까지) maxMs 까지 기다린다. 끝났으면 true.
+    bool FinishRadioToggle(DWORD maxMs);
 
     // 최근 10초간 수신한 대상 기기 광고 수 (초당 환산). 튜닝 시 신호가 얼마나 촘촘한지 확인용
     double RecentPacketRate() const;
