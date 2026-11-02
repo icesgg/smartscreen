@@ -14,6 +14,7 @@ add_executable(SmartScreen WIN32
     client/bluetooth.cpp
     client/blackscreen.cpp
     client/ble_rssi.cpp
+    client/bt_deaf.cpp
     client/ble_gatt.cpp
     client/ble_ident.cpp
     client/irk.cpp

@@ -6,6 +6,7 @@
 #include <string>
 #include <atomic>
 #include <mutex>
+#include "bt_deaf.h"   // RadioHealth
 
 // ---------------------------------------------------------------------------
 // 칼만 필터 - RSSI 노이즈 스무딩
@@ -78,6 +79,14 @@ public:
     // 처음 Start 때 라디오가 꺼져 있었음). 상태바가 보여 주는 데 쓴다. 판정은 보지 않는다.
     bool IsScanStopped() const;
 
+    // 블루투스 알림 (bt_deaf.h). 감시자가 돌고 있는데 어느 기기의 광고도 120초 동안 없으면
+    // 라디오가 귀먹은 것으로 보고 감시 스레드가 블루투스를 껐다 켠다. 그 진행과, 안 됐을 때
+    // 사용자가 할 일을 이 값으로 알린다. 광고가 하나라도 다시 오면, 그리고 Start/Stop 에서 Ok.
+    RadioHealth Health() const;
+    // Health 가 바뀌면 감시 스레드가 hwnd 에 msg 를 보낸다 (PostMessage). 화면은 그 스레드에서
+    // 고친다 - 감시 스레드는 창을 만지지 않는다.
+    void SetHealthNotify(HWND hwnd, UINT msg);
+
     // 최근 10초간 수신한 대상 기기 광고 수 (초당 환산). 튜닝 시 신호가 얼마나 촘촘한지 확인용
     double RecentPacketRate() const;
 
@@ -137,3 +146,8 @@ private:
 
 // 전역 BLE RSSI 스캐너 인스턴스
 extern BleRssiScanner g_bleScanner;
+
+// SmartScreen.exe --bt-reset: 감시 스레드가 귀먹음에서 쓰는 것과 같은 순서로 블루투스를 한 번
+// 껐다 켜고, 결과 한 줄("OK toggled in <S>s" / "FAIL <이유>")을 stdout 에 쓴다. 0 성공, 1 실패.
+// 뮤텍스, 설정, 로그, 창 어느 것도 쓰지 않는다 (wWinMain 이 --read-token 처럼 맨 먼저 부른다).
+int BleRadioResetMain();

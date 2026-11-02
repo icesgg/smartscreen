@@ -67,6 +67,9 @@ static constexpr UINT WM_ENTERPRISE_SYNC = WM_USER + 104;
 // 스레드로 넘긴다. 예전에는 스캔 스레드가 직접 Load -> Save 했고, 그것이 "설정
 // 쓰기는 한 스레드에서만" (아래 OnSessionRotated 주석) 의 유일한 예외였다.
 static constexpr UINT WM_GATT_SEEN = WM_USER + 105;
+// 블루투스 알림(g_bleScanner.Health, bt_deaf.h)이 바뀌었다. 스캐너의 감시 스레드가 보낸다 -
+// 그 스레드는 창을 만지지 않으므로 간단 창의 상태 칸과 오버레이는 여기서 다시 그린다.
+static constexpr UINT WM_BT_HEALTH = WM_USER + 106;
 
 // 기본으로 열리는 간단 창. 만드는 곳과 창 프로시저는 아래 "간단 화면" 절에 있다.
 // 오버레이의 [설정] 이 이 창을 열기 때문에 여기서 미리 알려 둔다.
@@ -323,6 +326,11 @@ static void UpdateOverlayState() {
     } else {
         swprintf_s(g_ovlLine2, L"\xBA40\xB9AC  \u2022  %d\xCD08", g_nCountdown);  // 멀리 · Ns
         g_ovlColor = RGB(240, 170, 50);
+    }
+    // 블루투스 알림이 있으면 둘째 줄은 그것을 말한다 (색은 상태 그대로). 이 PC 가 광고를 못 듣는
+    // 동안의 "멀리" 는 폰이 멀어서가 아니다 - 사용자가 할 일(껐다 켜기, 재부팅)이 먼저 보여야 한다.
+    if (g_monitoring) {
+        if (const wchar_t* n = RadioHealthShortText(g_bleScanner.Health())) wcscpy_s(g_ovlLine2, n);
     }
 
     InvalidateRect(g_hOverlay, nullptr, TRUE);
@@ -1083,6 +1091,7 @@ static void StartMon() {
     g_bleScanner.SetIdentity(cfg.phoneToken, cfg.phoneOvfBit, g_nearRssiThreshold - 10);
     g_bleScanner.SetTimeoutSec(cfg.bleTimeoutSec);
     g_bleScanner.SetDebugLog(cfg.bleDebugLog ? GetConfigDir() + L"\\ble_scan_log.csv" : L"");
+    g_bleScanner.SetHealthNotify(g_hWnd, WM_BT_HEALTH);
     g_bleScanner.Start(g_targetName, g_targetAddr);
 
     cfg.btAddress = g_targetAddr;
@@ -1476,9 +1485,13 @@ static void OnResult(ProbeResult* r) {
         :                                        (g_hasIrk ? L"토큰+IRK" : L"토큰");
     // 광고 감시자가 멈춰 다시 세우는 중이면 (블루투스를 껐다 켬 등) 초당 수신 건수 자리에 그렇게
     // 적는다. 예전에는 0.0/s 로만 보여서, 폰이 조용한 것인지 이 PC 가 못 듣는 것인지 갈리지 않았다.
-    const bool scanStopped = g_bleScanner.IsScanStopped();
+    // 블루투스 알림(아무 기기의 광고도 120초 없음 등, bt_deaf.h)은 그보다 앞선다 - 그때는 감시자가
+    // 아직 멈추지 않았거나, 멈춘 까닭이 앱이 껐다 켠 것이다.
+    const wchar_t* btNotice = RadioHealthShortText(g_bleScanner.Health());
+    const bool scanStopped = btNotice || g_bleScanner.IsScanStopped();
     wchar_t rate[48];
-    if (scanStopped) wcscpy_s(rate, L"광고 스캔 멈춤 - 다시 켜는 중");
+    if (btNotice) wcscpy_s(rate, btNotice);
+    else if (scanStopped) wcscpy_s(rate, L"광고 스캔 멈춤 - 다시 켜는 중");
     else swprintf_s(rate, L"%.1f/s", g_bleScanner.RecentPacketRate());
     if(r->bleAvailable)
         // 초당 수신 건수: 신호가 얼마나 촘촘한지 보면서 임계값을 잡을 수 있다
@@ -2773,6 +2786,12 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         break;
     }
 
+    case WM_BT_HEALTH:
+        // 블루투스 알림이 바뀌었다 (WM_BT_HEALTH 주석). 상태바는 다음 판정 결과(OnResult)가 고친다.
+        UpdateOverlayState();
+        SimpleRefresh();
+        break;
+
     case WM_POWERBROADCAST: {
         // 잠자기와 깨어남을 기록만 한다 (Mac 의 SLEEP / WAKE 와 같은 글자). 행동은 바꾸지 않는다 -
         // 깬 뒤의 판정은 판정 스레드가 잠든 시간을 직접 재서 다룬다 (ScanThread, kWakeGraceMs).
@@ -3838,12 +3857,33 @@ static LRESULT CALLBACK SimpleProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
         DeleteObject(br); DeleteObject(pn);
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, RGB(255, 255, 255));
-        RECT t1 = { rc.left + 18, rc.top + 14, rc.right - 18, rc.top + 48 };
-        HFONT of = (HFONT)SelectObject(hdc, g_hFontBig ? g_hFontBig : g_hFont);
+        HFONT of = (HFONT)SelectObject(hdc, g_hFont);
+
+        // 블루투스 알림이 있으면 둘째 줄만 그것으로 바꾼다 (첫 줄은 상태 그대로). 칸은 한 줄
+        // 높이라, 한 줄에 안 들어가는 알림은 " · " 에서 두 줄로 나누고 첫 줄을 조금 올린다 -
+        // 낱말 사이에서 아무 데나 꺾이면 "켜 / 주세요" 처럼 갈린다. 폭은 그리는 글꼴로 잰다.
+        std::wstring notice;
+        bool twoLines = false;
+        if (g_monitoring) {
+            if (const wchar_t* n = RadioHealthTileText(g_bleScanner.Health())) {
+                notice = n;
+                RECT m = { 0, 0, 0, 0 };
+                DrawTextW(hdc, n, -1, &m, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+                size_t dot = notice.find(L" · ");
+                if (m.right > (rc.right - 18) - (rc.left + 18) && dot != std::wstring::npos) {
+                    notice.replace(dot, 3, L"\n");
+                    twoLines = true;
+                }
+                line2 = notice.c_str();
+            }
+        }
+
+        RECT t1 = { rc.left + 18, rc.top + (twoLines ? 8 : 14), rc.right - 18, rc.top + 48 };
+        SelectObject(hdc, g_hFontBig ? g_hFontBig : g_hFont);
         DrawTextW(hdc, line1, -1, &t1, DT_LEFT | DT_SINGLELINE);
         SelectObject(hdc, g_hFont);
-        RECT t2 = { rc.left + 18, rc.top + 48, rc.right - 18, rc.bottom - 8 };
-        DrawTextW(hdc, line2, -1, &t2, DT_LEFT | DT_WORDBREAK);
+        RECT t2 = { rc.left + 18, rc.top + (twoLines ? 40 : 48), rc.right - 18, rc.bottom - (twoLines ? 4 : 8) };
+        DrawTextW(hdc, line2, -1, &t2, DT_LEFT | DT_WORDBREAK | (notice.empty() ? 0 : DT_NOPREFIX));
         SelectObject(hdc, of);
         EndPaint(hWnd, &ps); return 0;
     }
@@ -4056,6 +4096,13 @@ int WINAPI wWinMain(HINSTANCE hI, HINSTANCE, LPWSTR, int nS) {
                 // ExitProcess 로 끝낸다: 정적 소멸자와 CRT 정리를 건너뛴다. 시간을 넘겨 버린 WinRT
                 // 작업의 완료 콜백이 스레드 풀에서 아직 돌 수 있는데, 그것과 소멸자가 겹칠 까닭이 없다.
                 rc = ReadTokenHelperMain(argc, argv);
+                LocalFree(argv);
+                ExitProcess((UINT)rc);
+            } else if (argc >= 2 && wcscmp(argv[1], L"--bt-reset") == 0) {
+                // 블루투스를 한 번 껐다 켠다 (ble_rssi.h BleRadioResetMain) - 귀먹음에서 앱이 하는 것과
+                // 같은 함수다. 앱이 떠 있어도 돌아야 하므로 --read-token 처럼 뮤텍스, 설정, 로그, 창보다
+                // 먼저. ExitProcess 로 끝내는 까닭도 같다 (시간을 넘긴 WinRT 작업의 콜백과 소멸자).
+                rc = BleRadioResetMain();
                 LocalFree(argv);
                 ExitProcess((UINT)rc);
             } else if (argc >= 3 && wcscmp(argv[1], L"--dump-irk") == 0) {
